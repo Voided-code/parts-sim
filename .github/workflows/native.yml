@@ -147,7 +147,7 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
           QMAKE: ${{ env.QT_ROOT_DIR }}/bin/qmake
-          LD_LIBRARY_PATH: ${{ env.OCCT_DIR }}/lib:${{ env.WGPU_NATIVE_DIR }}/lib
+          LD_LIBRARY_PATH: ${{ env.QT_ROOT_DIR }}/lib:${{ env.OCCT_DIR }}/lib:${{ env.WGPU_NATIVE_DIR }}/lib
           VERSION: '0.3.0'
         run: |
           cmake --install build --prefix AppDir/usr

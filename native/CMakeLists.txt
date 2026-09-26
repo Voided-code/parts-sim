@@ -195,7 +195,16 @@ if(PARTS_SIM_APP)
 
     # ---- install and package: Qt, OpenCascade and wgpu libraries go into the app ----
     install(TARGETS PartsSim BUNDLE DESTINATION . RUNTIME DESTINATION bin)
-    qt_generate_deploy_app_script(TARGET PartsSim OUTPUT_SCRIPT PS_DEPLOY_SCRIPT NO_UNSUPPORTED_PLATFORM_ERROR)
+    if(WIN32)
+      # Qt 6.8's app-script generator leaves EXECUTABLE unquoted, splitting "Parts Sim.exe".
+      qt_generate_deploy_script(TARGET PartsSim OUTPUT_SCRIPT PS_DEPLOY_SCRIPT CONTENT "
+        qt6_deploy_runtime_dependencies(
+          EXECUTABLE \"$<TARGET_FILE:PartsSim>\"
+          GENERATE_QT_CONF)
+      ")
+    else()
+      qt_generate_deploy_app_script(TARGET PartsSim OUTPUT_SCRIPT PS_DEPLOY_SCRIPT NO_UNSUPPORTED_PLATFORM_ERROR)
+    endif()
     if(APPLE)
       # codesign rejects extended attributes (Finder info, iCloud / file-provider tags) anywhere in the
       # bundle: strip them before macdeployqt signs, then sign the finished app again (ad hoc)
