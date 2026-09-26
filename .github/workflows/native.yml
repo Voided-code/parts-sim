@@ -32,8 +32,8 @@ jobs:
             os: ubuntu-24.04
             wgpu: wgpu-linux-x86_64-release.zip
     env:
-      OCCT_DIR: ${{ runner.temp }}/occt
-      WGPU_NATIVE_DIR: ${{ runner.temp }}/wgpu
+      OCCT_DIR: ${{ github.workspace }}/.native-deps/occt
+      WGPU_NATIVE_DIR: ${{ github.workspace }}/.native-deps/wgpu
     steps:
       - uses: actions/checkout@v4
 
