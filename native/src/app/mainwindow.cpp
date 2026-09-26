@@ -17,6 +17,7 @@
 #include <QPainter>
 #include <QStyle>
 #include <QDir>
+#include <QFile>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QShortcut>
@@ -29,7 +30,6 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 
 #include "core/solidworks.hpp"
 #include "gpu/gpu.hpp"
@@ -421,8 +421,10 @@ void MainWindow::openFiles(const QStringList& paths) {
             for (const auto& f : d.entryList(QDir::Files))
                 if (f.compare(wanted, Qt::CaseInsensitive) == 0) { match = f; break; }
             if (match.isEmpty()) return {};
-            std::ifstream in(d.filePath(match).toStdString(), std::ios::binary);
-            return Bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            QFile f(d.filePath(match));
+            if (!f.open(QIODevice::ReadOnly)) return {};
+            const QByteArray b = f.readAll();
+            return Bytes(b.begin(), b.end());
         };
         src = importFile(primary.toStdString(), sibling);
     } catch (const std::exception& e) {

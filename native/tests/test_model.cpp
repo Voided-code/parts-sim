@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <random>
+#include <stdexcept>
 
 #include "check.hpp"
 #include "core/importers.hpp"
@@ -132,6 +135,29 @@ TEST("OBJ with polygons and negative indices") {
     const std::string obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\nf -4 -2 -1\n";
     const auto m = importBytes("q.obj", Bytes(obj.begin(), obj.end()));
     CHECK(m.positions.size() == 9 * 3);
+}
+
+TEST("importFile opens UTF-8 directories and file names") {
+    namespace fs = std::filesystem;
+    std::random_device rd;
+    fs::path dir = fs::temp_directory_path() / fs::path(u8"parts-sim-r\u00e9pertoire-\u96f6\u4ef6-");
+    dir += std::to_string(rd()) + std::to_string(rd());
+    if (!fs::create_directory(dir)) throw std::runtime_error("Could not create the test directory.");
+    struct Cleanup {
+        fs::path dir;
+        ~Cleanup() { std::error_code ec; fs::remove_all(dir, ec); }
+    } cleanup{dir};
+    const fs::path path = dir / fs::path(u8"pi\u00e8ce \u96f6\u4ef6.OBJ");
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "v 0 0 0\nv 2 0 0\nv 0 3 0\nf 1 2 3\n";
+        if (!out) throw std::runtime_error("Could not write the test mesh.");
+    }
+    const std::u8string utf8 = path.u8string();
+    const auto m = importFile(std::string(utf8.begin(), utf8.end()));
+    const std::u8string stem = u8"pi\u00e8ce \u96f6\u4ef6";
+    CHECK(m.name == std::string(stem.begin(), stem.end()));
+    CHECK(m.positions == std::vector<float>({0, 0, 0, 2, 0, 0, 0, 3, 0}));
 }
 
 TEST("STEP import through OpenCascade keeps the CAD faces") {

@@ -1,5 +1,6 @@
 // Parts Sim desktop app entry point.
 #include <QApplication>
+#include <QFile>
 #include <QFileOpenEvent>
 #include <QIcon>
 #include <QPalette>
@@ -78,7 +79,15 @@ protected:
     }
 };
 
-// Test automation: PARTS_SIM_SCRIPT="sample:beam;run;idle;shot:/tmp/a.png;quit" runs the steps in order.
+void scriptFailure(const QString& message) {
+    std::fprintf(stderr, "PARTS_SIM_SCRIPT_FAILED: %s\n", qPrintable(message));
+    std::fflush(stderr);
+    QApplication::exit(1);
+}
+
+// Test automation: PARTS_SIM_SCRIPT="sample:beam;idle;assert:part;run;idle;assert:static;shot:/tmp/a.png;quit".
+// Assertions exit with failure. A static pass also writes PARTS_SIM_SCRIPT_RESULT when set, so
+// packaged GUI executables can report success even on platforms without a console.
 void runScript(ps::MainWindow* w, QStringList steps) {
     if (steps.isEmpty()) return;
     const QString step = steps.takeFirst().trimmed();
@@ -111,15 +120,31 @@ void runScript(ps::MainWindow* w, QStringList steps) {
             QTimer::singleShot(100, w, [w, steps] { runScript(w, steps); });
             return;
         }
+    } else if (cmd == "assert") {
+        if (arg == "part") {
+            if (!w->part || w->part->nVert <= 0 || w->part->nTri <= 0)
+                return scriptFailure("No part was loaded. " + w->statusText());
+        } else if (arg == "static") {
+            if (!w->part || !w->structural->hasSuccessfulStaticResult())
+                return scriptFailure("No successful current static result. " + w->statusText());
+            const QByteArray marker("PARTS_SIM_SMOKE_OK\n");
+            if (qEnvironmentVariableIsSet("PARTS_SIM_SCRIPT_RESULT")) {
+                QFile file(qEnvironmentVariable("PARTS_SIM_SCRIPT_RESULT"));
+                if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) || file.write(marker) != marker.size() || !file.flush())
+                    return scriptFailure("Could not write the script result marker: " + file.errorString());
+            }
+            std::printf("%s", marker.constData());
+            std::fflush(stdout);
+        } else return scriptFailure("Unknown assertion: " + arg);
     } else if (cmd == "shot") {
-        w->grab().save(arg);
+        if (!w->grab().save(arg)) return scriptFailure("Could not save screenshot: " + arg);
     } else if (cmd == "status") {
         std::printf("status: %s\n", qPrintable(w->statusText()));
         std::fflush(stdout);
     } else if (cmd == "quit") {
         QApplication::quit();
         return;
-    }
+    } else return scriptFailure("Unknown script command: " + cmd);
     next(cmd == "sample" || cmd == "open" ? 300 : 50);
 }
 

@@ -87,23 +87,26 @@ MeshSource readCAD(const std::string& format, const Bytes& data, bool fine) {
         if (!out) throw std::runtime_error("Could not stage the CAD file for reading.");
     }
     struct Cleanup { fs::path p; ~Cleanup() { std::error_code ec; fs::remove(p, ec); } } cleanup{tmp};
+    // OpenCascade takes UTF-8 file names (the temp folder can contain a non-English user name)
+    const std::u8string u8 = tmp.u8string();
+    const std::string fileName(reinterpret_cast<const char*>(u8.data()), u8.size());
     TopoDS_Shape shape;
     try {
         if (format == "step") {
             STEPControl_Reader reader;
             Interface_Static::SetCVal("xstep.cascade.unit", "MM");
-            if (reader.ReadFile(tmp.string().c_str()) != IFSelect_RetDone) throw std::runtime_error("OpenCascade could not read this STEP file.");
+            if (reader.ReadFile(fileName.c_str()) != IFSelect_RetDone) throw std::runtime_error("OpenCascade could not read this STEP file.");
             reader.TransferRoots();
             shape = reader.OneShape();
         } else if (format == "iges") {
             IGESControl_Reader reader;
             Interface_Static::SetCVal("xstep.cascade.unit", "MM");
-            if (reader.ReadFile(tmp.string().c_str()) != IFSelect_RetDone) throw std::runtime_error("OpenCascade could not read this IGES file.");
+            if (reader.ReadFile(fileName.c_str()) != IFSelect_RetDone) throw std::runtime_error("OpenCascade could not read this IGES file.");
             reader.TransferRoots();
             shape = reader.OneShape();
         } else {
             BRep_Builder builder;
-            if (!BRepTools::Read(shape, tmp.string().c_str(), builder)) throw std::runtime_error("OpenCascade could not read this BREP file.");
+            if (!BRepTools::Read(shape, fileName.c_str(), builder)) throw std::runtime_error("OpenCascade could not read this BREP file.");
         }
     } catch (const Standard_Failure& e) {
         throw std::runtime_error(std::string("OpenCascade could not read this file: ") + e.GetMessageString());

@@ -58,7 +58,12 @@ cd native/build && cpack
 
 ### Windows and Linux
 
-Install the same libraries with vcpkg, your package manager, or the Qt online installer. Point CMake at them with
+The [Native app workflow](https://github.com/Voided-code/parts-sim/actions/workflows/native.yml) builds a portable
+Windows x64 ZIP, a Windows installer, and a Linux x86_64 AppImage. Download the artifacts from a successful run.
+The workflow runs the engine tests, then launches each packaged app and solves the beam sample without relying on
+the build machine's Qt or CAD library paths. The first build compiles OpenCascade; later builds reuse its cache.
+
+For a local build, install the same libraries with vcpkg, your package manager, or the Qt online installer. Point CMake at them with
 `-DCMAKE_PREFIX_PATH=...` and build as above. `cpack` makes a ZIP and an NSIS installer on Windows and a `.tar.gz`
 on Linux.
 
@@ -69,6 +74,8 @@ on Linux.
 | `PARTS_SIM_APP` | ON | build the Qt app (OFF: engine and tests only) |
 | `PARTS_SIM_STEP` | ON | OpenCascade import; turned off automatically when it is not found |
 | `PARTS_SIM_GPU` | ON | wgpu-native GPU solvers; turned off automatically when it is not found |
+
+When `PARTS_SIM_APP=ON`, Qt and its private GUI headers are required. Use `-DPARTS_SIM_APP=OFF` to build only the engine and tests.
 
 Environment variables at run time:
 
@@ -99,6 +106,15 @@ The app has a small automation hook used for screenshot checks:
 PARTS_SIM_SCRIPT="sample:bracket;tab:structural;study:modal;run;idle;shot:/tmp/modal.png;quit" \
   "native/build/Parts Sim.app/Contents/MacOS/Parts Sim"
 ```
+
+To check a built or packaged app, including a successful static solve and a screenshot:
+
+```sh
+python3 native/tests/smoke_app.py "native/build/Parts Sim.app" --screenshot /tmp/parts-sim-smoke.png
+```
+
+Use `--isolated` for self-contained packages to remove developer library paths from the app's environment.
+On Linux, run this under `xvfb-run -a` when no display is available.
 
 ## Source layout
 

@@ -6,7 +6,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore: ['native/**', '.github/workflows/native.yml']
   pull_request:
+    paths-ignore: ['native/**', '.github/workflows/native.yml']
   workflow_dispatch:
 
 jobs:

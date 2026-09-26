@@ -209,6 +209,11 @@ public:
     int studyIndex() const { return study_; }
     Study* currentStudy() const { return study_ > 0 ? studies[study_ - 1].get() : nullptr; }
     bool isStale() const { return stale_; }
+    /** True only while a completed, converged linear static result is current and displayed. */
+    bool hasSuccessfulStaticResult() const {
+        return study_ == 0 && display_ == "results" && !job && !stale_ && result_ &&
+               result_->converged && !result_->unreliable && result_->voxels > 0;
+    }
     void clearStale() { stale_ = false; }
     void rememberModel(const std::shared_ptr<StructuralModel>& m);
     /** The voxel model at this resolution if it is already built for the current part. */

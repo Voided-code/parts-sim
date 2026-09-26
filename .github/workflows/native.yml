@@ -43,7 +43,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build zlib1g-dev libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
             libxkbcommon-x11-0 libvulkan-dev libx11-dev libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
-            libxcb-shape0 libxcb-xinerama0 libxcb-randr0 libxcb-render-util0 libxcb-image0 libfontconfig1
+            libxcb-shape0 libxcb-xinerama0 libxcb-randr0 libxcb-render-util0 libxcb-image0 libfontconfig1 xvfb
 
       - name: MSVC environment
         if: runner.os == 'Windows'
@@ -71,27 +71,40 @@ jobs:
 
       - name: Cache OpenCascade
         id: occt-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.OCCT_DIR }}
-          key: occt-${{ matrix.name }}-${{ env.OCCT_TAG }}-v1
+          key: occt-${{ matrix.name }}-${{ env.OCCT_TAG }}-minimal-v2
 
-      # The STEP and IGES readers (TKDESTEP, TKDEIGES) need the application-framework and part of
-      # the visualization toolkits (for colours and names); OpenGL, FreeType, Tcl/Tk and Draw are left out.
+      # Build only the linked toolkits and the dependencies OCCT discovers for them.
       - name: Build OpenCascade
         if: steps.occt-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           git clone --depth 1 --branch $env:OCCT_TAG https://github.com/Open-Cascade-SAS/OCCT.git ../occt-src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake -S ../occt-src -B ../occt-build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DINSTALL_DIR="$env:OCCT_DIR" -DINSTALL_DIR_LAYOUT=Unix -DBUILD_LIBRARY_TYPE=Shared `
-            -DBUILD_MODULE_Draw=OFF -DBUILD_MODULE_Visualization=ON -DBUILD_MODULE_ApplicationFramework=ON `
-            -DBUILD_MODULE_DataExchange=ON -DBUILD_MODULE_ModelingAlgorithms=ON -DBUILD_MODULE_ModelingData=ON `
+            -DBUILD_MODULE_FoundationClasses=OFF -DBUILD_MODULE_ModelingData=OFF -DBUILD_MODULE_ModelingAlgorithms=OFF `
+            -DBUILD_MODULE_Visualization=OFF -DBUILD_MODULE_ApplicationFramework=OFF -DBUILD_MODULE_DataExchange=OFF `
+            -DBUILD_MODULE_Draw=OFF -DBUILD_MODULE_DETools=OFF `
+            "-DBUILD_ADDITIONAL_TOOLKITS=TKernel TKMath TKBRep TKG2d TKG3d TKGeomBase TKGeomAlgo TKTopAlgo TKPrim TKBO TKOffset TKFillet TKShHealing TKMesh TKXSBase TKDESTEP TKDEIGES" `
+            -DBUILD_USE_PCH=ON `
             -DUSE_FREETYPE=OFF -DUSE_OPENGL=OFF -DUSE_GLES2=OFF -DUSE_D3D=OFF -DUSE_TK=OFF -DUSE_XLIB=OFF `
             -DUSE_FREEIMAGE=OFF -DUSE_TBB=OFF -DUSE_VTK=OFF -DUSE_RAPIDJSON=OFF -DUSE_DRACO=OFF `
             -DBUILD_DOC_Overview=OFF -DBUILD_SAMPLES_QT=OFF -DINSTALL_SAMPLES=OFF -DINSTALL_TEST_CASES=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build ../occt-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --install ../occt-build
+
+      # Save immediately: a later app or packaging failure must not discard this costly build.
+      - name: Save OpenCascade
+        if: steps.occt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.OCCT_DIR }}
+          key: ${{ steps.occt-cache.outputs.cache-primary-key }}
 
       - name: Configure
         shell: pwsh
@@ -125,6 +138,7 @@ jobs:
           }
           cd build
           cpack -G "ZIP;NSIS"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force ../dist | Out-Null
           Copy-Item Parts-Sim-*.zip, Parts-Sim-*.exe ../dist/
 
@@ -137,8 +151,8 @@ jobs:
           VERSION: '0.3.0'
         run: |
           cmake --install build --prefix AppDir/usr
-          curl -sLO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          curl -sLO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          curl -fLsSO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fLsSO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
           chmod +x linuxdeploy*.AppImage
           ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin qt \
             --desktop-file AppDir/usr/share/applications/parts-sim.desktop \
@@ -146,6 +160,20 @@ jobs:
             --output appimage
           mkdir -p dist
           mv Parts_Sim-*.AppImage "dist/Parts-Sim-$VERSION-native-Linux-x86_64.AppImage"
+
+      - name: Test packaged app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist/Parts-Sim-*.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath package-test
+          $app = Get-ChildItem package-test -Recurse -Filter 'Parts Sim.exe' | Select-Object -First 1
+          if (-not $app) { throw 'The package contains no desktop executable.' }
+          python native/tests/smoke_app.py $app.FullName --isolated --screenshot package-smoke.png
+
+      - name: Test packaged app (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python3 native/tests/smoke_app.py dist/Parts-Sim-*.AppImage --isolated --screenshot package-smoke.png
 
       - uses: actions/upload-artifact@v4
         with:

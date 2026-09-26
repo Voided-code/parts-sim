@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -51,7 +52,10 @@ const std::vector<std::string>& supportedExtensions() {
 }
 
 MeshSource importFile(const std::string& path, const SiblingReader& readSibling) {
-    std::ifstream in(path, std::ios::binary);
+    // path is UTF-8: build the file-system path from it explicitly (Windows would otherwise read it
+    // in the local code page and fail on names with accents or other scripts)
+    const std::filesystem::path filePath(std::u8string(path.begin(), path.end()));
+    std::ifstream in(filePath, std::ios::binary);
     if (!in) throw std::runtime_error("Could not open the file.");
     Bytes data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     const size_t slash = path.find_last_of("/\\");
