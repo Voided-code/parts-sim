@@ -4,6 +4,9 @@ project(PartsSim VERSION 0.3.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# OCCT exports its precompiled headers to consumers. Keep those Windows/system
+# headers out of unrelated app and solver sources; OCCT itself still builds with PCH.
+set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
