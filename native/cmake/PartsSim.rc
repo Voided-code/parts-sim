@@ -1,0 +1,2 @@
+// Windows resources: the program icon shown in Explorer, the taskbar and the Start menu.
+IDI_ICON1 ICON "PartsSim.ico"

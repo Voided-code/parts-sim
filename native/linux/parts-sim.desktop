@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Parts Sim
+GenericName=Simulation
+Comment=Structural, thermal and airflow simulation for CAD parts
+Exec=parts-sim %F
+Icon=parts-sim
+Terminal=false
+Categories=Science;Engineering;
+MimeType=model/step;model/iges;model/stl;model/obj;model/gltf-binary;model/gltf+json;model/3mf;

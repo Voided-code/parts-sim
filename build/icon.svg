@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3d55"/>
+      <stop offset="1" stop-color="#0d131b"/>
+    </linearGradient>
+    <linearGradient id="stress" x1="0" y1="1" x2="0.35" y2="0">
+      <stop offset="0" stop-color="#1f5cff"/>
+      <stop offset="0.3" stop-color="#18d6ff"/>
+      <stop offset="0.55" stop-color="#2fe07a"/>
+      <stop offset="0.78" stop-color="#ffd21f"/>
+      <stop offset="1" stop-color="#ff3b30"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#shine)"/>
+  <!-- airflow lines -->
+  <g fill="none" stroke="#7fb4ff" stroke-width="16" stroke-linecap="round" opacity="0.55">
+    <path d="M470 230 C 560 230, 620 205, 700 205 S 820 225, 850 230"/>
+    <path d="M470 330 C 560 330, 620 300, 700 300 S 800 320, 850 330"/>
+  </g>
+  <!-- L-bracket in stress colours (bent slightly, like a deformed plot) -->
+  <path d="M250 820 L 250 470 Q 250 430 290 432 L 385 438 Q 420 440 420 475 L 420 650 Q 420 680 450 680 L 760 680 Q 800 680 800 720 L 800 790 Q 800 820 770 820 Z"
+        fill="url(#stress)"/>
+  <path d="M250 820 L 250 470 Q 250 430 290 432 L 385 438 Q 420 440 420 475 L 420 650 Q 420 680 450 680 L 760 680 Q 800 680 800 720 L 800 790 Q 800 820 770 820 Z"
+        fill="none" stroke="#0b1016" stroke-opacity="0.35" stroke-width="10" stroke-linejoin="round"/>
+  <!-- force arrow -->
+  <g fill="#e879f9">
+    <rect x="324" y="190" width="22" height="160" rx="11"/>
+    <path d="M300 334 L 370 334 L 335 416 Z"/>
+  </g>
+</svg>

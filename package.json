@@ -1,0 +1,167 @@
+{
+  "name": "parts-sim",
+  "version": "0.3.0",
+  "description": "Open-source desktop app for structural (static, nonlinear, frequency, buckling, fatigue, drop, dynamic, optimization), thermal and airflow simulation of STEP, SolidWorks, IGES, STL and OBJ parts.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "keywords": [
+    "cad",
+    "cfd",
+    "desktop",
+    "electron",
+    "fea",
+    "lattice-boltzmann",
+    "simulation",
+    "sldprt",
+    "solidworks",
+    "step",
+    "stl",
+    "stress",
+    "three.js"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "desktop": "vite build && node scripts/run-desktop.mjs",
+    "dist:mac": "vite build && electron-builder --mac",
+    "dist:win": "vite build && electron-builder --win",
+    "dist:linux": "vite build && electron-builder --linux",
+    "test": "node --test test/*.test.js",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "test:desktop": "node scripts/desktop-smoke.mjs",
+    "test:studies": "node scripts/studies-smoke.mjs"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "devDependencies": {
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "occt-import-js": "^0.0.23",
+    "playwright": "^1.63.0",
+    "three": "^0.186.1",
+    "three-mesh-bvh": "^0.9.15",
+    "vite": "^8.3.1"
+  },
+  "main": "electron/main.mjs",
+  "author": {
+    "name": "Parts Sim contributors"
+  },
+  "build": {
+    "appId": "org.partssim.app",
+    "productName": "Parts Sim",
+    "copyright": "Copyright © 2026 Parts Sim contributors",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "build/icon.png",
+      "package.json"
+    ],
+    "asar": true,
+    "fileAssociations": [
+      {
+        "ext": [
+          "sldprt",
+          "sldasm"
+        ],
+        "name": "SolidWorks Part",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": [
+          "step",
+          "stp",
+          "iges",
+          "igs"
+        ],
+        "name": "STEP or IGES Model",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": [
+          "stl",
+          "obj",
+          "3mf"
+        ],
+        "name": "3D Mesh",
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.graphics-design",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "darkModeSupport": true
+    },
+    "dmg": {
+      "title": "Parts Sim"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "Parts Sim"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "tar.gz",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Science",
+      "synopsis": "Structural, thermal and airflow simulation for CAD parts"
+    },
+    "afterPack": "build/after-pack.cjs"
+  }
+}

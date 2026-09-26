@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Open-source structural, thermal and airflow simulation for STEP, SolidWorks, IGES, STL and OBJ parts." />
+    <title>Parts Sim</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='1' x2='0' y2='0'%3E%3Cstop offset='0' stop-color='%230047ff'/%3E%3Cstop offset='.35' stop-color='%2300d9ff'/%3E%3Cstop offset='.6' stop-color='%2325d366'/%3E%3Cstop offset='.8' stop-color='%23ffd400'/%3E%3Cstop offset='1' stop-color='%23ff2a2a'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M4 26h7V10h6v16h11v-5H22V6H4z' fill='url(%23g)'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <span class="brand-name">Parts Sim</span>
+        <span class="brand-tag">structural · thermal · airflow</span>
+      </div>
+      <div class="toolbar">
+        <button id="btn-open" class="btn primary" title="Import STEP, IGES, SolidWorks (SLDPRT/SLDASM), STL, OBJ, 3MF, PLY or GLB">
+          <svg viewBox="0 0 24 24"><path d="M4 20h16M12 4v11m0 0-4-4m4 4 4-4" /></svg>Import part
+        </button>
+        <input id="file-input" type="file" hidden />
+        <div class="dropdown" id="samples-dd">
+          <button class="btn" id="btn-samples">Samples <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg></button>
+          <div class="menu" id="samples-menu" role="menu"></div>
+        </div>
+        <span class="sep"></span>
+        <div class="seg" role="group" aria-label="Views">
+          <button data-view="iso" title="Isometric">Iso</button>
+          <button data-view="front" title="Front (+Z)">Front</button>
+          <button data-view="top" title="Top (+Y)">Top</button>
+          <button data-view="right" title="Right (+X)">Right</button>
+        </div>
+        <span class="sep"></span>
+        <label class="toggle" title="Show feature edges"><input type="checkbox" id="chk-edges" checked /> Edges</label>
+        <label class="toggle" title="See-through part (shows internal cracks)"><input type="checkbox" id="chk-xray" /> X-ray</label>
+        <button class="btn icon" id="btn-shot" title="Save screenshot (PNG)">
+          <svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><circle cx="12" cy="13" r="3.5" /></svg>
+        </button>
+        <button class="btn icon" id="btn-help" title="How it works">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .8-1 1.5V14M12 17.2v.1" /></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <nav class="tabs" role="tablist">
+          <button role="tab" data-tab="part" class="active">Part</button>
+          <button role="tab" data-tab="structural">Structural</button>
+          <button role="tab" data-tab="thermal">Thermal</button>
+          <button role="tab" data-tab="airflow">Airflow</button>
+        </nav>
+
+        <!-- PART -->
+        <section class="panel" data-panel="part">
+          <div class="card">
+            <h3>Geometry</h3>
+            <p class="muted" id="part-empty">Import a CAD file or open a sample to get started. You can also drop a file onto the viewport.</p>
+            <dl class="stats" id="part-stats" hidden></dl>
+          </div>
+          <div class="card" id="material-card">
+            <h3>Material</h3>
+            <p class="muted small">Used by every study: stiffness and strength (structural), conductivity and heat capacity (thermal), and the part's weight against the wind (airflow).</p>
+            <select id="mat-select"></select>
+            <div class="prop-grid" id="mat-props"></div>
+          </div>
+          <div class="card">
+            <h3>Size</h3>
+            <p class="muted small">Scale the part up or down. Fixtures and loads stay on the same faces.</p>
+            <div class="size-grid">
+              <label>Scale by <input type="number" id="scale-factor" value="1" min="0.0001" step="0.1" /></label>
+              <button class="btn" id="btn-scale">Scale</button>
+              <label>Longest side <span class="unit" id="size-unit">mm</span><input type="number" id="target-size" min="0" step="any" /></label>
+              <button class="btn" id="btn-size">Set size</button>
+            </div>
+            <div class="row gap-s wrap" style="margin-top:8px">
+              <button class="btn small" data-scale="0.1">× 0.1</button>
+              <button class="btn small" data-scale="0.5">× 0.5</button>
+              <button class="btn small" data-scale="2">× 2</button>
+              <button class="btn small" data-scale="10">× 10</button>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Units</h3>
+            <p class="muted small">STEP, IGES and SolidWorks files carry their own units. For STL/OBJ, choose the unit the file was modelled in.</p>
+            <div class="seg wide" id="units-seg">
+              <button data-unit="mm" class="active">mm</button>
+              <button data-unit="cm">cm</button>
+              <button data-unit="m">m</button>
+              <button data-unit="in">in</button>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Orientation</h3>
+            <p class="muted small">Y is up and gravity points down (−Y). Rotate the part if it was modelled Z-up.</p>
+            <div class="row gap">
+              <button class="btn" data-rotate="0">Rotate X 90°</button>
+              <button class="btn" data-rotate="1">Rotate Y 90°</button>
+              <button class="btn" data-rotate="2">Rotate Z 90°</button>
+            </div>
+          </div>
+          <div class="card" id="face-card">
+            <h3>Face detection</h3>
+            <p class="muted small">Mesh files have no CAD faces, so faces are grown across edges bent less than this angle. Click-selection uses these faces.</p>
+            <div class="field">
+              <input type="range" id="face-angle" min="2" max="60" value="20" />
+              <output id="face-angle-out">20°</output>
+            </div>
+          </div>
+        </section>
+
+        <!-- STRUCTURAL -->
+        <section class="panel" data-panel="structural" hidden>
+          <div class="card mat-summary">
+            <div class="row gap">
+              <span class="muted">Material</span>
+              <b id="mat-summary-name">–</b>
+              <button class="linklike" id="mat-change">change</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Study</h3>
+            <select id="study-select" aria-label="Study type">
+              <option value="static">Linear static · bend &amp; break</option>
+              <option value="nonlinear">Nonlinear static · large bending, yielding</option>
+              <option value="modal">Frequency · natural vibration modes</option>
+              <option value="buckling">Buckling · critical load factor</option>
+              <option value="fatigue">Fatigue · life under repeated loads</option>
+              <option value="drop">Drop test · impact on the floor</option>
+              <option value="dynamic">Linear dynamic · vibration, shock, earthquake</option>
+              <option value="optimize">Optimization · lighter or cheaper design</option>
+            </select>
+            <p class="muted small" id="study-desc" style="margin:8px 0 0"></p>
+          </div>
+
+          <div class="card" id="study-options" hidden></div>
+
+          <div class="card" id="fixtures-card">
+            <div class="card-head">
+              <h3>Fixtures</h3>
+              <button class="btn small" id="btn-add-fixture">+ Fixed support</button>
+            </div>
+            <ul class="items" id="fixture-list"></ul>
+          </div>
+
+          <div class="card" id="loads-card">
+            <div class="card-head">
+              <h3>Loads</h3>
+              <div class="row gap-s">
+                <button class="btn small" id="btn-add-force">+ Force</button>
+                <button class="btn small" id="btn-add-pressure">+ Pressure</button>
+              </div>
+            </div>
+            <ul class="items" id="load-list"></ul>
+            <div id="load-editor" hidden></div>
+            <label class="check"><input type="checkbox" id="chk-gravity" /> Include self-weight (gravity −Y)</label>
+          </div>
+
+          <div class="card" id="mesh-card">
+            <h3>Mesh</h3>
+            <div class="field">
+              <label for="res-range">Voxels on longest side</label>
+              <input type="range" id="res-range" min="16" max="480" step="4" value="56" />
+              <output id="res-out">56</output>
+            </div>
+            <label class="check"><input type="checkbox" id="chk-voxels" /> Preview voxel mesh</label>
+            <div class="field">
+              <label for="fea-engine">Solver</label>
+              <select id="fea-engine">
+                <option value="auto">GPU (WebGPU), CPU if unavailable</option>
+                <option value="cpu">CPU (Web Worker)</option>
+              </select>
+            </div>
+            <p class="muted small" id="mesh-info"></p>
+          </div>
+
+          <div class="run-row">
+            <button class="btn primary big" id="btn-run">Run bend test</button>
+            <button class="btn big" id="btn-break">Break test</button>
+          </div>
+
+          <div class="card" id="results-card" hidden>
+            <h3>Results</h3>
+            <div class="alert" id="results-alert" role="alert" hidden></div>
+            <div class="kpis" id="kpis"></div>
+            <div class="field">
+              <label for="plot-select">Plot</label>
+              <select id="plot-select">
+                <option value="vm">von Mises stress</option>
+                <option value="disp">Displacement</option>
+                <option value="fos">Factor of safety</option>
+                <option value="p1">Max principal stress (tension)</option>
+                <option value="p3">Min principal stress (compression)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Show the part at</label>
+              <div class="seg wide" id="load-level">
+                <button data-level="applied" class="active" title="The loads you set">Applied load</button>
+                <button data-level="yield" title="Load at which the material first yields">First yield</button>
+                <button data-level="break" title="Load at which it breaks (true-scale bending)">Breaking load</button>
+              </div>
+            </div>
+            <button class="btn" id="btn-bend-break" style="margin-top:8px;width:100%">▶ Bend until it breaks</button>
+            <p class="muted small" id="load-level-note" style="margin:6px 0 0"></p>
+            <div class="field">
+              <label for="scale-range">Deformed shape (0 = keep the part's shape)</label>
+              <input type="range" id="scale-range" min="0" max="100" value="0" />
+              <output id="scale-out">off</output>
+            </div>
+            <div class="row gap wrap">
+              <label class="check"><input type="checkbox" id="chk-animate" /> Animate</label>
+              <label class="check"><input type="checkbox" id="chk-bands" /> Contour bands</label>
+              <label class="check"><input type="checkbox" id="chk-heat" /> Heat colours</label>
+              <label class="check"><input type="checkbox" id="chk-bcs" /> Show loads</label>
+              <label class="check"><input type="checkbox" id="chk-marker" checked /> Weakest point</label>
+            </div>
+          </div>
+
+          <div class="card" id="break-card" hidden>
+            <h3>Break test</h3>
+            <div class="kpis" id="break-kpis"></div>
+            <div class="chart-wrap">
+              <div class="chart-title">Load needed to grow the crack</div>
+              <canvas id="break-chart" height="150"></canvas>
+              <div class="chart-tip" id="break-tip" hidden></div>
+            </div>
+            <div class="field">
+              <label for="break-step">Crack step</label>
+              <input type="range" id="break-step" min="0" max="0" value="0" />
+              <output id="break-step-out">0</output>
+            </div>
+            <div class="row gap">
+              <button class="btn small" id="btn-break-play">▶ Play</button>
+              <label class="check"><input type="checkbox" id="chk-break-stress" checked /> Stress colours</label>
+            </div>
+          </div>
+
+          <div class="card" id="study-card" hidden>
+            <h3 id="study-title">Results</h3>
+            <div class="alert" id="study-alert" role="alert" hidden></div>
+            <div class="kpis" id="study-kpis"></div>
+            <div id="study-body"></div>
+          </div>
+        </section>
+
+        <!-- THERMAL -->
+        <section class="panel" data-panel="thermal" hidden>
+          <div class="card mat-summary">
+            <div class="row gap">
+              <span class="muted">Material</span>
+              <b id="th-mat-name">–</b>
+              <span class="muted small" id="th-mat-props"></span>
+              <button class="linklike" id="th-mat-change">change</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h3>Heat</h3>
+            </div>
+            <div class="row gap-s wrap">
+              <button class="btn small" id="btn-th-temp" title="Hold faces at a temperature">+ Temperature</button>
+              <button class="btn small" id="btn-th-heat" title="Heat power into faces (e.g. a chip, a heater)">+ Heat power</button>
+              <button class="btn small" id="btn-th-conv" title="Faces cooled by air or liquid">+ Convection</button>
+            </div>
+            <ul class="items" id="th-list" style="margin-top:8px"></ul>
+            <div id="th-editor" hidden></div>
+            <label class="check"><input type="checkbox" id="th-ambient" checked /> Convection on all other faces</label>
+            <div class="prop-grid" id="th-ambient-props">
+              <label>Film coefficient <span class="unit">W/m²K</span><input type="number" id="th-ambient-h" value="10" min="0" step="any" /></label>
+              <label>Air temperature <span class="unit">°C</span><input type="number" id="th-ambient-t" value="20" step="any" /></label>
+            </div>
+            <p class="muted small" style="margin:6px 0 0">Still air ≈ 5–10 W/m²K, a fan ≈ 25–100, water ≈ 500–5000.</p>
+          </div>
+          <div class="card">
+            <h3>Analysis</h3>
+            <div class="seg wide" id="th-mode">
+              <button data-mode="steady" class="active">Steady state</button>
+              <button data-mode="transient">Over time</button>
+            </div>
+            <div class="prop-grid" id="th-transient" hidden style="margin-top:8px">
+              <label>Duration <span class="unit">s</span><input type="number" id="th-duration" value="600" min="0.001" step="any" /></label>
+              <label>Time steps<input type="number" id="th-steps" value="40" min="2" max="400" step="1" /></label>
+              <label>Starting temperature <span class="unit">°C</span><input type="number" id="th-initial" value="20" step="any" /></label>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Mesh</h3>
+            <div class="field">
+              <label for="th-res">Voxels on longest side</label>
+              <input type="range" id="th-res" min="16" max="480" step="4" value="56" />
+              <output id="th-res-out">56</output>
+            </div>
+            <p class="muted small" id="th-mesh-info"></p>
+          </div>
+          <div class="run-row">
+            <button class="btn primary big" id="btn-th-run">Run heat transfer</button>
+          </div>
+          <div class="card" id="th-results" hidden>
+            <h3>Results</h3>
+            <div class="alert" id="th-alert" role="alert" hidden></div>
+            <div class="kpis" id="th-kpis"></div>
+            <div class="field">
+              <label for="th-plot">Plot</label>
+              <select id="th-plot">
+                <option value="T">Temperature</option>
+                <option value="flux">Heat flux</option>
+              </select>
+            </div>
+            <div id="th-time" hidden>
+              <div class="chart-wrap">
+                <div class="chart-title">Hottest and coldest point over time</div>
+                <canvas id="th-chart" height="150"></canvas>
+                <div class="chart-tip" id="th-tip" hidden></div>
+              </div>
+              <div class="field">
+                <label for="th-frame">Time</label>
+                <input type="range" id="th-frame" min="0" max="0" value="0" />
+                <output id="th-frame-out">0 s</output>
+              </div>
+              <button class="btn small" id="btn-th-play">▶ Play</button>
+            </div>
+            <div class="row gap wrap">
+              <label class="check"><input type="checkbox" id="th-bands" /> Contour bands</label>
+              <label class="check"><input type="checkbox" id="th-bcs" /> Show heat inputs</label>
+            </div>
+          </div>
+        </section>
+
+        <!-- AIRFLOW -->
+        <section class="panel" data-panel="airflow" hidden>
+          <div class="card">
+            <h3>Wind</h3>
+            <p class="muted small">Direction the air travels. The blue arrow in the view shows it.</p>
+            <div class="seg wide" id="wind-presets">
+              <button data-yaw="90" data-pitch="0" title="Air moves toward +X">→ +X</button>
+              <button data-yaw="-90" data-pitch="0" title="Air moves toward −X">← −X</button>
+              <button data-yaw="0" data-pitch="0" title="Air moves toward −Z (hits the front)">−Z</button>
+              <button data-yaw="180" data-pitch="0" title="Air moves toward +Z">+Z</button>
+              <button data-yaw="0" data-pitch="-90" title="Air falls onto the part from above">↓ −Y</button>
+            </div>
+            <div class="field">
+              <label for="yaw-range">Yaw</label>
+              <input type="range" id="yaw-range" min="-180" max="180" value="90" />
+              <output id="yaw-out">90°</output>
+            </div>
+            <div class="field">
+              <label for="pitch-range">Pitch (angle of attack)</label>
+              <input type="range" id="pitch-range" min="-90" max="90" value="0" />
+              <output id="pitch-out">0°</output>
+            </div>
+            <div class="prop-grid">
+              <label>Speed <span class="unit">m/s</span><input type="number" id="wind-speed" value="20" min="0.1" step="1" /></label>
+              <label>Air density <span class="unit">kg/m³</span><input type="number" id="air-density" value="1.225" step="0.01" /></label>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Solver</h3>
+            <div class="field">
+              <label for="engine-select">Engine</label>
+              <select id="engine-select">
+                <option value="auto">Auto (WebGPU if available)</option>
+                <option value="cpu">CPU (Web Worker)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="flow-cells">Grid size</label>
+              <input type="range" id="flow-cells" min="0" max="1000" value="500" />
+              <output id="flow-cells-out">1 M</output>
+            </div>
+            <p class="muted small" id="flow-cells-info"></p>
+            <p class="muted small" id="gpu-info"></p>
+          </div>
+          <div class="run-row">
+            <button class="btn primary big" id="btn-flow-run">Run airflow</button>
+            <button class="btn big" id="btn-flow-reset" disabled>Reset</button>
+          </div>
+          <div class="card" id="flow-card" hidden>
+            <h3>Aerodynamics</h3>
+            <div class="kpis" id="flow-kpis"></div>
+            <p class="muted small" id="flow-state"></p>
+          </div>
+          <div class="card" id="flow-display" hidden>
+            <h3>Display</h3>
+            <div class="row gap wrap">
+              <label class="check"><input type="checkbox" id="chk-cp" checked /> Surface pressure</label>
+              <label class="check"><input type="checkbox" id="chk-particles" checked /> Particles</label>
+              <label class="check"><input type="checkbox" id="chk-streamlines" /> Streamlines</label>
+              <label class="check"><input type="checkbox" id="chk-domain" checked /> Tunnel box</label>
+            </div>
+            <label class="check"><input type="checkbox" id="chk-slice" /> Slice plane</label>
+            <div id="slice-controls" hidden>
+              <div class="row gap">
+                <select id="slice-axis">
+                  <option value="xz">Horizontal</option>
+                  <option value="xy">Vertical (along wind)</option>
+                  <option value="yz">Cross-section</option>
+                </select>
+                <select id="slice-qty">
+                  <option value="speed">Speed</option>
+                  <option value="pressure">Pressure</option>
+                </select>
+              </div>
+              <div class="field">
+                <input type="range" id="slice-pos" min="0" max="100" value="50" />
+                <output id="slice-pos-out">50%</output>
+              </div>
+            </div>
+            <button class="btn" id="btn-wind-load">Use as load in bend test →</button>
+          </div>
+        </section>
+      </aside>
+
+      <div class="viewport" id="viewport">
+        <div class="empty" id="empty-state">
+          <div class="empty-inner">
+            <div class="empty-title">Drop a STEP, SolidWorks, STL or OBJ file here</div>
+            <div class="muted">or <button class="linklike" id="empty-open">browse</button> · <button class="linklike" id="empty-sample">open a sample</button></div>
+          </div>
+        </div>
+        <div class="drop-overlay" id="drop-overlay">Drop to import</div>
+        <div class="legend" id="legend" hidden></div>
+        <div class="probe" id="probe" hidden></div>
+        <div class="picker" id="picker" hidden>
+          <span class="picker-title" id="picker-title"></span>
+          <div class="seg" id="picker-mode">
+            <button data-mode="face" class="active" title="Click CAD faces">Face</button>
+            <button data-mode="brush" title="Paint a circular area">Brush</button>
+          </div>
+          <label class="picker-radius" id="picker-radius-wrap" hidden>Radius <input type="range" id="picker-radius" min="1" max="30" value="5" /></label>
+          <button class="btn small primary" id="picker-done">Done</button>
+          <button class="btn small" id="picker-cancel">Cancel</button>
+        </div>
+        <div class="hint" id="hint" hidden></div>
+        <div class="busy" id="busy" hidden>
+          <div class="busy-row"><span class="spinner"></span><span id="busy-text">Working…</span></div>
+          <div class="bar"><span id="busy-bar"></span></div>
+          <button class="btn small" id="busy-cancel">Cancel</button>
+        </div>
+      </div>
+    </main>
+
+    <footer class="statusbar">
+      <span id="status">Ready.</span>
+      <span class="muted" id="status-right"></span>
+    </footer>
+
+    <dialog id="help">
+      <form method="dialog">
+        <h2>How Parts Sim works</h2>
+        <p><b>Linear static (bend test).</b> The part is voxelised into 8-node hexahedral elements with incompatible bending modes and solved with a multigrid-preconditioned conjugate-gradient solver on the GPU (WebGPU), or on the CPU when no GPU is available. Stresses are recovered at the element corners and averaged, like the nodal stress plots in commercial FEA.</p>
+        <p><b>Break test.</b> A progressive-damage model: the voxel that first reaches the material's strength is removed, the model is re-solved, and this repeats until the load path is severed. It shows where cracks start and how they run.</p>
+        <p><b>Nonlinear static.</b> Large rotations (co-rotational elements) and metal plasticity (von Mises yield with hardening up to the tensile strength at the elongation at break), solved by Newton iterations with automatic load steps. It can ramp the load until the part collapses or tears, then unloads to show the permanent bend.</p>
+        <p><b>Frequency and buckling.</b> The lowest natural frequencies (with effective mass) and buckling load factors come from a block eigen-solver (LOBPCG) preconditioned by the same multigrid. Without fixtures the part is free-floating and its six rigid-body modes are skipped.</p>
+        <p><b>Fatigue.</b> Stress-life (S-N) estimate from the static stresses: Basquin line from the tensile strength to the fatigue strength, a surface-finish factor for metals and the Goodman mean-stress correction.</p>
+        <p><b>Drop test.</b> Explicit dynamics on the GPU: the part hits a rigid floor at the speed of a free fall from the drop height; the peak stress anywhere during the impact is kept.</p>
+        <p><b>Linear dynamic.</b> Modal superposition with the mode-acceleration correction: frequency sweeps (harmonic loads or base shaking), shock pulses, sine bursts and a synthetic earthquake, with modal damping.</p>
+        <p><b>Optimization.</b> Topology optimization (SIMP, density filter) removes material while keeping the part as stiff as possible for a target mass. The size and material study finds the smallest size of each material that keeps the safety factor, and ranks them by weight or cost.</p>
+        <p><b>Thermal.</b> Steady or transient heat conduction with fixed temperatures, heat inputs and convection, solved with a multigrid-preconditioned conjugate-gradient method.</p>
+        <p><b>Airflow.</b> A 3D lattice-Boltzmann (D3Q19) solver with a Smagorinsky turbulence model runs on the GPU through WebGPU, or on the CPU as a fallback. Curved walls are placed at their true position on the grid (interpolated bounce-back). Pressure drag, lift and surface pressure come from the time-averaged flow. Drag of bluff shapes is typically within 10–30% of wind-tunnel data. Lift on thin wings is under-predicted because the chord only spans a few dozen cells. Use it to compare designs, see the flow and estimate wind loads, not for certification.</p>
+        <p><b>SolidWorks files.</b> Parts and assemblies from SolidWorks 2015 or newer open without SolidWorks, using the display mesh saved in the file. Assemblies need their part files alongside them: the desktop app finds them in the same folder; in a browser, select them together. Older files, or parts saved without display data, need a STEP export.</p>
+        <p><b>Picking.</b> Add a fixture or load, then click faces (or switch to Brush and paint an area). Drag the purple arrow's tail to aim a force, or use the direction buttons.</p>
+        <p class="muted small">Everything runs on your computer. Nothing is uploaded. Results are engineering estimates: check critical parts with a physical test or a certified analysis.</p>
+        <div class="row end"><button class="btn primary">Got it</button></div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
