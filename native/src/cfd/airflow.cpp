@@ -22,7 +22,7 @@ constexpr double MIN_NU_LAT = 0.0005;
 // memory per cell on the GPU: f-in / f-out (2 x 19 populations, 16-bit where supported), moments,
 // solid flag, cell flags, wall links, read-back copy
 double gpuBytesPerCell() {
-    const bool half = gpuAvailable() && GpuContext::get()->shaderF16;
+    const bool half = gpuShaderF16();
     return 2 * 19 * (half ? 2 : 4) + 16 + 4 + 4 + 19 + 16;
 }
 // host: solid flag, wall links, up to three snapshots (moments + averages), a read-back copy, the voxelizer

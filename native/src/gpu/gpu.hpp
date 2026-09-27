@@ -24,6 +24,8 @@ bool gpuAvailable();
 std::string gpuUnavailableReason();
 /** Adapter name for the UI (e.g. "Apple M5 (Metal)"). */
 std::string gpuName();
+/** Can the GPU's shaders use 16-bit floats (false without a GPU)? */
+bool gpuShaderF16();
 
 /** WGSL sources embedded at build time: "fea", "explicit", "lbm". */
 const char* wgslSource(const std::string& name);

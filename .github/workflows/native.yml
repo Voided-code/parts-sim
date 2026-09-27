@@ -12,11 +12,11 @@ on:
     paths: ['native/**', '.github/workflows/native.yml']
   workflow_dispatch:
     inputs:
-      windows_compiler:
-        description: Windows C++ compiler (msvc only to compare; its builds leave the CPU solvers unvectorized)
+      compiler:
+        description: C++ compiler (system = MSVC on Windows and GCC on Linux, only to compare; the CPU solvers are tuned for clang)
         type: choice
-        options: [clang-cl, msvc]
-        default: clang-cl
+        options: [clang, system]
+        default: clang
 
 env:
   QT_VERSION: '6.8.3'
@@ -112,14 +112,15 @@ jobs:
           path: ${{ env.OCCT_DIR }}
           key: ${{ steps.occt-cache.outputs.cache-primary-key }}
 
-      # Windows builds with clang-cl (LLVM ships with the runner image; it links against the MSVC-built
-      # Qt and OpenCascade): MSVC ignores the vector types and loop hints of the CPU solvers.
+      # Both build with clang, which ships with the runner images and links against the MSVC- and
+      # GCC-built Qt and OpenCascade: MSVC ignores the CPU solvers' vector types and loop hints, and
+      # GCC's code for them is several times slower.
       - name: Configure
         shell: pwsh
         run: |
           $compiler = @()
-          if ($IsWindows -and '${{ inputs.windows_compiler }}' -ne 'msvc') {
-            $compiler = '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl'
+          if ('${{ inputs.compiler }}' -ne 'system') {
+            $compiler = if ($IsWindows) { '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl' } else { '-DCMAKE_C_COMPILER=clang', '-DCMAKE_CXX_COMPILER=clang++' }
           }
           cmake -S native -B build -G Ninja -DCMAKE_BUILD_TYPE=Release @compiler `
             -DCMAKE_PREFIX_PATH="$env:OCCT_DIR" -DWGPU_NATIVE_DIR="$env:WGPU_NATIVE_DIR" `

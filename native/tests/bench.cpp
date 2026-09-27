@@ -114,7 +114,7 @@ static void lbm(const char* name, int nx, int ny, int nz, bool gpu, int steps, b
     const auto m = sim->macro();
     const double read = since(t0);
     // pull scheme: 19 populations read + 19 written per cell and step
-    const double bytes = 38.0 * (gpu && half && GpuContext::get()->shaderF16 ? 2 : 4);
+    const double bytes = 38.0 * (gpu && half && gpuShaderF16() ? 2 : 4);
     std::printf("%-22s %7.2f M cells  setup %6.0f ms  %6.1f MLUPS  (%5.1f GB/s)  read-back %5.0f ms\n", name, cells / 1e6, 1e3 * setup,
                 cells * steps / t / 1e6, cells * steps * bytes / t / 1e9, 1e3 * read);
 }

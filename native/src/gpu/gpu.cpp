@@ -274,4 +274,12 @@ std::string gpuName() {
     return "";
 }
 
+bool gpuShaderF16() {
+#ifdef PARTS_SIM_HAS_GPU
+    return gpuAvailable() && GpuContext::get()->shaderF16;
+#else
+    return false;
+#endif
+}
+
 }  // namespace ps
