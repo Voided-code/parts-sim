@@ -51,8 +51,9 @@ try {
   // 1. SolidWorks assembly from argv, part resolved from the same folder
   await page.waitForFunction(() => window.partsSim?.part, null, { timeout: 60000 });
   await idle();
-  const asm = await page.evaluate(() => ({ info: window.partsSim.partInfo, size: window.partsSim.part.bbox.size.map(Math.round), desktop: !!window.partsSim.desktop, title: document.title }));
+  const asm = await page.evaluate(() => ({ info: window.partsSim.partInfo, size: window.partsSim.part.bbox.size.map(Math.round), desktop: !!window.partsSim.desktop, title: document.title, isolated: crossOriginIsolated }));
   assert.equal(asm.desktop, true);
+  assert.equal(asm.isolated, true, 'cross-origin isolation (the solvers\' shared-memory threads)');
   assert.match(asm.info, /3 of 3 components/, asm.info);
   assert.deepEqual(asm.size, [140, 120, 20]);
   assert.match(asm.title, /robot — Parts Sim/);
