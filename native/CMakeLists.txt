@@ -19,6 +19,9 @@ if(MSVC)
   # sources are UTF-8 (°, µ, × in UI strings); no min/max macros from windows.h
   add_compile_options(/W3 /permissive- /Zc:__cplusplus /bigobj /utf-8)
   add_compile_definitions(_USE_MATH_DEFINES NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_options(/clang:-O3) # clang-cl: the same optimization as the macOS and Linux builds
+  endif()
 else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter)
   if(CMAKE_BUILD_TYPE STREQUAL "Release")

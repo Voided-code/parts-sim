@@ -5,6 +5,7 @@
 #include <limits>
 
 #include "../util/parallel.hpp"
+#include "../util/trace.hpp"
 #include "bvh.hpp"
 
 namespace ps {
@@ -28,30 +29,34 @@ std::vector<float> voxelize(const std::vector<float>& pos, const std::vector<uin
     const size_t nTri = index.size() / 3;
     // tiny irrational offsets keep rays off shared edges and vertices of axis-aligned CAD geometry
     const double jitter[3] = {0.000137 * ds, 0.000291 * ds, 0.000213 * ds};
+    TraceTimer trace("  rasterize");
 
     for (int a = 0; a < 3; a++) {
+        if (a > 0) trace.lap("  rasterize");
         const int u = (a + 1) % 3, v = (a + 2) % 3;
         const int Nu = S[u], Nv = S[v], Na = S[a];
         const double ou = grid.origin[u] + jitter[u], ov = grid.origin[v] + jitter[v];
         const size_t nRays = size_t(Nu) * Nv;
-        std::vector<uint32_t> counts(nRays + 1, 0);
-        std::vector<float> hits;
-        // pass 0 counts hits per ray, pass 1 stores them
-        for (int pass = 0; pass < 2; pass++) {
-            std::vector<uint32_t> fill;
-            if (pass == 1) fill.assign(counts.begin(), counts.end() - 1);
+        // Rays are numbered su + Nu * sv, so a band of rows sv is a contiguous range of rays: the
+        // bands rasterize in parallel, each reading every triangle (in order, so each ray's hit
+        // list is the same as a serial pass) and touching only its own rays.
+        const int bands = std::max(1, std::min<int>(Nv, 2 * int(ThreadPool::instance().size())));
+        auto raster = [&](int band, auto&& hit) {
+            const int rowLo = int(int64_t(Nv) * band / bands), rowHi = int(int64_t(Nv) * (band + 1) / bands) - 1;
             for (size_t t = 0; t < nTri; t++) {
                 const size_t i0 = 3 * size_t(index[3 * t]), i1 = 3 * size_t(index[3 * t + 1]), i2 = 3 * size_t(index[3 * t + 2]);
-                const double au = pos[i0 + u], av = pos[i0 + v], aa = pos[i0 + a];
-                const double bu = pos[i1 + u], bv = pos[i1 + v], ba = pos[i1 + a];
-                const double cu = pos[i2 + u], cv = pos[i2 + v], ca = pos[i2 + a];
+                const double av = pos[i0 + v], bv = pos[i1 + v], cv = pos[i2 + v];
+                const int sv0 = std::max(rowLo, int(std::ceil((std::min({av, bv, cv}) - ov) / ds - 0.5)));
+                const int sv1 = std::min(rowHi, int(std::floor((std::max({av, bv, cv}) - ov) / ds - 0.5)));
+                if (sv0 > sv1) continue;
+                const double au = pos[i0 + u], aa = pos[i0 + a];
+                const double bu = pos[i1 + u], ba = pos[i1 + a];
+                const double cu = pos[i2 + u], ca = pos[i2 + a];
                 const double det = (bv - cv) * (au - cu) + (cu - bu) * (av - cv);
                 if (det == 0) continue;
                 const int su0 = std::max(0, int(std::ceil((std::min({au, bu, cu}) - ou) / ds - 0.5)));
                 const int su1 = std::min(Nu - 1, int(std::floor((std::max({au, bu, cu}) - ou) / ds - 0.5)));
-                const int sv0 = std::max(0, int(std::ceil((std::min({av, bv, cv}) - ov) / ds - 0.5)));
-                const int sv1 = std::min(Nv - 1, int(std::floor((std::max({av, bv, cv}) - ov) / ds - 0.5)));
-                if (su0 > su1 || sv0 > sv1) continue;
+                if (su0 > su1) continue;
                 const double inv = 1 / det;
                 for (int sv = sv0; sv <= sv1; sv++) {
                     const double pv = ov + (sv + 0.5) * ds;
@@ -63,27 +68,32 @@ std::vector<float> voxelize(const std::vector<float>& pos, const std::vector<uin
                         if (l2 < 0) continue;
                         const double l3 = 1 - l1 - l2;
                         if (l3 < 0) continue;
-                        const size_t ray = size_t(su) + size_t(Nu) * sv;
-                        if (pass == 0) counts[ray]++;
-                        else hits[fill[ray]++] = float(l1 * aa + l2 * ba + l3 * ca);
+                        hit(size_t(su) + size_t(Nu) * sv, l1 * aa + l2 * ba + l3 * ca);
                     }
                 }
             }
-            if (pass == 0) {
-                uint32_t acc = 0;
-                for (size_t r = 0; r < nRays; r++) {
-                    const uint32_t c = counts[r];
-                    counts[r] = acc;
-                    acc += c;
-                }
-                counts[nRays] = acc;
-                hits.assign(acc, 0.f);
-            }
+        };
+        // count the hits per ray, then store them in ray order
+        std::vector<uint32_t> counts(nRays + 1, 0);
+        ThreadPool::instance().run(bands, [&](int b) { raster(b, [&](size_t ray, double) { counts[ray]++; }); });
+        uint32_t acc = 0;
+        for (size_t r = 0; r < nRays; r++) {
+            const uint32_t c = counts[r];
+            counts[r] = acc;
+            acc += c;
         }
+        counts[nRays] = acc;
+        std::vector<float> hits(acc, 0.f);
+        std::vector<uint32_t> fill(counts.begin(), counts.end() - 1);
+        ThreadPool::instance().run(bands, [&](int b) { raster(b, [&](size_t ray, double depth) { hits[fill[ray]++] = float(depth); }); });
+        trace.lap("  fill");
         const double oa = grid.origin[a];
-        parallelFor(int64_t(Nv), [&](int64_t lo, int64_t hi) {
-            for (int64_t sv = lo; sv < hi; sv++)
-                for (int su = 0; su < Nu; su++) {
+        // walk the rays with x varying fastest, so neighbouring rays write neighbouring bytes
+        const bool uOuter = v == 0;
+        parallelFor(int64_t(uOuter ? Nu : Nv), [&](int64_t lo, int64_t hi) {
+            for (int64_t o = lo; o < hi; o++)
+                for (int in = 0; in < (uOuter ? Nv : Nu); in++) {
+                    const int64_t su = uOuter ? o : in, sv = uOuter ? in : o;
                     const size_t ray = size_t(su) + size_t(Nu) * sv;
                     const uint32_t start = counts[ray], end = counts[ray + 1];
                     if (end - start < 2) continue;
@@ -97,6 +107,7 @@ std::vector<float> voxelize(const std::vector<float>& pos, const std::vector<uin
                 }
         }, 1);
     }
+    trace.lap("  fractions");
     const int nx = grid.dims[0], ny = grid.dims[1], nz = grid.dims[2];
     std::vector<float> frac(size_t(nx) * ny * nz, 0.f);
     const double inv = 1.0 / (sub * sub * sub);

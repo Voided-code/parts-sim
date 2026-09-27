@@ -107,6 +107,9 @@ void runScript(ps::MainWindow* w, QStringList steps) {
     else if (cmd == "aero") {
         std::printf("aero: %s\n", qPrintable(w->airflow->aeroSummary()));
         std::fflush(stdout);
+    } else if (cmd == "result") {
+        std::printf("result: %s\n", qPrintable(w->structural->resultSummary()));
+        std::fflush(stdout);
     }
     else if (cmd == "voxels") w->structural->setVoxelPreview(arg == "on");
     else if (cmd == "mesh") w->structural->setTargetVoxels(arg.toDouble());  // mesh:<total voxels>

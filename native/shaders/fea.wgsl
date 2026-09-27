@@ -3,8 +3,10 @@
 //
 // Matrix products gather, for each node, the rows of its 8 surrounding voxels from a 3x3x3 block of
 // neighbour values loaded once. Each voxel is one word: 0 = empty, > 0 = the f32 bits of s for an
-// s * Kb element (Kb, the level's uniform element, is matrix 0 of Ke), < 0 = sign bit | index - 1
-// of its own 24x24 matrix in Ke (coarse levels). A node whose 8 voxels are the same s * Kb uses the
+// s * Kb element (Kb, the level's uniform element, is the start of Ke), < 0 = sign bit | index of
+// its own 24x24 matrix after it in Ke (coarse levels; pairs of 16-bit halves times the level's
+// scale L.hs, which halves the memory traffic of these bandwidth-bound products). A node whose 8
+// voxels are the same s * Kb uses the
 // assembled 27-point stencil (243 multiply-adds, not 576). The product and the smoothing steps built
 // on it share one kernel ("op"), so drivers compile the large unrolled code once.
 
@@ -12,7 +14,7 @@ struct Level {
   nx: u32, ny: u32, nz: u32, NX: u32,
   NY: u32, NZ: u32, nNodes: u32, nDof: u32,
   p0: u32, strideN: u32, strideD: u32, m: u32,
-  first: f32, c1: f32, c2: f32, p3: f32,     // Chebyshev smoother coefficients
+  first: f32, c1: f32, c2: f32, hs: f32,     // Chebyshev smoother coefficients; scale of the halves in Ke
   CNX: u32, CNY: u32, CNZ: u32, cNodes: u32,
   cStrideN: u32, hasDiag: u32, p5: u32, p6: u32,
 };
@@ -23,7 +25,7 @@ struct Red { slot: u32, count: u32, q0: u32, q1: u32 };
 @group(0) @binding(2) var<storage, read_write> vout: array<f32>;
 @group(0) @binding(3) var<storage, read> invD: array<f32>;
 @group(0) @binding(4) var<storage, read> ew: array<i32>;          // voxel words (coarsest: free DOF list)
-@group(0) @binding(5) var<storage, read> Ke: array<vec4<f32>>;    // element matrices (0 = Kb), 144 vec4 each
+@group(0) @binding(5) var<storage, read> Ke: array<vec4<u32>>;    // Kb (f32 bits, 144 vec4), then own matrices (halves, 72 vec4 each)
 @group(0) @binding(7) var<storage, read> rhs: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vout2: array<f32>;
 @group(0) @binding(9) var<storage, read> vin2: array<f32>;
@@ -49,15 +51,28 @@ fn word(i: i32, j: i32, k: i32) -> i32 {
   return ew[u32(i) + L.nx * (u32(j) + L.ny * u32(k))];
 }
 
+// eight halves of a matrix row times eight values
+fn h8(q: vec4<u32>, lo: vec4<f32>, hi: vec4<f32>) -> f32 {
+  return dot(vec4<f32>(unpack2x16float(q.x), unpack2x16float(q.y)), lo) + dot(vec4<f32>(unpack2x16float(q.z), unpack2x16float(q.w)), hi);
+}
+
+// row b of Kb (six vec4 from index b) times 24 values
+fn kb(b: u32, v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, v5: vec4<f32>) -> f32 {
+  return dot(bitcast<vec4<f32>>(Ke[b]), v0) + dot(bitcast<vec4<f32>>(Ke[b + 1u]), v1) + dot(bitcast<vec4<f32>>(Ke[b + 2u]), v2) +
+    dot(bitcast<vec4<f32>>(Ke[b + 3u]), v3) + dot(bitcast<vec4<f32>>(Ke[b + 4u]), v4) + dot(bitcast<vec4<f32>>(Ke[b + 5u]), v5);
+}
+
 // the three rows of corner a (from vec4 index r = 18a) of a voxel's matrix times its corner values
 fn rows(w: i32, r: u32, v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, v5: vec4<f32>) -> vec3<f32> {
-  let own = w < 0;
-  let b = select(0u, u32(w & 0x7fffffff) + 1u, own) * 144u + r;
-  let s = select(bitcast<f32>(w), 1.0, own);
-  return s * vec3<f32>(
-    dot(Ke[b], v0) + dot(Ke[b + 1u], v1) + dot(Ke[b + 2u], v2) + dot(Ke[b + 3u], v3) + dot(Ke[b + 4u], v4) + dot(Ke[b + 5u], v5),
-    dot(Ke[b + 6u], v0) + dot(Ke[b + 7u], v1) + dot(Ke[b + 8u], v2) + dot(Ke[b + 9u], v3) + dot(Ke[b + 10u], v4) + dot(Ke[b + 11u], v5),
-    dot(Ke[b + 12u], v0) + dot(Ke[b + 13u], v1) + dot(Ke[b + 14u], v2) + dot(Ke[b + 15u], v3) + dot(Ke[b + 16u], v4) + dot(Ke[b + 17u], v5));
+  if (w < 0) {
+    let h = 144u + u32(w & 0x7fffffff) * 72u + r / 2u;
+    return L.hs * vec3<f32>(
+      h8(Ke[h], v0, v1) + h8(Ke[h + 1u], v2, v3) + h8(Ke[h + 2u], v4, v5),
+      h8(Ke[h + 3u], v0, v1) + h8(Ke[h + 4u], v2, v3) + h8(Ke[h + 5u], v4, v5),
+      h8(Ke[h + 6u], v0, v1) + h8(Ke[h + 7u], v2, v3) + h8(Ke[h + 8u], v4, v5));
+  }
+  return bitcast<f32>(w) * vec3<f32>(
+    kb(r, v0, v1, v2, v3, v4, v5), kb(r + 6u, v0, v1, v2, v3, v4, v5), kb(r + 12u, v0, v1, v2, v3, v4, v5));
 }
 
 fn elem(w: i32, a: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, p4: vec3<f32>, p5: vec3<f32>, p6: vec3<f32>, p7: vec3<f32>) -> vec3<f32> {

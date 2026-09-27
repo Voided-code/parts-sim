@@ -11,6 +11,12 @@ on:
   pull_request:
     paths: ['native/**', '.github/workflows/native.yml']
   workflow_dispatch:
+    inputs:
+      windows_compiler:
+        description: Windows C++ compiler (msvc only to compare; its builds leave the CPU solvers unvectorized)
+        type: choice
+        options: [clang-cl, msvc]
+        default: clang-cl
 
 env:
   QT_VERSION: '6.8.3'
@@ -106,10 +112,16 @@ jobs:
           path: ${{ env.OCCT_DIR }}
           key: ${{ steps.occt-cache.outputs.cache-primary-key }}
 
+      # Windows builds with clang-cl (LLVM ships with the runner image; it links against the MSVC-built
+      # Qt and OpenCascade): MSVC ignores the vector types and loop hints of the CPU solvers.
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S native -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+          $compiler = @()
+          if ($IsWindows -and '${{ inputs.windows_compiler }}' -ne 'msvc') {
+            $compiler = '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl'
+          }
+          cmake -S native -B build -G Ninja -DCMAKE_BUILD_TYPE=Release @compiler `
             -DCMAKE_PREFIX_PATH="$env:OCCT_DIR" -DWGPU_NATIVE_DIR="$env:WGPU_NATIVE_DIR" `
             -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/stage"
 
@@ -127,6 +139,19 @@ jobs:
             $env:LD_LIBRARY_PATH = "$env:OCCT_DIR/lib:$env:WGPU_NATIVE_DIR/lib"
           }
           ctest --test-dir build --output-on-failure
+
+      - name: Benchmark (CPU engines)
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PARTS_SIM_NO_GPU: '1'
+        run: |
+          if ($IsWindows) {
+            $env:PATH = "$env:OCCT_DIR\bin;$env:WGPU_NATIVE_DIR\lib;$env:ZLIB_ROOT\bin;$env:PATH"
+          } else {
+            $env:LD_LIBRARY_PATH = "$env:OCCT_DIR/lib:$env:WGPU_NATIVE_DIR/lib"
+          }
+          ./build/bench
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

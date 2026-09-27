@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <tuple>
 #include <stdexcept>
 
@@ -24,6 +25,27 @@ namespace {
 constexpr int RED_GROUPS = 1024;
 // scalar slots on the GPU (2 = alpha, 3 = beta)
 constexpr int PQ = 1, ALPHA = 2, RR = 4, RZN = 5, ZQ = 7;  // 0 = rz
+
+// IEEE half-precision bits of f (round to nearest even; |f| below the half range)
+uint16_t toHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u, mant = x & 0x7fffffu;
+    const int32_t exp = int32_t((x >> 23) & 0xffu) - 112;  // rebiased from 127 to 15
+    if (exp >= 31) return uint16_t(sign | 0x7c00u);
+    if (exp <= 0) {  // subnormal half
+        if (exp < -10) return uint16_t(sign);
+        const uint32_t m = mant | 0x800000u, shift = uint32_t(14 - exp);
+        uint32_t h = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (h & 1))) h++;
+        return uint16_t(sign | h);
+    }
+    uint32_t h = (uint32_t(exp) << 10) | (mant >> 13);
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;  // a carry correctly bumps the exponent
+    return uint16_t(sign | h);
+}
 }  // namespace
 
 struct GpuFeaSolver::Impl {
@@ -34,7 +56,7 @@ struct GpuFeaSolver::Impl {
         const Level* lv;
         bool last;
         int out = 0;  // buffer holding the V-cycle result: 0 = z, 1 = t
-        GpuBuffer params, invD, words, Ke, dadd, r, z, t, d, freeIdx, ainv, rc, stencil;  // rc: compact coarsest r  // K0 / stencil: the level's uniform element
+        GpuBuffer params, invD, words, Ke, dadd, r, z, t, d, freeIdx, ainv, rc, stencil;  // rc: compact coarsest r  // Ke: the level's element matrices, stencil: its uniform element's
         // [p]: from buffer p (0 = z, 1 = t) to the other
         GpuBindGroup first, chebA[2], chebB[2], resid[2], restrictBG[2], prolongBG[2], gather, coarsest, mv;
         GpuBindGroup lzX, lzMv, lzW, lzAxpy, lzNext;  // Lanczos: v = z, vPrev = d, w = t, x = r
@@ -43,6 +65,7 @@ struct GpuFeaSolver::Impl {
     std::vector<Lvl> L;
     GpuBuffer opMode[4];  // the op kernel's modes (fea.wgsl): 0 product, 1 / 2 Chebyshev steps, 3 residual
     GpuBuffer x, pv, qv, S, partials, red, readBuf, xRead;
+    GpuBuffer scalRead[2];  // the scalars at the end of a queued batch of CG iterations (solve())
     GpuBindGroup mvP, updXR, updP, alpha, beta, lzStore;
     std::vector<float> host;  // conversion buffer for uploads
     std::vector<GpuBindGroup> reduce;
@@ -104,6 +127,13 @@ struct GpuFeaSolver::Impl {
     std::array<float, 64> scalars() {
         std::array<float, 64> s{};
         gpuReadInto(ctx, S.get(), readBuf.get(), 256, [&](const void* p) { std::memcpy(s.data(), p, 256); });
+        return s;
+    }
+
+    // the scalars copied into scalRead[slot] by submit(..., slot), once the GPU has got there
+    std::array<float, 64> queuedScalars(int slot) {
+        std::array<float, 64> s{};
+        gpuMapRead(ctx, scalRead[slot].get(), 256, [&](const void* p) { std::memcpy(s.data(), p, 256); });
         return s;
     }
 
@@ -183,9 +213,11 @@ struct GpuFeaSolver::Impl {
 
     WGPUCommandEncoder encoder() { return wgpuDeviceCreateCommandEncoder(ctx.device, nullptr); }
     WGPUComputePassEncoder begin(WGPUCommandEncoder enc) { return wgpuCommandEncoderBeginComputePass(enc, nullptr); }
-    void submit(WGPUCommandEncoder enc, WGPUComputePassEncoder pass) {
+    // ends the pass and submits it; with a slot, the scalars are then copied to scalRead[slot]
+    void submit(WGPUCommandEncoder enc, WGPUComputePassEncoder pass, int slot = -1) {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
+        if (slot >= 0) wgpuCommandEncoderCopyBufferToBuffer(enc, S.get(), 0, scalRead[slot].get(), 0, 256);
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
         wgpuQueueSubmit(ctx.queue, 1, &cmd);
         wgpuCommandBufferRelease(cmd);
@@ -256,6 +288,16 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
             params[16] = next->NX; params[17] = next->NY; params[18] = next->NZ; params[19] = uint32_t(next->nNodes); params[20] = sC[2];
         }
         params[21] = lv.diagAdd.empty() ? 0 : 1;
+        // the level's own element matrices in 16-bit halves: their products are bandwidth-bound. A
+        // power-of-two scale keeps the largest entries near 2^14, well inside the half range.
+        const int64_t nOwn = int64_t(lv.K.size() / 576);
+        const double kmax = parallelMax(nOwn * 576, [&](int64_t lo, int64_t hi) {
+            double m = 0;
+            for (int64_t i = lo; i < hi; i++) m = std::max(m, double(std::abs(lv.K[i])));
+            return m;
+        });
+        const float hs = kmax > 0 ? float(std::exp2(std::ceil(std::log2(kmax / 16384)))) : 1.f;
+        std::memcpy(&params[15], &hs, 4);
         V.params = gpuUniform(*ctx, sizeof(params), params);
         V.invD = gpuBuffer(*ctx, invD.size() * 4, invD.data());
         // one word per voxel: 0 empty, f32 bits of s for s * K0, sign bit | matrix index otherwise
@@ -271,12 +313,14 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
             }
         });
         V.words = gpuBuffer(*ctx, words.size() * 4, words.data());
-        // element matrices: 0 = the level's uniform element Kb, then its own ones
+        // element matrices: the level's uniform element Kb in 32 bits, then its own ones as halves / hs
         {
-            std::vector<float> ke(576 + lv.K.size());
-            std::copy(lv.Kbf.begin(), lv.Kbf.begin() + 576, ke.begin());
-            std::copy(lv.K.begin(), lv.K.end(), ke.begin() + 576);
-            V.Ke = gpuBuffer(*ctx, ke.size() * 4, ke.data());
+            std::vector<uint16_t> ke(2 * 576 + nOwn * 576);
+            std::memcpy(ke.data(), lv.Kbf.data(), 576 * 4);
+            uint16_t* kh = ke.data() + 2 * 576;
+            const float inv = 1 / hs;
+            parallelFor(nOwn * 576, [&](int64_t lo, int64_t hi) { for (int64_t i = lo; i < hi; i++) kh[i] = toHalf(lv.K[i] * inv); });
+            V.Ke = gpuBuffer(*ctx, ke.size() * 2, ke.data());
         }
         // Kb's 27-point stencil: neighbour m = ox + 3 oy + 9 oz, row d -> [3m + d].xyz
         {
@@ -320,6 +364,7 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
     for (int s = 0; s < 10; s++) { red[s * 64] = s; red[s * 64 + 1] = I.dotGroups; }
     I.red = gpuBuffer(*ctx, red.size() * 4, red.data(), WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
     I.readBuf = gpuReadback(*ctx, 256);
+    for (auto& b : I.scalRead) b = gpuReadback(*ctx, 256);
     I.xRead = gpuReadback(*ctx, n * 4);
     auto& P = *I.prog;
     for (size_t l = 0; l < I.L.size(); l++) {
@@ -444,14 +489,18 @@ SolveResult GpuFeaSolver::solve(const std::vector<double>& f, const SolveOptions
         };
         // fold when the GPU residual is a tenth of its peak since the last fold: its drift from the
         // true residual stays a small fraction of the peak
-        double relUpdated = rel, peak = rel, lastEst = rel;
-        int batch = 1;
+        double relUpdated = rel, peak = rel, lastEst = rel, rho = 0.5;
+        int batch = 1, slot = 0;
         bool dirty = false;
-        while (it < opts.maxIter) {
-            const auto t0 = std::chrono::steady_clock::now();
+        // A batch of k iterations, queued with a copy of its scalars; the next batch is queued before
+        // they are read (unless they are likely to call for a fold or the end), so the GPU does not
+        // idle while this thread waits for them and records more work.
+        struct Batch { int k, slot; std::chrono::steady_clock::time_point t0; };
+        auto launch = [&](int k) {
+            Batch b{k, slot, std::chrono::steady_clock::now()};
+            slot ^= 1;
             auto enc = I.encoder();
             auto pass = I.begin(enc);
-            const int k = std::min(batch, opts.maxIter - it);
             for (int q = 0; q < k; q++) {
                 // z = M r; beta = max(0, z.(r - r_old) / rz) with r - r_old = -alpha q; p = z + beta p
                 I.vcycle(pass, 0);
@@ -466,27 +515,49 @@ SolveResult GpuFeaSolver::solve(const std::vector<double>& f, const SolveOptions
                 I.run(pass, "update_xr", I.updXR.get(), n);
             }
             I.dot(pass, I.L[0].r.get(), I.L[0].r.get(), RR);
-            I.submit(enc, pass);
-            const auto sc = I.scalars();
-            it += k;
+            I.submit(enc, pass, b.slot);
+            return b;
+        };
+        auto broken = [](const std::array<float, 64>& sc) { return !(sc[PQ] > 0) || !std::isfinite(sc[RR]) || !std::isfinite(sc[ALPHA]); };
+        std::optional<Batch> cur, next;
+        while (it < opts.maxIter || cur) {
+            if (!cur) cur = launch(std::min(batch, opts.maxIter - it));
+            const int kn = std::min(batch, opts.maxIter - it - cur->k);
+            if (kn > 0 && lastEst * std::pow(rho, cur->k) > 1.5 * std::max(opts.tol, 0.1 * peak)) next = launch(kn);
+            const auto sc = I.queuedScalars(cur->slot);
+            it += cur->k;
             dirty = true;
-            if (!(sc[PQ] > 0) || !std::isfinite(sc[RR]) || !std::isfinite(sc[ALPHA])) break;  // lost positive-definiteness
+            // finish the queued batch (its iterations count) before stopping or folding
+            auto drain = [&] {
+                if (!next) return true;
+                const bool ok = !broken(I.queuedScalars(next->slot));
+                it += next->k;
+                next.reset();
+                return ok;
+            };
+            if (broken(sc)) { drain(); break; }  // lost positive-definiteness
             const double est = std::sqrt(double(sc[RR])) / scale / bnorm;
-            if (opts.onProgress && opts.onProgress(it, std::min(est, relUpdated))) { res.cancelled = true; break; }
+            if (opts.onProgress && opts.onProgress(it, std::min(est, relUpdated))) { res.cancelled = true; drain(); break; }
             peak = std::max(peak, est);
             // per-iteration reduction, for sizing the next batch
-            const double rho = std::clamp(std::pow(est / lastEst, 1.0 / k), 0.05, 0.95);
+            rho = std::clamp(std::pow(est / lastEst, 1.0 / cur->k), 0.05, 0.95);
             lastEst = est;
             if (est <= opts.tol || est <= 0.1 * peak) {
+                if (!drain()) break;
                 rel = relUpdated = peak = lastEst = foldIn();
                 dirty = false;
                 if (rel <= opts.tol) break;
                 I.upload(I.L[0].r.get(), r.data(), scale, L);
             }
-            // wait for the GPU about every 4 ms (rarely enough to keep it busy), and not past convergence
-            const double per = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / k;
-            const int toGo = int(std::ceil(std::log(opts.tol / lastEst) / std::log(rho)));
-            batch = std::clamp(std::min(int(0.004 / std::max(per, 1e-5)), toGo), 1, 8);
+            // wait for the GPU about every 4 ms (rarely enough to keep it busy), and not past the next
+            // fold or convergence (predicted with convergence speeding up by half again: overshooting a
+            // fold lets the float32 residual drift from the true one, which costs iterations); batches
+            // grow at most twofold, as the first rates are unreliable
+            const double per = std::chrono::duration<double>(std::chrono::steady_clock::now() - cur->t0).count() / cur->k;
+            const int toGo = int(std::ceil(std::log(std::max(opts.tol, 0.1 * peak) / lastEst) / (1.5 * std::log(rho))));
+            batch = std::clamp(std::min({int(0.004 / std::max(per, 1e-5)), toGo, 2 * cur->k}), 1, 8);
+            cur = next;
+            next.reset();
         }
         if (dirty) rel = foldIn();
     }
@@ -529,6 +600,24 @@ std::string GpuFeaSolver::profile(int reps) {
         const double vc = time([&](auto p) { I.vcycle(p, l); });
         std::snprintf(line, sizeof line, "L%zu nodes=%lld elems=%zu own matrices=%zu: matvec %.3f  smooth %.3f  restrict %.3f  prolong %.3f  | V-cycle from here %.3f ms\n", l,
                       (long long)nN, V.lv->elems.size(), V.lv->K.size() / 576, mv, sm, rs, pr, vc);
+        out += line;
+    }
+    {
+        // one conjugate-gradient iteration as solve() records it, and one of its three dot products
+        const int64_t n = I.n, nN = fea_.levels[0].nNodes;
+        const double iter = time([&](auto pass) {
+            I.vcycle(pass, 0);
+            I.dot(pass, I.L[0].r.get(), I.result(0), RZN);
+            I.dot(pass, I.result(0), I.qv.get(), ZQ);
+            I.run(pass, "cg_beta", I.beta.get(), 1);
+            I.run(pass, "update_p", I.updP.get(), n);
+            I.run(pass, "op", I.mvP.get(), nN);
+            I.dot(pass, I.pv.get(), I.qv.get(), PQ);
+            I.run(pass, "cg_alpha", I.alpha.get(), 1);
+            I.run(pass, "update_xr", I.updXR.get(), n);
+        });
+        const double d = time([&](auto pass) { I.dot(pass, I.pv.get(), I.qv.get(), PQ); });
+        std::snprintf(line, sizeof line, "CG iteration %.3f ms (one dot product %.3f ms)\n", iter, d);
         out += line;
     }
     {

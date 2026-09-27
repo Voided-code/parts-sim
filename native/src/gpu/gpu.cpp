@@ -185,6 +185,10 @@ void gpuReadInto(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t b
     wgpuQueueSubmit(ctx.queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
+    gpuMapRead(ctx, staging, bytes, use);
+}
+
+void gpuMapRead(GpuContext& ctx, WGPUBuffer staging, uint64_t bytes, const std::function<void(const void*)>& use) {
     struct Req { bool done = false; WGPUMapAsyncStatus status = WGPUMapAsyncStatus_Error; } req;
     WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
     cb.mode = WGPUCallbackMode_AllowProcessEvents;

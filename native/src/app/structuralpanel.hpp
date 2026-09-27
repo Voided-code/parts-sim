@@ -239,6 +239,12 @@ public:
         return study_ == 0 && display_ == "results" && !job && !stale_ && result_ &&
                result_->converged && !result_->unreliable && result_->voxels > 0;
     }
+    /** Key numbers of the static result, for scripted comparisons (the "result" script command). */
+    QString resultSummary() const {
+        if (!result_) return "no result";
+        return QString("voxels %1, %2 iterations, max von Mises %3, max displacement %4")
+            .arg(result_->voxels).arg(result_->iterations).arg(result_->maxVM, 0, 'g', 12).arg(result_->maxDisp, 0, 'g', 12);
+    }
     void clearStale() { stale_ = false; }
     void rememberModel(const std::shared_ptr<StructuralModel>& m);
     /** The voxel model at this resolution if it is already built for the current part. */

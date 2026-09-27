@@ -98,6 +98,8 @@ GpuBuffer gpuReadback(GpuContext& ctx, uint64_t bytes);
 std::vector<uint8_t> gpuRead(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t bytes, uint64_t srcOffset = 0);
 /** The same, handing `use` the mapped bytes in place (no copy; valid only during the call). */
 void gpuReadInto(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t bytes, const std::function<void(const void*)>& use, uint64_t srcOffset = 0);
+/** Waits for the work already queued to fill the read-back buffer, then hands `use` its bytes. */
+void gpuMapRead(GpuContext& ctx, WGPUBuffer staging, uint64_t bytes, const std::function<void(const void*)>& use);
 /** Processes GPU events until `done` is set by a callback (low latency for short jobs). */
 void gpuWaitFor(GpuContext& ctx, const bool& done);
 /** Dispatch geometry for `count` invocations at workgroup size 64: {x, y, stride}. */
