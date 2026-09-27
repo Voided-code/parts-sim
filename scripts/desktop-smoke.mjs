@@ -138,15 +138,16 @@ try {
     el.dispatchEvent(new Event('input'));
   }, target.value);
   await command('run:airflow');
-  await page.waitForFunction(() => window.partsSim.airflow.study.results, null, { timeout: 180000 }).catch(async (err) => {
+  // the drag comes from time-averaged pressures, which take a while to build on a slow CPU
+  const developed = () => { const r = window.partsSim.airflow.study.results; return r && Number.isFinite(r.cd) && r.cd > 0; };
+  await page.waitForFunction(developed, null, { timeout: 180000 }).catch(async (err) => {
     const state = await page.evaluate(() => {
       const s = window.partsSim.airflow.study;
-      return { status: document.querySelector('#status')?.textContent, ready: s.ready, running: s.running, engine: s.engine, N: s.N, steps: s.steps, dims: s.dims, building: window.partsSim.airflow.building };
+      return { status: document.querySelector('#status')?.textContent, ready: s.ready, running: s.running, engine: s.engine, N: s.N, steps: s.steps, dims: s.dims, cd: s.results?.cd, building: window.partsSim.airflow.building };
     });
     console.log('airflow state:', JSON.stringify(state));
     throw err;
   });
-  await page.waitForTimeout(3000);
   const flow = await page.evaluate(() => ({ engine: window.partsSim.airflow.study.engine, cd: window.partsSim.airflow.study.results.cd, cells: window.partsSim.airflow.study.N }));
   assert.ok(flow.cells <= target.cells * 1.001 && flow.cells > 0.7 * target.cells, `grid ${flow.cells} for ${target.cells}`);
   assert.ok(Number.isFinite(flow.cd) && flow.cd > 0, JSON.stringify(flow));
