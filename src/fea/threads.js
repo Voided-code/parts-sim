@@ -1,5 +1,6 @@
-// Shared-memory threads for the finest level's work on large models: the stiffness product (every
-// conjugate-gradient iteration, smoothing step and 64-bit residual check) and the stress recovery.
+// Shared-memory threads for the finest level's work on all but small models: the stiffness product
+// (every conjugate-gradient iteration, smoothing step and 64-bit residual check) and the stress
+// recovery.
 //
 // The level's arrays are copied once into SharedArrayBuffers; each call then splits the nodes into
 // chunks that the helper workers and the calling thread take in turn, and the helpers wait on
@@ -48,7 +49,7 @@ export class Threads {
    * Helper threads for fea's finest level, or null when memory cannot be shared, the machine has
    * one core or the model is too small to be worth it.
    */
-  static async start(fea, { minDof = 60000, maxThreads = 15 } = {}) {
+  static async start(fea, { minDof = 20000, maxThreads = 15 } = {}) {
     if (typeof SharedArrayBuffer === 'undefined' || !globalThis.crossOriginIsolated || typeof Worker === 'undefined') return null;
     const L = fea.levels[0];
     const count = Math.min(maxThreads, (navigator.hardwareConcurrency || 1) - 1);
