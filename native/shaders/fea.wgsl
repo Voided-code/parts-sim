@@ -3,8 +3,10 @@
 //
 // Matrix products gather, for each node, the rows of its 8 surrounding voxels from a 3x3x3 block of
 // neighbour values loaded once. Each voxel is one word: 0 = empty, > 0 = the f32 bits of s for an
-// s * K0 element, < 0 = sign bit | index of its own 24x24 matrix in Ke (coarse levels). A node whose
-// 8 voxels are the same s * K0 uses the assembled 27-point stencil (243 multiply-adds, not 576).
+// s * Kb element (Kb, the level's uniform element, is matrix 0 of Ke), < 0 = sign bit | index - 1
+// of its own 24x24 matrix in Ke (coarse levels). A node whose 8 voxels are the same s * Kb uses the
+// assembled 27-point stencil (243 multiply-adds, not 576). The product and the smoothing steps built
+// on it share one kernel ("op"), so drivers compile the large unrolled code once.
 
 struct Level {
   nx: u32, ny: u32, nz: u32, NX: u32,
@@ -21,8 +23,7 @@ struct Red { slot: u32, count: u32, q0: u32, q1: u32 };
 @group(0) @binding(2) var<storage, read_write> vout: array<f32>;
 @group(0) @binding(3) var<storage, read> invD: array<f32>;
 @group(0) @binding(4) var<storage, read> ew: array<i32>;          // voxel words (coarsest: free DOF list)
-@group(0) @binding(5) var<storage, read> Ke: array<vec4<f32>>;    // element matrices, 144 vec4 each
-@group(0) @binding(6) var<uniform> K0: array<vec4<f32>, 144>;     // unit element, rows as 6 vec4
+@group(0) @binding(5) var<storage, read> Ke: array<vec4<f32>>;    // element matrices (0 = Kb), 144 vec4 each
 @group(0) @binding(7) var<storage, read> rhs: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vout2: array<f32>;
 @group(0) @binding(9) var<storage, read> vin2: array<f32>;
@@ -32,6 +33,8 @@ struct Red { slot: u32, count: u32, q0: u32, q1: u32 };
 @group(0) @binding(13) var<storage, read> dadd: array<f32>;
 @group(0) @binding(14) var<uniform> ST: array<vec4<f32>, 81>;     // stencil: neighbour m, row d -> ST[3m + d].xyz
 @group(0) @binding(15) var<storage, read> ainv: array<f32>;       // coarsest: dense inverse (symmetric)
+struct Op { mode: u32, q0: u32, q1: u32, q2: u32 };
+@group(0) @binding(16) var<uniform> OP: Op;                        // op kernel: what to do with K vin
 
 fn nodeU(i: i32, j: i32, k: i32) -> vec3<f32> {
   let x = u32(clamp(i, 0, i32(L.NX) - 1));
@@ -48,17 +51,13 @@ fn word(i: i32, j: i32, k: i32) -> i32 {
 
 // the three rows of corner a (from vec4 index r = 18a) of a voxel's matrix times its corner values
 fn rows(w: i32, r: u32, v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, v5: vec4<f32>) -> vec3<f32> {
-  if (w > 0) {
-    return bitcast<f32>(w) * vec3<f32>(
-      dot(K0[r + 0u], v0) + dot(K0[r + 1u], v1) + dot(K0[r + 2u], v2) + dot(K0[r + 3u], v3) + dot(K0[r + 4u], v4) + dot(K0[r + 5u], v5),
-      dot(K0[r + 6u], v0) + dot(K0[r + 7u], v1) + dot(K0[r + 8u], v2) + dot(K0[r + 9u], v3) + dot(K0[r + 10u], v4) + dot(K0[r + 11u], v5),
-      dot(K0[r + 12u], v0) + dot(K0[r + 13u], v1) + dot(K0[r + 14u], v2) + dot(K0[r + 15u], v3) + dot(K0[r + 16u], v4) + dot(K0[r + 17u], v5));
-  }
-  let b = u32(w & 0x7fffffff) * 144u + r;
-  return vec3<f32>(
-      dot(Ke[b + 0u], v0) + dot(Ke[b + 1u], v1) + dot(Ke[b + 2u], v2) + dot(Ke[b + 3u], v3) + dot(Ke[b + 4u], v4) + dot(Ke[b + 5u], v5),
-      dot(Ke[b + 6u], v0) + dot(Ke[b + 7u], v1) + dot(Ke[b + 8u], v2) + dot(Ke[b + 9u], v3) + dot(Ke[b + 10u], v4) + dot(Ke[b + 11u], v5),
-      dot(Ke[b + 12u], v0) + dot(Ke[b + 13u], v1) + dot(Ke[b + 14u], v2) + dot(Ke[b + 15u], v3) + dot(Ke[b + 16u], v4) + dot(Ke[b + 17u], v5));
+  let own = w < 0;
+  let b = select(0u, u32(w & 0x7fffffff) + 1u, own) * 144u + r;
+  let s = select(bitcast<f32>(w), 1.0, own);
+  return s * vec3<f32>(
+    dot(Ke[b], v0) + dot(Ke[b + 1u], v1) + dot(Ke[b + 2u], v2) + dot(Ke[b + 3u], v3) + dot(Ke[b + 4u], v4) + dot(Ke[b + 5u], v5),
+    dot(Ke[b + 6u], v0) + dot(Ke[b + 7u], v1) + dot(Ke[b + 8u], v2) + dot(Ke[b + 9u], v3) + dot(Ke[b + 10u], v4) + dot(Ke[b + 11u], v5),
+    dot(Ke[b + 12u], v0) + dot(Ke[b + 13u], v1) + dot(Ke[b + 14u], v2) + dot(Ke[b + 15u], v3) + dot(Ke[b + 16u], v4) + dot(Ke[b + 17u], v5));
 }
 
 fn elem(w: i32, a: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, p4: vec3<f32>, p5: vec3<f32>, p6: vec3<f32>, p7: vec3<f32>) -> vec3<f32> {
@@ -66,6 +65,9 @@ fn elem(w: i32, a: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f3
   return rows(w, 18u * a, vec4<f32>(p0, p1.x), vec4<f32>(p1.yz, p2.xy), vec4<f32>(p2.z, p3), vec4<f32>(p4, p5.x), vec4<f32>(p5.yz, p6.xy),
               vec4<f32>(p6.z, p7));
 }
+
+// voxel v = (di, dj, dk) around a node: the node is its corner CA[v]
+const CA: array<u32, 8> = array<u32, 8>(6u, 7u, 5u, 4u, 2u, 3u, 1u, 0u);
 
 fn st(m: u32, u: vec3<f32>) -> vec3<f32> {
   return vec3<f32>(dot(ST[3u * m].xyz, u), dot(ST[3u * m + 1u].xyz, u), dot(ST[3u * m + 2u].xyz, u));
@@ -123,14 +125,17 @@ fn applyK(n: u32) -> vec3<f32> {
       st(20u, u20) + st(21u, u21) + st(22u, u22) + st(23u, u23) + st(24u, u24) +
       st(25u, u25) + st(26u, u26));
   } else {
-    acc = elem(w0, 6u, u0, u1, u4, u3, u9, u10, u13, u12) +
-          elem(w1, 7u, u1, u2, u5, u4, u10, u11, u14, u13) +
-          elem(w2, 5u, u3, u4, u7, u6, u12, u13, u16, u15) +
-          elem(w3, 4u, u4, u5, u8, u7, u13, u14, u17, u16) +
-          elem(w4, 2u, u9, u10, u13, u12, u18, u19, u22, u21) +
-          elem(w5, 3u, u10, u11, u14, u13, u19, u20, u23, u22) +
-          elem(w6, 1u, u12, u13, u16, u15, u21, u22, u25, u24) +
-          elem(w7, 0u, u13, u14, u17, u16, u22, u23, u26, u25);
+    // near a surface: voxel by voxel, from the block copied into an array (one loop body keeps the
+    // shader small; interior nodes, the bulk, take the unrolled stencil above)
+    let ua = array<vec3<f32>, 27>(u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14, u15, u16, u17, u18, u19, u20, u21, u22, u23, u24, u25, u26);
+    let wa = array<i32, 8>(w0, w1, w2, w3, w4, w5, w6, w7);
+    acc = vec3<f32>(0.0);
+    for (var v = 0u; v < 8u; v++) {
+      let w = wa[v];
+      if (w == 0) { continue; }
+      let b = (v & 1u) + 3u * ((v >> 1u) & 1u) + 9u * (v >> 2u);
+      acc += elem(w, CA[v], ua[b], ua[b + 1u], ua[b + 4u], ua[b + 3u], ua[b + 9u], ua[b + 10u], ua[b + 13u], ua[b + 12u]);
+    }
   }
   if (L.hasDiag == 1u) { acc += vec3<f32>(dadd[3u * n], dadd[3u * n + 1u], dadd[3u * n + 2u]) * own; }
   return acc;
@@ -144,66 +149,45 @@ fn put(n: u32, y: vec3<f32>) {
   vout[3u * n + 2u] = y.z;
 }
 
-// vout = K vin (held DOFs zero)
+// One kernel for everything built on K vin (held DOFs zero), by OP.mode:
+//   0: vout = K vin
+//   1, 2: Chebyshev step into a second buffer, d = c1 d + c2 D^-1 (rhs - K vin), vout = vin + d, with
+//         (c1, c2) = (0, first) for the first step from a nonzero vin (1) and (c1, c2) for the second (2);
+//         d (per DOF) is updated in place in vout2
+//   3: vout = rhs - K vin
 @compute @workgroup_size(64)
-fn matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn op(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x + gid.y * L.strideN;
   if (n >= L.nNodes) { return; }
-  let d = freeOf(n);
-  var y = vec3<f32>(0.0);
-  if (any(d != vec3<f32>(0.0))) { y = select(vec3<f32>(0.0), applyK(n), d != vec3<f32>(0.0)); }
-  put(n, y);
-}
-
-// Chebyshev smoother step into a second buffer: d = c1 d + c2 D^-1 (rhs - K vin), vout = vin + d
-// (d, per DOF, is updated in place in vout2)
-fn chebStep(n: u32, c1: f32, c2: f32) {
   let dI = freeOf(n);
   let q = 3u * n;
-  var z = vec3<f32>(0.0);
+  let mode = OP.mode;
+  var y = vec3<f32>(0.0);
   var d = vec3<f32>(0.0);
   if (any(dI != vec3<f32>(0.0))) {
-    let zo = vec3<f32>(vin[q], vin[q + 1u], vin[q + 2u]);
-    let r = vec3<f32>(rhs[q], rhs[q + 1u], rhs[q + 2u]);
-    let dOld = vec3<f32>(vout2[q], vout2[q + 1u], vout2[q + 2u]);
-    d = select(vec3<f32>(0.0), c1 * dOld + c2 * dI * (r - applyK(n)), dI != vec3<f32>(0.0));
-    z = zo + d;
-  }
-  put(n, z);
-  vout2[q] = d.x;
-  vout2[q + 1u] = d.y;
-  vout2[q + 2u] = d.z;
-}
-
-// first step from a nonzero vin
-@compute @workgroup_size(64)
-fn cheb_a(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x + gid.y * L.strideN;
-  if (n >= L.nNodes) { return; }
-  chebStep(n, 0.0, L.first);
-}
-
-// second step
-@compute @workgroup_size(64)
-fn cheb_b(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x + gid.y * L.strideN;
-  if (n >= L.nNodes) { return; }
-  chebStep(n, L.c1, L.c2);
-}
-
-// vout = rhs - K vin (held DOFs zero)
-@compute @workgroup_size(64)
-fn resid(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x + gid.y * L.strideN;
-  if (n >= L.nNodes) { return; }
-  let d = freeOf(n);
-  var y = vec3<f32>(0.0);
-  if (any(d != vec3<f32>(0.0))) {
-    let q = 3u * n;
-    let r = vec3<f32>(rhs[q], rhs[q + 1u], rhs[q + 2u]);
-    y = select(vec3<f32>(0.0), r - applyK(n), d != vec3<f32>(0.0));
+    let Ku = applyK(n);
+    if (mode == 0u) {
+      y = Ku;
+    } else {
+      let r = vec3<f32>(rhs[q], rhs[q + 1u], rhs[q + 2u]);
+      if (mode == 3u) {
+        y = r - Ku;
+      } else {
+        let c1 = select(0.0, L.c1, mode == 2u);
+        let c2 = select(L.first, L.c2, mode == 2u);
+        let dOld = vec3<f32>(vout2[q], vout2[q + 1u], vout2[q + 2u]);
+        d = select(vec3<f32>(0.0), c1 * dOld + c2 * dI * (r - Ku), dI != vec3<f32>(0.0));
+        y = vec3<f32>(vin[q], vin[q + 1u], vin[q + 2u]) + d;
+      }
+    }
+    y = select(vec3<f32>(0.0), y, dI != vec3<f32>(0.0));
   }
   put(n, y);
+  if (mode == 1u || mode == 2u) {
+    vout2[q] = d.x;
+    vout2[q + 1u] = d.y;
+    vout2[q + 2u] = d.z;
+  }
 }
 
 // first step from zero: vout = d = first D^-1 rhs
@@ -271,22 +255,26 @@ fn prolong(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 
-// coarsest level: z = A^-1 r over the free DOFs (ew = free DOF list, at most 3000; ainv symmetric).
-// A workgroup takes 32 rows, 8 threads per row each summing every 8th column (neighbouring threads
-// read neighbouring words of a column), then adds up the 8 parts. r is gathered into workgroup
-// memory first.
-var<workgroup> cr: array<f32, 3000>;
+// coarsest level: z = A^-1 r over the free DOFs (ew = free DOF list; ainv symmetric). First the
+// free entries of r are gathered into vout2 (a compact vector), then a workgroup takes 32 rows, 8
+// threads per row each summing every 8th column (neighbouring threads read neighbouring words of
+// a column), and adds up the 8 parts.
+@compute @workgroup_size(64)
+fn coarse_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let c = gid.x;
+  if (c >= L.m) { return; }
+  vout2[c] = vin[u32(ew[c])];
+}
+
 var<workgroup> part: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn coarsest(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  for (var c = lid.x; c < L.m; c += 256u) { cr[c] = vin[u32(ew[c])]; }
-  workgroupBarrier();
   let row = wid.x * 32u + lid.x % 32u;
   let k = lid.x / 32u;
   var s = 0.0;
   if (row < L.m) {
-    for (var c = k; c < L.m; c += 8u) { s += ainv[c * L.m + row] * cr[c]; }
+    for (var c = k; c < L.m; c += 8u) { s += ainv[c * L.m + row] * vin2[c]; }
   }
   part[lid.x] = s;
   workgroupBarrier();

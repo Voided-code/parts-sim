@@ -34,13 +34,14 @@ struct GpuFeaSolver::Impl {
         const Level* lv;
         bool last;
         int out = 0;  // buffer holding the V-cycle result: 0 = z, 1 = t
-        GpuBuffer params, invD, words, Ke, dadd, r, z, t, d, freeIdx, ainv, K0, stencil;  // K0 / stencil: the level's uniform element
+        GpuBuffer params, invD, words, Ke, dadd, r, z, t, d, freeIdx, ainv, rc, stencil;  // rc: compact coarsest r  // K0 / stencil: the level's uniform element
         // [p]: from buffer p (0 = z, 1 = t) to the other
-        GpuBindGroup first, chebA[2], chebB[2], resid[2], restrictBG[2], prolongBG[2], coarsest, mv;
+        GpuBindGroup first, chebA[2], chebB[2], resid[2], restrictBG[2], prolongBG[2], gather, coarsest, mv;
         GpuBindGroup lzX, lzMv, lzW, lzAxpy, lzNext;  // Lanczos: v = z, vPrev = d, w = t, x = r
         WGPUBuffer buf(int p) const { return p ? t.get() : z.get(); }
     };
     std::vector<Lvl> L;
+    GpuBuffer opMode[4];  // the op kernel's modes (fea.wgsl): 0 product, 1 / 2 Chebyshev steps, 3 residual
     GpuBuffer x, pv, qv, S, partials, red, readBuf, xRead;
     GpuBindGroup mvP, updXR, updP, alpha, beta, lzStore;
     std::vector<float> host;  // conversion buffer for uploads
@@ -82,6 +83,7 @@ struct GpuFeaSolver::Impl {
     void vcycle(WGPUComputePassEncoder pass, size_t l) {
         Lvl& V = L[l];
         if (V.last) {
+            run(pass, "coarse_gather", V.gather.get(), uint64_t(coarseM));
             wgpuComputePassEncoderSetPipeline(pass, prog->pipeline("coarsest"));
             wgpuComputePassEncoderSetBindGroup(pass, 0, V.coarsest.get(), 0, nullptr);
             wgpuComputePassEncoderDispatchWorkgroups(pass, uint32_t((coarseM + 31) / 32), 1, 1);  // 32 rows each
@@ -89,13 +91,13 @@ struct GpuFeaSolver::Impl {
         }
         const uint64_t nD = V.lv->nDof, nN = V.lv->nNodes;
         run(pass, "cheb_first", V.first.get(), nD);                   // z
-        run(pass, "cheb_b", V.chebB[0].get(), nN);                    // z -> t
-        run(pass, "resid", V.resid[1].get(), nN);                     // t -> residual in z
+        run(pass, "op", V.chebB[0].get(), nN);                        // z -> t
+        run(pass, "op", V.resid[1].get(), nN);                        // t -> residual in z
         run(pass, "restrict_", V.restrictBG[0].get(), L[l + 1].lv->nNodes);
         vcycle(pass, l + 1);
         run(pass, "prolong", V.prolongBG[1].get(), nN);               // t += P z_coarse
-        run(pass, "cheb_a", V.chebA[1].get(), nN);                    // t -> z
-        run(pass, "cheb_b", V.chebB[0].get(), nN);                    // z -> t
+        run(pass, "op", V.chebA[1].get(), nN);                        // t -> z
+        run(pass, "op", V.chebB[0].get(), nN);                        // z -> t
     }
     WGPUBuffer result(size_t l) const { return L[l].buf(L[l].out); }
 
@@ -133,7 +135,7 @@ struct GpuFeaSolver::Impl {
         auto pass = begin(enc);
         for (int j = 0; j < STEPS; j++) {
             run(pass, "lz_x", V.lzX.get(), uint64_t(m));
-            run(pass, "matvec", V.lzMv.get(), uint64_t(lv.nNodes));
+            run(pass, "op", V.lzMv.get(), uint64_t(lv.nNodes));
             run(pass, "lz_w", V.lzW.get(), uint64_t(m));
             dot(pass, V.t.get(), V.z.get(), 8, l);
             run(pass, "lz_axpy", V.lzAxpy.get(), uint64_t(m));
@@ -225,10 +227,14 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
     TraceTimer trace("  GPU shaders");
     gpuPushErrors(*ctx);
     I.prog = std::make_unique<GpuProgram>(*ctx, wgslSource("fea"),
-                                          std::vector<std::string>{"matvec", "cheb_first", "cheb_a", "cheb_b", "resid", "restrict_", "prolong", "coarsest", "update_xr",
+                                          std::vector<std::string>{"op", "cheb_first", "restrict_", "prolong", "coarse_gather", "coarsest", "update_xr",
                                                                    "update_p", "dot_partial", "reduce", "cg_alpha", "cg_beta", "lz_x", "lz_w", "lz_axpy",
                                                                    "lz_next", "lz_store"});
     trace.lap("  GPU upload");
+    for (uint32_t m = 0; m < 4; m++) {
+        const uint32_t op[4] = {m, 0, 0, 0};
+        I.opMode[m] = gpuUniform(*ctx, sizeof op, op);
+    }
     I.coarseM = fea.coarse.m;
     const auto& levels = fea.levels;
     I.L.resize(levels.size());
@@ -265,10 +271,14 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
             }
         });
         V.words = gpuBuffer(*ctx, words.size() * 4, words.data());
-        V.Ke = gpuBuffer(*ctx, lv.K.size() * 4, lv.K.data());
-        // the level's uniform element (rows as 6 vec4) and its 27-point stencil: neighbour
-        // m = ox + 3 oy + 9 oz, row d -> [3m + d].xyz
-        V.K0 = gpuUniform(*ctx, 576 * 4, lv.Kbf.data());
+        // element matrices: 0 = the level's uniform element Kb, then its own ones
+        {
+            std::vector<float> ke(576 + lv.K.size());
+            std::copy(lv.Kbf.begin(), lv.Kbf.begin() + 576, ke.begin());
+            std::copy(lv.K.begin(), lv.K.end(), ke.begin() + 576);
+            V.Ke = gpuBuffer(*ctx, ke.size() * 4, ke.data());
+        }
+        // Kb's 27-point stencil: neighbour m = ox + 3 oy + 9 oz, row d -> [3m + d].xyz
         {
             std::vector<float> st(81 * 4, 0.f);
             for (int row = 0; row < 9; row++)
@@ -294,6 +304,7 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
             V.freeIdx = gpuBuffer(*ctx, freeIdx.size() * 4, freeIdx.data());
             const auto inv = coarseInverse(fea.coarse);
             V.ainv = gpuBuffer(*ctx, inv.size() * 4, inv.data());
+            V.rc = gpuBuffer(*ctx, uint64_t(fea.coarse.m) * 4);
         } else V.out = 1;  // t
     }
     const int64_t n = levels[0].nDof;
@@ -313,22 +324,19 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
     auto& P = *I.prog;
     for (size_t l = 0; l < I.L.size(); l++) {
         auto& V = I.L[l];
-        auto op = [&](const char* entry, WGPUBuffer in, WGPUBuffer out, bool withD) {
-            std::vector<GpuProgram::Bind> b = {{0, V.params.get()}, {1, in}, {2, out}, {3, V.invD.get()}, {4, V.words.get()}, {5, V.Ke.get()},
-                                               {6, V.K0.get()}, {7, V.r.get()}, {13, V.dadd.get()}, {14, V.stencil.get()}};
-            if (withD) b.push_back({8, V.d.get()});
-            return P.bindGroup(entry, b);
+        auto op = [&](int mode, WGPUBuffer in, WGPUBuffer out) {
+            return P.bindGroup("op", {{0, V.params.get()}, {1, in}, {2, out}, {3, V.invD.get()}, {4, V.words.get()}, {5, V.Ke.get()}, {7, V.r.get()},
+                                      {8, V.d.get()}, {13, V.dadd.get()}, {14, V.stencil.get()}, {16, I.opMode[mode].get()}});
         };
         V.first = P.bindGroup("cheb_first", {{0, V.params.get()}, {2, V.z.get()}, {3, V.invD.get()}, {7, V.r.get()}, {8, V.d.get()}});
         for (int p = 0; p < 2; p++) {
-            V.chebA[p] = op("cheb_a", V.buf(p), V.buf(p ^ 1), true);
-            V.chebB[p] = op("cheb_b", V.buf(p), V.buf(p ^ 1), true);
-            V.resid[p] = op("resid", V.buf(p), V.buf(p ^ 1), false);
+            V.chebA[p] = op(1, V.buf(p), V.buf(p ^ 1));
+            V.chebB[p] = op(2, V.buf(p), V.buf(p ^ 1));
+            V.resid[p] = op(3, V.buf(p), V.buf(p ^ 1));
         }
         if (!V.last) {
             V.lzX = P.bindGroup("lz_x", {{0, V.params.get()}, {1, V.z.get()}, {2, V.r.get()}, {3, V.invD.get()}});
-            V.lzMv = P.bindGroup("matvec", {{0, V.params.get()}, {1, V.r.get()}, {2, V.t.get()}, {3, V.invD.get()}, {4, V.words.get()}, {5, V.Ke.get()},
-                                            {6, V.K0.get()}, {13, V.dadd.get()}, {14, V.stencil.get()}});
+            V.lzMv = op(0, V.r.get(), V.t.get());
             V.lzW = P.bindGroup("lz_w", {{0, V.params.get()}, {1, V.d.get()}, {2, V.t.get()}, {3, V.invD.get()}, {10, I.S.get()}});
             V.lzAxpy = P.bindGroup("lz_axpy", {{0, V.params.get()}, {1, V.z.get()}, {2, V.t.get()}, {10, I.S.get()}});
             V.lzNext = P.bindGroup("lz_next", {{0, V.params.get()}, {1, V.t.get()}, {2, V.z.get()}, {8, V.d.get()}, {10, I.S.get()}});
@@ -337,19 +345,16 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
                 V.restrictBG[p] = P.bindGroup("restrict_", {{0, V.params.get()}, {1, V.buf(p)}, {2, N.r.get()}, {3, N.invD.get()}});
                 V.prolongBG[p] = P.bindGroup("prolong", {{0, V.params.get()}, {1, N.buf(N.out)}, {2, V.buf(p)}, {3, V.invD.get()}});
             }
-            V.mv = P.bindGroup("matvec", {{0, V.params.get()}, {1, V.z.get()}, {2, V.t.get()}, {3, V.invD.get()}, {4, V.words.get()}, {5, V.Ke.get()},
-                                          {6, V.K0.get()}, {13, V.dadd.get()}, {14, V.stencil.get()}});
+            V.mv = op(0, V.z.get(), V.t.get());
         } else {
-            V.coarsest = P.bindGroup("coarsest", {{0, V.params.get()}, {1, V.r.get()}, {2, V.z.get()}, {4, V.freeIdx.get()}, {15, V.ainv.get()}});
+            V.gather = P.bindGroup("coarse_gather", {{0, V.params.get()}, {1, V.r.get()}, {4, V.freeIdx.get()}, {8, V.rc.get()}});
+            V.coarsest = P.bindGroup("coarsest", {{0, V.params.get()}, {9, V.rc.get()}, {2, V.z.get()}, {4, V.freeIdx.get()}, {15, V.ainv.get()}});
         }
     }
     auto& L0 = I.L[0];
     const WGPUBuffer z0 = I.result(0);
-    auto mv = [&](WGPUBuffer in, WGPUBuffer out) {
-        return P.bindGroup("matvec", {{0, L0.params.get()}, {1, in}, {2, out}, {3, L0.invD.get()}, {4, L0.words.get()}, {5, L0.Ke.get()},
-                                      {6, L0.K0.get()}, {13, L0.dadd.get()}, {14, L0.stencil.get()}});
-    };
-    I.mvP = mv(I.pv.get(), I.qv.get());
+    I.mvP = P.bindGroup("op", {{0, L0.params.get()}, {1, I.pv.get()}, {2, I.qv.get()}, {3, L0.invD.get()}, {4, L0.words.get()}, {5, L0.Ke.get()},
+                                {7, L0.r.get()}, {8, L0.d.get()}, {13, L0.dadd.get()}, {14, L0.stencil.get()}, {16, I.opMode[0].get()}});
     I.updXR = P.bindGroup("update_xr", {{0, L0.params.get()}, {1, I.pv.get()}, {2, I.x.get()}, {8, L0.r.get()}, {9, I.qv.get()}, {10, I.S.get()}});
     I.updP = P.bindGroup("update_p", {{0, L0.params.get()}, {1, z0}, {2, I.pv.get()}, {10, I.S.get()}});
     I.alpha = P.bindGroup("cg_alpha", {{10, I.S.get()}});
@@ -455,7 +460,7 @@ SolveResult GpuFeaSolver::solve(const std::vector<double>& f, const SolveOptions
                 I.run(pass, "cg_beta", I.beta.get(), 1);
                 I.run(pass, "update_p", I.updP.get(), n);
                 // q = K p; alpha = rz / p.q; x += alpha p; r -= alpha q
-                I.run(pass, "matvec", I.mvP.get(), L.nNodes);
+                I.run(pass, "op", I.mvP.get(), L.nNodes);
                 I.dot(pass, I.pv.get(), I.qv.get(), PQ);
                 I.run(pass, "cg_alpha", I.alpha.get(), 1);
                 I.run(pass, "update_xr", I.updXR.get(), n);
@@ -517,8 +522,8 @@ std::string GpuFeaSolver::profile(int reps) {
             out += line;
             continue;
         }
-        const double mv = time([&](auto p) { I.run(p, "matvec", V.mv.get(), nN); });
-        const double sm = time([&](auto p) { I.run(p, "cheb_b", V.chebB[0].get(), nN); });
+        const double mv = time([&](auto p) { I.run(p, "op", V.mv.get(), nN); });
+        const double sm = time([&](auto p) { I.run(p, "op", V.chebB[0].get(), nN); });
         const double rs = time([&](auto p) { I.run(p, "restrict_", V.restrictBG[0].get(), I.L[l + 1].lv->nNodes); });
         const double pr = time([&](auto p) { I.run(p, "prolong", V.prolongBG[0].get(), nN); });
         const double vc = time([&](auto p) { I.vcycle(p, l); });
