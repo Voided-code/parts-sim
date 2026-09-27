@@ -148,8 +148,10 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: '1'
           QMAKE: ${{ env.QT_ROOT_DIR }}/bin/qmake
           LD_LIBRARY_PATH: ${{ env.QT_ROOT_DIR }}/lib:${{ env.OCCT_DIR }}/lib:${{ env.WGPU_NATIVE_DIR }}/lib
-          VERSION: '0.3.0'
         run: |
+          # the version comes from native/CMakeLists.txt (linuxdeploy also stamps it into the AppImage)
+          export VERSION=$(sed -n 's/^project(PartsSim VERSION \([0-9.]*\).*/\1/p' native/CMakeLists.txt)
+          test -n "$VERSION"
           cmake --install build --prefix AppDir/usr
           curl -fLsSO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fLsSO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
