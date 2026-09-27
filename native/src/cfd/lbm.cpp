@@ -30,7 +30,7 @@ void validate(const LbmSetup& s) {
 
 
 // Cells away from walls and the domain boundary: the same pull-and-collide step without branches,
-// in 32-bit and unrolled over the directions, so the compiler vectorizes it along x.
+// in 32-bit and unrolled over the directions, so the compiler can vectorize it along x.
 // src[i] = f_i shifted so that src[i][c] is the population arriving at c; dst[i] = g_i.
 template <bool WriteMacro>
 void collideRun(const float* const* src, float* const* dst, float* __restrict macro, int64_t c0, int64_t c1, float tau0, float smag) {
@@ -73,8 +73,12 @@ void collideRun(const float* const* src, float* const* dst, float* __restrict ma
     float* __restrict t16 = dst[16];
     float* __restrict t17 = dst[17];
     float* __restrict t18 = dst[18];
-#if defined(__clang__)
+#if defined(__clang__) && defined(__aarch64__)
 #pragma clang loop vectorize(enable) interleave(disable)
+#elif defined(__clang__)
+    // x86 has 16 vector registers for the 19 populations: the vector code spills, and scalar code
+    // (what MSVC made of it) runs faster
+#pragma clang loop vectorize(disable)
 #endif
     for (int64_t c = c0; c < c1; c++) {
         const float f0 = s0[c];
