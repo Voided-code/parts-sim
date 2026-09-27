@@ -138,14 +138,18 @@ try {
     el.dispatchEvent(new Event('input'));
   }, target.value);
   await command('run:airflow');
-  // the drag comes from time-averaged pressures, which take a while to build on a slow CPU
-  const developed = () => { const r = window.partsSim.airflow.study.results; return r && Number.isFinite(r.cd) && r.cd > 0; };
-  await page.waitForFunction(developed, null, { timeout: 180000 }).catch(async (err) => {
-    const state = await page.evaluate(() => {
-      const s = window.partsSim.airflow.study;
-      return { status: document.querySelector('#status')?.textContent, ready: s.ready, running: s.running, engine: s.engine, N: s.N, steps: s.steps, dims: s.dims, cd: s.results?.cd, building: window.partsSim.airflow.building };
-    });
-    console.log('airflow state:', JSON.stringify(state));
+  const flowState = () => page.evaluate(() => {
+    const s = window.partsSim.airflow.study;
+    return { status: document.querySelector('#status')?.textContent, ready: s.ready, running: s.running, engine: s.engine, N: s.N, steps: s.steps, dims: s.dims, cd: s.results?.cd, building: window.partsSim.airflow.building };
+  });
+  await page.waitForFunction(() => window.partsSim.airflow.study.results, null, { timeout: 180000 }).catch(async (err) => {
+    console.log('airflow state:', JSON.stringify(await flowState()));
+    throw err;
+  });
+  await page.waitForTimeout(3000);
+  // the drag comes from time-averaged pressures, which take longer to build on a slow CPU
+  await page.waitForFunction(() => window.partsSim.airflow.study.results?.cd > 0, null, { timeout: 180000 }).catch(async (err) => {
+    console.log('airflow state:', JSON.stringify(await flowState()));
     throw err;
   });
   const flow = await page.evaluate(() => ({ engine: window.partsSim.airflow.study.engine, cd: window.partsSim.airflow.study.results.cd, cells: window.partsSim.airflow.study.N }));
