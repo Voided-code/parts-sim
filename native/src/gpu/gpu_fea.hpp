@@ -1,17 +1,18 @@
-// GPU version of the multigrid-preconditioned CG solve (fea.wgsl, the same shader the web app
-// used). The multigrid hierarchy is built by VoxelFEA on the CPU and uploaded; each GPU solve
-// runs in 32-bit floats and serves as the preconditioner of a 64-bit flexible CG on the CPU, so
-// the result reaches the CPU solver's accuracy.
+// GPU structural solve (fea.wgsl). The multigrid hierarchy is built by VoxelFEA on the CPU and
+// uploaded. solve() runs the CPU solver's multigrid-preconditioned conjugate gradients on the GPU
+// in 32-bit, with 64-bit reliable updates on the CPU, so it converges like the CPU solver and
+// reaches the same accuracy.
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "../fea/voxel_fea.hpp"
 
 namespace ps {
 
-constexpr int64_t GPU_COARSEST_DOF = 300;
+constexpr int64_t GPU_COARSEST_DOF = 1100;  // same hierarchy as the CPU solver (thin parts converge badly with one more level)
 
 class GpuFeaSolver {
 public:
@@ -19,12 +20,13 @@ public:
     explicit GpuFeaSolver(VoxelFEA& fea);
     ~GpuFeaSolver();
 
-    /** Approximate K x = rhs on the GPU from x = 0 (float32 multigrid-PCG). */
-    std::vector<double> pcg(const std::vector<double>& rhs, double tol, int maxIter, int* iterations = nullptr);
-    /** K u = f to the requested tolerance (flexible CG in float64, GPU-preconditioned). */
+    /** One multigrid V-cycle on the GPU (float32): z ~ K^-1 r, like VoxelFEA::precondition. */
+    void precondition(const double* r, double* z);
+    /** K u = f to the requested tolerance (32-bit CG on the GPU with 64-bit reliable updates on the CPU). */
     SolveResult solve(const std::vector<double>& f, const SolveOptions& opts);
+    /** Diagnostics: GPU time of each kernel and of the whole V-cycle, one line each. */
+    std::string profile(int reps = 20);
 
-    static double innerTol;
 
 private:
     struct Impl;

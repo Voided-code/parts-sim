@@ -47,11 +47,13 @@ struct BucklingRun {
     struct Mode { double factor; std::vector<float> shape; };  // factor inf: does not buckle
     std::vector<Mode> modes;
     std::vector<float> vm;  // pre-buckling von Mises [Pa] per vertex
+    double maxFactor = 0;   // factors were searched up to this (inf beyond it)
     bool converged = false;
     int iterations = 0, removed = 0;
     std::string engine, gpuNote;
 };
-BucklingRun runBuckling(const StructuralModel& m, const StructuralInput& in, int nev, const ProgressFn& progress);
+/** strength [Pa]: yield (or tensile strength for brittle materials), sets the range searched. */
+BucklingRun runBuckling(const StructuralModel& m, const StructuralInput& in, int nev, double strength, const ProgressFn& progress);
 
 // ---------- nonlinear static ----------
 

@@ -1,6 +1,7 @@
 // Parts Sim desktop app entry point.
 #include <QApplication>
 #include <QFile>
+#include <QElapsedTimer>
 #include <QFileOpenEvent>
 #include <QIcon>
 #include <QPalette>
@@ -103,7 +104,17 @@ void runScript(ps::MainWindow* w, QStringList steps) {
         else w->structural->runStudy();
     } else if (cmd == "windload") w->airflow->useAsLoad();
     else if (cmd == "cells") w->airflow->setCells(arg.toDouble());
+    else if (cmd == "aero") {
+        std::printf("aero: %s\n", qPrintable(w->airflow->aeroSummary()));
+        std::fflush(stdout);
+    }
     else if (cmd == "voxels") w->structural->setVoxelPreview(arg == "on");
+    else if (cmd == "mesh") w->structural->setTargetVoxels(arg.toDouble());  // mesh:<total voxels>
+    else if (cmd == "engine") w->structural->setEngine(arg == "gpu" ? 1 : arg == "cpu" ? 2 : 0);
+    else if (cmd == "meshinfo") {
+        std::printf("mesh: %s\n", qPrintable(w->structural->meshSummary()));
+        std::fflush(stdout);
+    }
     else if (cmd == "thtemp" || cmd == "thheat" || cmd == "thconv") {
         // thheat:<face>:<value> - a heat input on one CAD face
         const auto type = cmd == "thtemp" ? ps::ThermalPanel::Item::Temp : cmd == "thheat" ? ps::ThermalPanel::Item::Heat : ps::ThermalPanel::Item::Conv;
@@ -138,6 +149,20 @@ void runScript(ps::MainWindow* w, QStringList steps) {
         } else return scriptFailure("Unknown assertion: " + arg);
     } else if (cmd == "shot") {
         if (!w->grab().save(arg)) return scriptFailure("Could not save screenshot: " + arg);
+    } else if (cmd == "loaddir") {
+        // loaddir:x,y,z - point the selected load (or the first) along a direction
+        const QStringList v = arg.split(',');
+        auto& loads = w->structural->loads;
+        if (v.size() != 3 || loads.empty()) return scriptFailure("loaddir needs x,y,z and a load");
+        auto& l = loads[std::max(0, w->structural->selectedLoad)];
+        l.dir = {v[0].toDouble(), v[1].toDouble(), v[2].toDouble()};
+        w->structural->markStale();
+    } else if (cmd == "clock") {
+        // elapsed time since start-up, to time runs: clock;run;idle;clock
+        static QElapsedTimer timer;
+        if (!timer.isValid()) timer.start();
+        std::printf("clock: %lld ms\n", static_cast<long long>(timer.elapsed()));
+        std::fflush(stdout);
     } else if (cmd == "status") {
         std::printf("status: %s\n", qPrintable(w->statusText()));
         std::fflush(stdout);

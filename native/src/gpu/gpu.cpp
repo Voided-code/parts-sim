@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 #ifdef PARTS_SIM_HAS_GPU
 #include <wgpu.h>
@@ -55,6 +57,12 @@ GpuContext* create() {
     req.maxStorageBuffersPerShaderStage = std::min<uint32_t>(alimits.maxStorageBuffersPerShaderStage, 10);
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &req;
+    // 16-bit floats where the adapter has them (the flow solver stores its populations in them)
+    const WGPUFeatureName f16 = WGPUFeatureName_ShaderF16;
+    if (wgpuAdapterHasFeature(ctx->adapter, f16)) {
+        dd.requiredFeatureCount = 1;
+        dd.requiredFeatures = &f16;
+    }
     dd.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const*, WGPUErrorType, WGPUStringView, void*, void*) {};
     struct DeviceReq { WGPUDevice device = nullptr; bool done = false; std::string msg; } dreq;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -71,6 +79,7 @@ GpuContext* create() {
     if (!dreq.device) { ctx->error = dreq.msg.empty() ? "could not open the GPU device" : dreq.msg; return ctx; }
     ctx->device = dreq.device;
     ctx->queue = wgpuDeviceGetQueue(ctx->device);
+    ctx->shaderF16 = wgpuDeviceHasFeature(ctx->device, f16);
     wgpuDeviceGetLimits(ctx->device, &ctx->limits);
     return ctx;
 }
@@ -82,7 +91,29 @@ GpuContext* GpuContext::get() {
     return ctx->device ? ctx : nullptr;
 }
 
-void GpuContext::wait() { wgpuDevicePoll(device, true, nullptr); }
+void GpuContext::wait() {
+    // an empty completion callback on the queue marks when everything submitted so far is done
+    bool done = false;
+    WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+    cb.mode = WGPUCallbackMode_AllowProcessEvents;
+    cb.callback = [](WGPUQueueWorkDoneStatus, WGPUStringView, void* u1, void*) { *static_cast<bool*>(u1) = true; };
+    cb.userdata1 = &done;
+    wgpuQueueOnSubmittedWorkDone(queue, cb);
+    gpuWaitFor(*this, done);
+}
+
+void gpuWaitFor(GpuContext& ctx, const bool& done) {
+    // A blocking poll sleeps in 1 ms steps on some backends (Metal), which dominates short GPU
+    // jobs such as one solver iteration: spin on non-blocking polls for the first few
+    // milliseconds, then block for long jobs.
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!done) {
+        const bool spin = std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(4);
+        wgpuDevicePoll(ctx.device, !spin, nullptr);
+        wgpuInstanceProcessEvents(ctx.instance);
+        if (spin && !done) std::this_thread::yield();
+    }
+}
 
 GpuProgram::GpuProgram(GpuContext& ctx, const std::string& wgsl, const std::vector<std::string>& entries) : ctx_(ctx) {
     gpuPushErrors(ctx);
@@ -142,6 +173,12 @@ GpuBuffer gpuReadback(GpuContext& ctx, uint64_t bytes) {
 }
 
 std::vector<uint8_t> gpuRead(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t bytes, uint64_t srcOffset) {
+    std::vector<uint8_t> out;
+    gpuReadInto(ctx, src, staging, bytes, [&](const void* p) { out.assign(static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + bytes); }, srcOffset);
+    return out;
+}
+
+void gpuReadInto(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t bytes, const std::function<void(const void*)>& use, uint64_t srcOffset) {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(ctx.device, nullptr);
     wgpuCommandEncoderCopyBufferToBuffer(enc, src, srcOffset, staging, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
@@ -158,15 +195,16 @@ std::vector<uint8_t> gpuRead(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging
     };
     cb.userdata1 = &req;
     wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size_t(bytes), cb);
-    while (!req.done) {
-        wgpuDevicePoll(ctx.device, true, nullptr);
-        wgpuInstanceProcessEvents(ctx.instance);
-    }
+    gpuWaitFor(ctx, req.done);
     if (req.status != WGPUMapAsyncStatus_Success) throw std::runtime_error("Could not read results back from the GPU.");
     const void* p = wgpuBufferGetConstMappedRange(staging, 0, size_t(bytes));
-    std::vector<uint8_t> out(static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + bytes);
+    try {
+        use(p);
+    } catch (...) {
+        wgpuBufferUnmap(staging);
+        throw;
+    }
     wgpuBufferUnmap(staging);
-    return out;
 }
 
 std::array<uint32_t, 3> gpuDispatchSize(GpuContext& ctx, uint64_t count) {

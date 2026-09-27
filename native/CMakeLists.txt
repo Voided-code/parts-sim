@@ -122,6 +122,9 @@ ps_test(test_model)
 ps_test(test_gpu)
 ps_test(test_studies)
 ps_test(test_lbm)
+# performance benchmark (run by hand: build/bench [filter])
+add_executable(bench tests/bench.cpp)
+target_link_libraries(bench PRIVATE partssim_core)
 
 # ---------------------------------------------------------------------------------------------
 # Desktop app (Qt Widgets, 3D viewport through Qt RHI: Metal / Direct3D / Vulkan / OpenGL)

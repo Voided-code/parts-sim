@@ -31,6 +31,9 @@ struct LbmSetup {
     std::vector<uint8_t> solid;  // per cell
     std::vector<uint8_t> links;  // 19 * N or empty (see wallLinks)
     double uLat = 0.08, nuLat = 0.01, smagorinsky = 0.16;
+    // GPU: store the populations in 16 bits (shifted by their rest weights, "FP16S": Lehmann et al.
+    // 2022) where the GPU supports it - half the memory traffic and size, computing still in 32 bits
+    bool gpuHalf = true;
 };
 
 /** Inlet speed at a step (ramped up over the first LBM_RAMP_STEPS steps). */
@@ -62,6 +65,8 @@ private:
     std::vector<uint8_t> solid_, links_;
     std::vector<float> f_, g_, macro_;
     int64_t off_[19];
+    std::vector<std::pair<int, int>> runs_;  // [x0, x1) of cells with no solid neighbour, row by row
+    std::vector<int64_t> runStart_;          // per row (y + ny z), its first run
     double uLat_, tau0_, smag_;
     bool macroFresh_ = false;
 };
@@ -69,7 +74,7 @@ private:
 /** GPU solver; throws when the GPU is unavailable or the grid does not fit. */
 std::unique_ptr<LbmSolver> makeLbmGpu(const LbmSetup& s);
 /** Largest grid (cells) the GPU can hold (19 floats per cell in one storage buffer); 0 without a GPU. */
-int64_t lbmGpuMaxCells();
+int64_t lbmGpuMaxCells(bool half = true);
 
 /**
  * Exact wall distances for interpolated (Bouzidi) bounce-back: links[i * N + c] = 1 + round(254 q)

@@ -14,6 +14,7 @@
 #include <QScrollBar>
 #include <QTimer>
 #include <QSlider>
+#include <QSpinBox>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -23,6 +24,9 @@
 #include <set>
 
 #include "gpu/gpu.hpp"
+#include "gpu/gpu_fea.hpp"
+#include "util/system.hpp"
+#include "util/trace.hpp"
 #include "mainwindow.hpp"
 #include "picker.hpp"
 #include "samples.hpp"
@@ -68,10 +72,48 @@ int suggestResolution(Part& part, double budget) {
     return int(std::lround(n / 4.0) * 4);
 }
 
+// voxels of a part at a resolution: its volume plus the partly filled layer along the surface
+double estimateVoxels(const Part& part, int res) {
+    const auto& size = part.bbox.size;
+    const double hv = std::max({size[0], size[1], size[2]}) / res;
+    return part.volume / (hv * hv * hv) + 0.5 * part.area / (hv * hv);
+}
+
+// the resolution whose (corrected) voxel estimate is closest to a target count
+int resolutionFor(const Part& part, double voxels, double factor) {
+    int lo = 4, hi = 4000;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (factor * estimateVoxels(part, mid) <= voxels) lo = mid;
+        else hi = mid - 1;
+    }
+    const double below = factor * estimateVoxels(part, lo), above = factor * estimateVoxels(part, lo + 1);
+    return std::abs(std::log(above / voxels)) < std::abs(std::log(voxels / below)) ? lo + 1 : lo;
+}
+
+QString duration(double s) {
+    if (s < 1) return QObject::tr("%1 s").arg(QString::number(s, 'f', 1));
+    if (s < 60) return QObject::tr("%1 s").arg(std::lround(s));
+    const long m = std::lround(s) / 60, r = std::lround(s) % 60;
+    return r ? QObject::tr("%1 min %2 s").arg(m).arg(r) : QObject::tr("%1 min").arg(m);
+}
+
+// how many bend tests (one static solve) a study costs, roughly (measured on the samples)
+double studyCost(const QString& id, double voxels) {
+    if (id == "nonlinear") return 30;
+    if (id == "modal") return 15;
+    if (id == "buckling") return 10;
+    if (id == "drop") return 10 * std::cbrt(voxels / 4e4);  // the time step shrinks with the voxels
+    if (id == "dynamic") return 16;
+    if (id == "optimize") return 20;
+    return 1;
+}
+
 }  // namespace
 
 StructuralPanel::StructuralPanel(MainWindow* app) : app_(app) {
     buildUi();
+    QTimer::singleShot(1500, this, [this] { calibrate(); });
     studies = createStudies(this);
     renderStudyOptions();
 }
@@ -79,7 +121,7 @@ StructuralPanel::StructuralPanel(MainWindow* app) : app_(app) {
 StructuralPanel::~StructuralPanel() { cancelJob(); }
 
 bool StructuralPanel::gravity() const { return gravity_->isChecked(); }
-int StructuralPanel::resolution() const { return res_->value(); }
+int StructuralPanel::resolution() const { return resolution_; }
 
 bool StructuralPanel::useGPU() const {
     const int mode = engine_->currentIndex();
@@ -149,23 +191,34 @@ void StructuralPanel::buildUi() {
 
     root->addWidget(card(tr("Mesh"), &c, this));
     auto* rl = new QHBoxLayout;
-    rl->addWidget(new QLabel(tr("Voxels on longest side"), this));
+    rl->addWidget(new QLabel(tr("Total voxels"), this));
     rl->addStretch();
-    resOut_ = new QLabel("56", this);
-    rl->addWidget(resOut_);
+    voxelsBox_ = new QSpinBox(this);
+    voxelsBox_->setRange(1000, 100000000);
+    voxelsBox_->setSingleStep(10000);
+    voxelsBox_->setGroupSeparatorShown(true);
+    voxelsBox_->setKeyboardTracking(false);  // apply when typing is finished
+    voxelsBox_->setToolTip(tr("How many voxels the whole part is meshed with. More voxels: finer detail, longer runs."));
+    connect(voxelsBox_, &QSpinBox::valueChanged, this, [this](int v) { setTargetVoxels(v); });
+    rl->addWidget(voxelsBox_);
     c->addLayout(rl);
-    res_ = new QSlider(Qt::Horizontal, this);
-    res_->setRange(16, 480);
-    res_->setSingleStep(4);
-    res_->setPageStep(16);
-    res_->setValue(56);
-    connect(res_, &QSlider::valueChanged, this, [this](int v) { resOut_->setText(QString::number(v)); });
-    connect(res_, &QSlider::sliderReleased, this, [this] { markStale(); updateMeshInfo(); showVoxelPreview(); });
-    connect(res_, &QSlider::actionTriggered, this, [this](int action) {
-        if (action != QAbstractSlider::SliderMove)
-            QMetaObject::invokeMethod(this, [this] { markStale(); updateMeshInfo(); showVoxelPreview(); }, Qt::QueuedConnection);
+    // log scale: every step is the same ratio of voxels; the mesh follows when the slider is released
+    voxelsSlider_ = new QSlider(Qt::Horizontal, this);
+    voxelsSlider_->setRange(0, 1000);
+    auto fromSlider = [this](int v) {
+        const double raw = 1000 * std::pow(maxVoxels() / 1000, v / 1000.0);
+        const double p = std::pow(10.0, std::floor(std::log10(raw)) - 1);
+        return std::round(raw / p) * p;
+    };
+    connect(voxelsSlider_, &QSlider::valueChanged, this, [this, fromSlider](int v) {
+        const double n = fromSlider(v);
+        voxelsBox_->blockSignals(true);
+        voxelsBox_->setValue(int(n));
+        voxelsBox_->blockSignals(false);
+        if (!voxelsSlider_->isSliderDown()) setTargetVoxels(n);
     });
-    c->addWidget(res_);
+    connect(voxelsSlider_, &QSlider::sliderReleased, this, [this, fromSlider] { setTargetVoxels(fromSlider(voxelsSlider_->value())); });
+    c->addWidget(voxelsSlider_);
     voxelsChk_ = new QCheckBox(tr("Preview voxel mesh"), this);
     connect(voxelsChk_, &QCheckBox::toggled, this, [this] { showVoxelPreview(); });
     c->addWidget(voxelsChk_);
@@ -176,6 +229,10 @@ void StructuralPanel::buildUi() {
     engine_->setItemData(1, gpuAvailable() ? QVariant() : QVariant(0), Qt::UserRole - 1);
     el->addWidget(engine_, 1);
     c->addLayout(el);
+    connect(engine_, &QComboBox::activated, this, [this](int) { updateMeshInfo(); });
+    etaLabel_ = note("", this);
+    etaLabel_->setStyleSheet("font-weight: 600;");
+    c->addWidget(etaLabel_);
     meshInfo_ = note("", this);
     c->addWidget(meshInfo_);
 
@@ -342,7 +399,9 @@ void StructuralPanel::setStudy(int index) {
     study_ = index;
     studyBox_->setCurrentIndex(index);
     if (app_->part) {
-        res_->setValue(suggestResolution(*app_->part, studyInfos()[index].budget));
+        resolution_ = suggestResolution(*app_->part, studyInfos()[index].budget);
+        targetVoxels_ = voxelFactor_ * estimateVoxels(*app_->part, resolution_);
+        syncVoxelControls();
         updateMeshInfo();
     }
     display_ = index == 0 ? (result_ ? "results" : brk_ && !brk_->steps.empty() ? "break" : "setup")
@@ -415,7 +474,12 @@ void StructuralPanel::reset(const SampleSetup* setup) {
         for (const auto& l : setup->loads) loads.push_back(l);
         selectedLoad = loads.empty() ? -1 : 0;
     }
-    if (app_->part) res_->setValue(suggestResolution(*app_->part, studyInfos()[study_].budget));
+    voxelFactor_ = 1;
+    if (app_->part) {
+        resolution_ = suggestResolution(*app_->part, studyInfos()[study_].budget);
+        targetVoxels_ = estimateVoxels(*app_->part, resolution_);
+        syncVoxelControls();
+    }
     renderLists();
     renderStudyOptions();
     updateMeshInfo();
@@ -802,18 +866,137 @@ std::shared_ptr<StructuralModel> StructuralPanel::modelFor(int res) {
 std::shared_ptr<StructuralModel> StructuralPanel::model() { return modelFor(resolution()); }
 
 void StructuralPanel::updateMeshInfo() {
-    if (!app_->part) { meshInfo_->clear(); return; }
+    if (!app_->part) { meshInfo_->clear(); etaLabel_->clear(); return; }
     Part& p = *app_->part;
     const int res = resolution();
     const double hv = std::max({p.bbox.size[0], p.bbox.size[1], p.bbox.size[2]}) / res;
     const double wall = typicalWallThickness(p);
-    QString text = tr("Voxel size ≈ %1 %2.").arg(num(hv), app_->units);
+    QString text = tr("Voxel size ≈ %1 %2 (%3 on the longest side).").arg(num(hv), app_->units).arg(res);
     if (std::isfinite(wall))
         text += tr(" Walls ≈ %1 %2 thick (%3 voxels across)%4.")
                     .arg(num(wall), app_->units, num(wall / hv), wall < 1.5 * hv ? tr("; thinner walls are kept as connected layers") : QString());
-    auto it = models_.find(res);
-    if (it != models_.end() && it->second->part == app_->part) text += tr(" %1 voxels.").arg(QLocale().toString(it->second->voxelCount));
+    if (auto m = cachedModel(res)) text += tr(" This mesh: %1 voxels.").arg(QLocale().toString(m->voxelCount));
     meshInfo_->setText(text);
+    etaLabel_->setText(runEstimate());
+}
+
+void StructuralPanel::setTargetVoxels(double n, bool markChanged) {
+    targetVoxels_ = std::clamp(n, 1000.0, maxVoxels());
+    const int before = resolution_;
+    if (app_->part) resolution_ = resolutionFor(*app_->part, targetVoxels_, voxelFactor_);
+    syncVoxelControls();
+    if (markChanged && resolution_ != before) {
+        markStale();
+        showVoxelPreview();
+    }
+    updateMeshInfo();
+}
+
+QString StructuralPanel::meshSummary() const { return etaLabel_->text() + " | " + meshInfo_->text(); }
+
+void StructuralPanel::setEngine(int index) {
+    engine_->setCurrentIndex(index);
+    updateMeshInfo();
+}
+
+double StructuralPanel::maxVoxels() const {
+    // about 1.2 kB per voxel for the solver and its multigrid levels; keep 60% of the memory free
+    double ram = double(physicalMemory());
+    if (!(ram > 0)) ram = 8e9;
+    return std::clamp(0.4 * ram / 1200, 1e5, 1e8);
+}
+
+void StructuralPanel::syncVoxelControls() {
+    voxelsBox_->blockSignals(true);
+    voxelsBox_->setMaximum(int(maxVoxels()));
+    voxelsBox_->setValue(int(std::lround(targetVoxels_)));
+    voxelsBox_->blockSignals(false);
+    voxelsSlider_->blockSignals(true);
+    voxelsSlider_->setValue(int(std::lround(1000 * std::log(targetVoxels_ / 1000) / std::log(maxVoxels() / 1000))));
+    voxelsSlider_->blockSignals(false);
+}
+
+void StructuralPanel::learnVoxelFactor(const StructuralModel& m) {
+    if (!app_->part || m.part != app_->part || !(m.voxelCount > 0)) return;
+    const double est = estimateVoxels(*m.part, m.resolution);
+    if (est > 0) voxelFactor_ = m.voxelCount / est;
+}
+
+void StructuralPanel::recordRunTime(int voxels, const std::string& engine, double seconds) {
+    if (voxels < 2000 || !(seconds > 0)) return;
+    const int e = engine == "GPU" ? 1 : 0;
+    const double rate = seconds / voxels;
+    secPerVoxel_[e] = measured_[e] ? 0.5 * (secPerVoxel_[e] + rate) : rate;
+    measured_[e] = true;
+    updateMeshInfo();
+}
+
+QString StructuralPanel::runEstimate() const {
+    if (!app_->part) return {};
+    auto m = cachedModel(resolution_);
+    const double n = m ? m->voxelCount : targetVoxels_;
+    const QString id = studyInfos()[study_].id;
+    const double cost = studyCost(id, n);
+    const double cpu = cost * (0.05 + secPerVoxel_[0] * n), gpu = cost * (0.05 + secPerVoxel_[1] * n);
+    const int mode = engine_->currentIndex();
+    const bool gpuOk = gpuAvailable() && id != "drop";  // the drop test runs on the CPU
+    const bool onGPU = gpuOk && (mode == 1 || (mode == 0 && n >= AUTO_GPU_VOXELS));
+    QString text;
+    if (gpuOk)
+        text = onGPU ? tr("Estimated run ≈ %1 on the GPU (used) · %2 on the CPU").arg(duration(gpu), duration(cpu))
+                     : tr("Estimated run ≈ %1 on the CPU (used) · %2 on the GPU").arg(duration(cpu), duration(gpu));
+    else text = tr("Estimated run ≈ %1 on the CPU").arg(duration(cpu));
+    if (id == "static") text += tr("; break test ≈ %1").arg(duration(20 * (onGPU ? gpu : cpu)));
+    if (!measured_[0] && !measured_[1] && !calibrated_) text += calibration_ ? tr(" (measuring this computer…)") : tr(" (rough)");
+    return text + ".";
+}
+
+void StructuralPanel::calibrate() {
+    // a small bend test on each engine at start-up, so the estimates fit this computer
+    struct Out { double rate[2] = {-1, -1}; };
+    calibration_ = runJob<Out>(this,
+        [](JobControl& ctl) {
+            Out o;
+            // cantilever beam fixed at x = 0 and loaded at the far end
+            auto solveBeam = [](int nx, int ny, int nz, bool gpu) {
+                const int NX = nx + 1, NY = ny + 1, NZ = nz + 1;
+                std::vector<uint8_t> bc(3 * size_t(NX) * NY * NZ, 0);
+                std::vector<double> f(bc.size(), 0.0);
+                for (int k = 0; k < NZ; k++)
+                    for (int j = 0; j < NY; j++) {
+                        const size_t n0 = size_t(NX) * (j + size_t(NY) * k);
+                        bc[3 * n0] = bc[3 * n0 + 1] = bc[3 * n0 + 2] = 1;
+                        f[3 * (nx + n0) + 1] = -1.0 / (NY * NZ);
+                    }
+                VoxelFEA fea({nx, ny, nz}, std::vector<float>(size_t(nx) * ny * nz, 1.f), 0.3, bc, gpu ? GPU_COARSEST_DOF : 1100);
+                SolveOptions so;
+                so.tol = 1e-6;
+                so.maxIter = 400;
+                if (gpu) GpuFeaSolver(fea).solve(f, so);
+                else fea.solve(f, so);
+            };
+            const int nx = 200, ny = 18, nz = 18;
+            for (int e = 0; e < 2; e++) {
+                if (e == 1 && !gpuAvailable()) break;
+                ctl.check();
+                // the first GPU solve compiles the shaders (once per session): keep that out of the rate
+                if (e) solveBeam(24, 4, 4, true);
+                const auto t0 = std::chrono::steady_clock::now();
+                solveBeam(nx, ny, nz, e == 1);
+                // a real part needs voxelizing and results mapping, and its thin features and corners
+                // take more iterations than this plain beam: real parts run about 2.5x slower per voxel
+                o.rate[e] = 2.5 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / (nx * ny * nz);
+            }
+            return o;
+        },
+        [this](Out o) {
+            calibration_.reset();
+            for (int e = 0; e < 2; e++)
+                if (!measured_[e] && o.rate[e] > 0) secPerVoxel_[e] = o.rate[e];
+            calibrated_ = o.rate[0] > 0;
+            updateMeshInfo();
+        },
+        [this](QString, bool) { calibration_.reset(); }, {});
 }
 
 bool StructuralPanel::checkSetup(bool requireFixtures, bool requireLoads) {
@@ -938,9 +1121,12 @@ void StructuralPanel::run() {
     job = runJob<Out>(this,
         [s, engine](JobControl& ctl) {
             Out o;
-            o.prep = prepareOn(s, ctl);
-            // the CPU solver wins below ~60k voxels (GPU set-up and transfers dominate)
-            if (engine == 0) o.prep.input.useGPU = s.useGPU && o.prep.model->voxelCount >= 60000;
+            {
+                TraceTimer trace("prepare (model + loads)");
+                o.prep = prepareOn(s, ctl);
+            }
+            // the CPU solver wins on small models (GPU set-up and transfers dominate)
+            if (engine == 0) o.prep.input.useGPU = s.useGPU && o.prep.model->voxelCount >= AUTO_GPU_VOXELS;
             ctl.progress(0, "Solving " + std::to_string(o.prep.model->voxelCount) + " voxels…");
             o.res = solveStatic(o.prep.input, [&ctl](double f, const std::string& t) {
                 ctl.progress(f, t);
@@ -954,7 +1140,9 @@ void StructuralPanel::run() {
             models_[o.prep.model->resolution] = o.prep.model;
             updateMeshInfo();
             for (const auto& w : o.prep.asm_.warnings) app_->status(QString::fromStdString(w), "warn");
+            TraceTimer trace("map result");
             mapResult(o.res, o.prep);
+            trace.lap("show result");
             stale_ = false;
             display_ = "results";
             resultsCard_->show();
@@ -964,6 +1152,7 @@ void StructuralPanel::run() {
             if (o.res.removed) notes << tr("%1 voxels not connected to a fixture were ignored").arg(o.res.removed);
             if (o.res.lostLoad > 0.01) notes << tr("%1% of the load was on unsupported bits").arg(std::lround(o.res.lostLoad * 100));
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            recordRunTime(o.res.voxels, o.res.engine, secs);
             QString msg = (result_->unreliable ? tr("Results not reliable - see the note in Results. ") : QString()) +
                           tr("Solved %1 voxels on the %2 in %3 s (%4 multigrid-CG iterations).")
                               .arg(QLocale().toString(o.res.voxels), QString::fromStdString(o.res.engine), QString::number(secs, 'f', 2))
@@ -982,6 +1171,7 @@ void StructuralPanel::run() {
 }
 
 void StructuralPanel::rememberModel(const std::shared_ptr<StructuralModel>& m) {
+    learnVoxelFactor(*m);
     models_[m->resolution] = m;
     while (models_.size() > 3) models_.erase(models_.begin());
     updateMeshInfo();
@@ -1014,8 +1204,8 @@ bool StructuralPanel::startStudy(const QString& busyText, bool requireFixtures, 
         [s, engine, work](JobControl& ctl) {
             Out o;
             o.prep = prepareOn(s, ctl);
-            // the CPU solver wins below ~60k voxels (GPU set-up and transfers dominate)
-            if (engine == 0) o.prep.input.useGPU = s.useGPU && o.prep.model->voxelCount >= 60000;
+            // the CPU solver wins on small models (GPU set-up and transfers dominate)
+            if (engine == 0) o.prep.input.useGPU = s.useGPU && o.prep.model->voxelCount >= AUTO_GPU_VOXELS;
             o.value = work(o.prep, ctl);
             return o;
         },
@@ -1489,7 +1679,7 @@ void StructuralPanel::runBreak() {
         [this, s, engine, strength, principal](JobControl& ctl) {
             Out o;
             auto prep = prepareOn(s, ctl);
-            if (engine == 0) prep.input.useGPU = s.useGPU && prep.model->voxelCount >= 60000;
+            if (engine == 0) prep.input.useGPU = s.useGPU && prep.model->voxelCount >= AUTO_GPU_VOXELS;
             o.model = prep.model;
             o.totalF = std::sqrt(prep.asm_.total[0] * prep.asm_.total[0] + prep.asm_.total[1] * prep.asm_.total[1] + prep.asm_.total[2] * prep.asm_.total[2]);
             auto model = prep.model;

@@ -1,12 +1,15 @@
 #include "static_study.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
 
 #include "../gpu/gpu.hpp"
 #include "../gpu/gpu_fea.hpp"
+#include "../util/trace.hpp"
 
 namespace ps {
 
@@ -40,7 +43,9 @@ Solved buildAndSolve(const StructuralInput& in, const std::vector<float>& densit
                      const ProgressFn& progress, bool& gpuFailed, std::string& gpuNote) {
     Solved s;
     const bool gpu = in.useGPU && !gpuFailed && gpuAvailable();
+    TraceTimer trace("multigrid build");
     s.fea = std::make_unique<VoxelFEA>(in.dims, density, in.nu, in.bc, gpu ? GPU_COARSEST_DOF : 1100);
+    trace.lap("GPU setup");
     SolveOptions o;
     o.tol = 1e-6;
     o.x0 = x0;
@@ -55,6 +60,8 @@ Solved buildAndSolve(const StructuralInput& in, const std::vector<float>& densit
     if (gpu) {
         try {
             GpuFeaSolver g(*s.fea);
+            if (std::getenv("PARTS_SIM_PROFILE")) std::fputs(g.profile(50).c_str(), stderr);
+            trace.lap("GPU solve");
             o.maxIter = 3000;
             o.onProgress = report("GPU");
             s.sol = g.solve(in.f, o);
@@ -71,6 +78,8 @@ Solved buildAndSolve(const StructuralInput& in, const std::vector<float>& densit
             gpuNote = e.what();
         }
     }
+    if (std::getenv("PARTS_SIM_PROFILE")) std::fputs(s.fea->profile().c_str(), stderr);
+    trace.lap("CPU solve");
     o.maxIter = 400;
     o.onProgress = report("CPU");
     s.sol = s.fea->solve(in.f, o);
@@ -88,12 +97,15 @@ double maxDisp(const std::vector<double>& u) {
 }  // namespace
 
 StaticResult solveStatic(const StructuralInput& in, const ProgressFn& progress) {
+    TraceTimer trace("prune");
     const auto held = heldNodes(in.bc);
     auto pruned = pruneFloating(in.dims, in.density, held);
     if (progress && progress(0, "Building multigrid")) throw std::runtime_error("Cancelled");
     bool gpuFailed = false;
     std::string gpuNote;
+    trace.lap("build + solve");
     Solved s = buildAndSolve(in, pruned.density, nullptr, "Solving", progress, gpuFailed, gpuNote);
+    trace.lap("stresses + result");
     if (s.sol.cancelled) throw std::runtime_error("Cancelled");
     const double lost = lostLoadFraction(*s.fea, in.f);
     if (!s.sol.converged)

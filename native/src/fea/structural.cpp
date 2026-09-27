@@ -7,6 +7,7 @@
 #include <tuple>
 
 #include "../util/parallel.hpp"
+#include "../util/trace.hpp"
 
 namespace ps {
 
@@ -16,6 +17,7 @@ constexpr double GRAVITY = 9.81;
 }
 
 StructuralModel::StructuralModel(std::shared_ptr<Part> part_, int resolution_) : part(std::move(part_)), resolution(resolution_) {
+    TraceTimer trace("wall thickness");
     grid = gridForBox(part->bbox.min, part->bbox.max, resolution);
     const int nx = grid.dims[0], ny = grid.dims[1], nz = grid.dims[2];
     // sample finely enough to resolve thin walls, within a memory budget for the sample grid
@@ -23,7 +25,9 @@ StructuralModel::StructuralModel(std::shared_ptr<Part> part_, int resolution_) :
     int sub = 5;
     if (std::isfinite(wallThickness)) sub = std::max(sub, std::min(6, int(std::ceil(3 * grid.h / wallThickness))));
     while (sub > 2 && double(nx) * ny * nz * sub * sub * sub > 48e6) sub--;
+    trace.lap("voxelize");
     const auto frac = voxelize(part->vertices, part->tris, grid, sub);
+    trace.lap("thin walls + nodes");
     // walls under ~1.5 voxels thick get a connected layer with their true cross-section
     std::vector<float> shell;
     if (wallThickness < 2.5 * grid.h) shell = thinWallDensity(*part, grid, 1.5 * grid.h);

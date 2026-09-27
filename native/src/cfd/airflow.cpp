@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -18,8 +19,12 @@ namespace {
 
 constexpr double NU_AIR = 1.5e-5;  // m^2/s
 constexpr double MIN_NU_LAT = 0.0005;
-// memory per cell: GPU f-in / f-out (2 x 19 floats), moments, solid flag, wall links, read-back copy
-constexpr double GPU_BYTES = 2 * 76 + 16 + 4 + 19 + 16;
+// memory per cell on the GPU: f-in / f-out (2 x 19 populations, 16-bit where supported), moments,
+// solid flag, cell flags, wall links, read-back copy
+double gpuBytesPerCell() {
+    const bool half = gpuAvailable() && GpuContext::get()->shaderF16;
+    return 2 * 19 * (half ? 2 : 4) + 16 + 4 + 4 + 19 + 16;
+}
 // host: solid flag, wall links, up to three snapshots (moments + averages), a read-back copy, the voxelizer
 constexpr double HOST_BYTES = 1 + 19 + 3 * 32 + 16 + 4;
 constexpr double CPU_SOLVER_BYTES = 2 * 76 + 16;  // the CPU solver's own distributions and moments
@@ -51,8 +56,8 @@ AirflowCapacity airflowCapacity(bool gpu) {
 #else
     const bool unified = false;
 #endif
-    c.gpuBytesPerCell = gpu ? GPU_BYTES : 0;
-    c.ramBytesPerCell = HOST_BYTES + (gpu ? (unified ? GPU_BYTES : 0) : CPU_SOLVER_BYTES);
+    c.gpuBytesPerCell = gpu ? gpuBytesPerCell() : 0;
+    c.ramBytesPerCell = HOST_BYTES + (gpu ? (unified ? c.gpuBytesPerCell : 0) : CPU_SOLVER_BYTES);
     double ram = double(physicalMemory());
     if (!(ram > 0)) ram = 8e9;
     // leave half the memory to the system, the app and the other studies
@@ -62,9 +67,10 @@ AirflowCapacity airflowCapacity(bool gpu) {
         c.maxCells = std::min(ramCap, 0.95 * double(lbmGpuMaxCells()));
         c.defaultCells = 1e6;
     } else {
-        // the CPU manages ~70 million cell updates a second: bigger grids take minutes per flow-through
-        c.maxCells = std::min(ramCap, 8e6);
-        c.defaultCells = 3e5;
+        // the CPU manages ~250 million cell updates a second (10 cores): bigger grids take minutes per
+        // flow-through
+        c.maxCells = std::min(ramCap, 16e6);
+        c.defaultCells = 5e5;
     }
     c.maxCells = std::max(c.maxCells, c.minCells);
     c.defaultCells = std::clamp(c.defaultCells, c.minCells, c.maxCells);
@@ -185,6 +191,7 @@ void AirflowSim::createSolver() {
     s.links = links_;
     s.uLat = AIR_U_LAT;
     s.nuLat = nuLat;
+    s.gpuHalf = !std::getenv("PARTS_SIM_LBM_FP32");  // diagnostics: 32-bit populations
     if (useGPU_) {
         solver_ = makeLbmGpu(s);
         engine = "GPU";

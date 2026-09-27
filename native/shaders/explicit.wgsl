@@ -25,7 +25,7 @@ struct Params {
 @group(0) @binding(16) var<storage, read_write> partial: array<f32>;
 @group(0) @binding(17) var<storage, read_write> hist: array<f32>;
 
-var<private> OFF: array<vec3<u32>, 8> = array<vec3<u32>, 8>(
+const OFF: array<vec3<u32>, 8> = array<vec3<u32>, 8>(
   vec3<u32>(0u, 0u, 0u), vec3<u32>(1u, 0u, 0u), vec3<u32>(1u, 1u, 0u), vec3<u32>(0u, 1u, 0u), vec3<u32>(0u, 0u, 1u), vec3<u32>(1u, 0u, 1u), vec3<u32>(1u, 1u, 1u), vec3<u32>(0u, 1u, 1u));
 
 fn corner(x: u32, y: u32, z: u32) -> u32 {

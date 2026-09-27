@@ -477,6 +477,12 @@ void AirflowPanel::run() {
     renderLegends();
 }
 
+QString AirflowPanel::aeroSummary() const {
+    auto s = sim_ ? sim_->snapshot() : nullptr;
+    if (!s) return "no flow";
+    return QString("step %1 (%2 samples): Cd %3, Cl %4").arg(s->steps).arg(s->samples).arg(s->results.cd, 0, 'f', 4).arg(s->results.cl, 0, 'f', 4);
+}
+
 void AirflowPanel::update() {
     updateButtons();
     auto s = sim_ ? sim_->snapshot() : nullptr;

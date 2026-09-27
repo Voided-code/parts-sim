@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -36,6 +37,7 @@ struct GpuContext {
     WGPUQueue queue = nullptr;
     WGPULimits limits{};
     std::string name, error;
+    bool shaderF16 = false;  // 16-bit floats in shaders (WGSL "enable f16")
     std::mutex lock;  // one GPU job at a time
 
     static GpuContext* get();  // nullptr when unavailable
@@ -94,6 +96,10 @@ GpuBuffer gpuUniform(GpuContext& ctx, uint64_t bytes, const void* data);
 GpuBuffer gpuReadback(GpuContext& ctx, uint64_t bytes);
 /** Copy `bytes` from src (at srcOffset) through the read-back buffer and return them. */
 std::vector<uint8_t> gpuRead(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t bytes, uint64_t srcOffset = 0);
+/** The same, handing `use` the mapped bytes in place (no copy; valid only during the call). */
+void gpuReadInto(GpuContext& ctx, WGPUBuffer src, WGPUBuffer staging, uint64_t bytes, const std::function<void(const void*)>& use, uint64_t srcOffset = 0);
+/** Processes GPU events until `done` is set by a callback (low latency for short jobs). */
+void gpuWaitFor(GpuContext& ctx, const bool& done);
 /** Dispatch geometry for `count` invocations at workgroup size 64: {x, y, stride}. */
 std::array<uint32_t, 3> gpuDispatchSize(GpuContext& ctx, uint64_t count);
 /** Throws with the message of any validation or out-of-memory error raised since `push`. */

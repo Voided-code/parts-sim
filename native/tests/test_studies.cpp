@@ -108,10 +108,16 @@ TEST("buckling load of a clamped column matches Euler") {
     const double Pcr = M_PI * M_PI * E * (std::pow(0.01, 4) / 12) / (4 * 0.2 * 0.2);
     std::printf("  load factor %.3f vs %.3f (%d iterations)\n", r.factors[0], Pcr / F, r.iterations);
     CHECK(std::abs(r.factors[0] / (Pcr / F) - 1) < 0.03);
-    // pulling the column never buckles it
+    // the same search range as the app (compression at 1000 x the load is found)
+    const auto rr = bucklingFactors(fea, elementStresses(fea, u, g.h), 1, cpuPreconditioner(fea), {}, 1e-5, 1e4);
+    CHECK(std::abs(rr.factors[0] / r.factors[0] - 1) < 1e-3);
+    // pulling the column never buckles it: the clamp's small sideways compression only gives
+    // meaningless factors far beyond the range, and the search stops once that is clear
     const auto t = physical(fea.solve(tipForce(g, F, 0), o).u, g.h);
-    const auto r2 = bucklingFactors(fea, elementStresses(fea, t, g.h), 1, cpuPreconditioner(fea));
+    const auto r2 = bucklingFactors(fea, elementStresses(fea, t, g.h), 1, cpuPreconditioner(fea), {}, 1e-5, 1e4);
+    std::printf("  pulled: %s after %d iterations\n", std::isinf(r2.factors[0]) ? "no buckling in range" : "buckles", r2.iterations);
     CHECK(std::isinf(r2.factors[0]));
+    CHECK(r2.iterations < 100);
 }
 
 TEST("nonlinear: large deflection of a cantilever follows the elastica") {

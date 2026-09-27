@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <functional>
 #include <vector>
 
@@ -31,6 +32,7 @@ public:
 private:
     const Level& L_;
     std::vector<double> G_;
+    std::array<std::vector<int64_t>, 8> colours_;  // voxels of the same parity share no nodes
 };
 
 /** Symmetric eigen-decomposition (cyclic Jacobi): ascending values, column eigenvectors. */
@@ -41,6 +43,11 @@ struct LobpcgOptions {
     int block = 0;  // 0 = nev + guard vectors
     double tol = 1e-5;
     int maxIter = 300;
+    // Ritz values above this that have settled (moved less than 1% of |settleAbove| over the last
+    // 10 iterations) count as converged: buckling only needs to know an eigenvalue lies outside the
+    // searched range, and a cluster near zero would never meet the relative tolerance. Ritz values
+    // only decrease towards the eigenvalues, so a settled value above the bound stays above it.
+    double settleAbove = INFINITY;
     std::function<bool(int it, double res, int converged)> onProgress;  // true = cancel
 };
 
@@ -81,12 +88,18 @@ FrequencyResult naturalFrequencies(VoxelFEA& fea, int nev, double E, double dens
                                    const std::function<bool(int, double, int)>& onProgress = {}, double tol = 1e-5);
 
 struct BucklingResult {
-    std::vector<double> factors;  // +inf: no buckling for this mode
+    std::vector<double> factors;  // +inf: no buckling below maxFactor for this mode
+    double maxFactor = INFINITY;  // the range that was searched
     Block modes;
     bool converged = false;
     int iterations = 0;
 };
+/**
+ * Lowest buckling load factors up to maxFactor (factors above it come back as +inf: a part that
+ * yields long before would not reach them, and the search there is slow and ill-conditioned).
+ */
 BucklingResult bucklingFactors(VoxelFEA& fea, const std::vector<double>& sigma, int nev, const FullPreconditioner& pre,
-                               const std::function<bool(int, double, int)>& onProgress = {}, double tol = 1e-5);
+                               const std::function<bool(int, double, int)>& onProgress = {}, double tol = 1e-5,
+                               double maxFactor = INFINITY);
 
 }  // namespace ps

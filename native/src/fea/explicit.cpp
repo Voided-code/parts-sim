@@ -95,7 +95,7 @@ DropResult dropTestCPU(const VoxelFEA& fea, const DropOptions& o) {
     double fc = forces();
     for (int64_t i = 0; i < n; i++) v[i] += 0.5 * dt * a[i];
     auto sampleStress = [&] {
-        auto st = fea.stresses(u, o.E, o.h);
+        auto st = fea.stresses(u, o.E, o.h, false);  // only von Mises is tracked
         for (int64_t k = 0; k < nN; k++)
             if (st.nodeVM[k] > r.vmMax[k]) { r.vmMax[k] = st.nodeVM[k]; r.tPeak[k] = float(t); }
         return st;

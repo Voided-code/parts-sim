@@ -28,6 +28,167 @@ void validate(const LbmSetup& s) {
     if (!std::isfinite(s.smagorinsky) || s.smagorinsky < 0) throw std::invalid_argument("Smagorinsky constant must be finite and non-negative.");
 }
 
+
+// Cells away from walls and the domain boundary: the same pull-and-collide step without branches,
+// in 32-bit and unrolled over the directions, so the compiler vectorizes it along x.
+// src[i] = f_i shifted so that src[i][c] is the population arriving at c; dst[i] = g_i.
+template <bool WriteMacro>
+void collideRun(const float* const* src, float* const* dst, float* __restrict macro, int64_t c0, int64_t c1, float tau0, float smag) {
+    const float w0 = float(LBM_W[0]), w1 = float(LBM_W[1]), w2 = float(LBM_W[7]);
+    const float* __restrict s0 = src[0];
+    const float* __restrict s1 = src[1];
+    const float* __restrict s2 = src[2];
+    const float* __restrict s3 = src[3];
+    const float* __restrict s4 = src[4];
+    const float* __restrict s5 = src[5];
+    const float* __restrict s6 = src[6];
+    const float* __restrict s7 = src[7];
+    const float* __restrict s8 = src[8];
+    const float* __restrict s9 = src[9];
+    const float* __restrict s10 = src[10];
+    const float* __restrict s11 = src[11];
+    const float* __restrict s12 = src[12];
+    const float* __restrict s13 = src[13];
+    const float* __restrict s14 = src[14];
+    const float* __restrict s15 = src[15];
+    const float* __restrict s16 = src[16];
+    const float* __restrict s17 = src[17];
+    const float* __restrict s18 = src[18];
+    float* __restrict t0 = dst[0];
+    float* __restrict t1 = dst[1];
+    float* __restrict t2 = dst[2];
+    float* __restrict t3 = dst[3];
+    float* __restrict t4 = dst[4];
+    float* __restrict t5 = dst[5];
+    float* __restrict t6 = dst[6];
+    float* __restrict t7 = dst[7];
+    float* __restrict t8 = dst[8];
+    float* __restrict t9 = dst[9];
+    float* __restrict t10 = dst[10];
+    float* __restrict t11 = dst[11];
+    float* __restrict t12 = dst[12];
+    float* __restrict t13 = dst[13];
+    float* __restrict t14 = dst[14];
+    float* __restrict t15 = dst[15];
+    float* __restrict t16 = dst[16];
+    float* __restrict t17 = dst[17];
+    float* __restrict t18 = dst[18];
+#if defined(__clang__)
+#pragma clang loop vectorize(enable) interleave(disable)
+#endif
+    for (int64_t c = c0; c < c1; c++) {
+        const float f0 = s0[c];
+        const float f1 = s1[c];
+        const float f2 = s2[c];
+        const float f3 = s3[c];
+        const float f4 = s4[c];
+        const float f5 = s5[c];
+        const float f6 = s6[c];
+        const float f7 = s7[c];
+        const float f8 = s8[c];
+        const float f9 = s9[c];
+        const float f10 = s10[c];
+        const float f11 = s11[c];
+        const float f12 = s12[c];
+        const float f13 = s13[c];
+        const float f14 = s14[c];
+        const float f15 = s15[c];
+        const float f16 = s16[c];
+        const float f17 = s17[c];
+        const float f18 = s18[c];
+        const float rho = f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 + f10 + f11 + f12 + f13 + f14 + f15 + f16 + f17 + f18;
+        const float inv = 1.0f / rho;
+        const float ux = (f1 - f2 + f7 - f8 + f9 - f10 + f11 - f12 + f13 - f14) * inv;
+        const float uy = (f3 - f4 + f7 - f8 - f9 + f10 + f15 - f16 + f17 - f18) * inv;
+        const float uz = (f5 - f6 + f11 - f12 - f13 + f14 + f15 - f16 - f17 + f18) * inv;
+        const float usq = 1.5f * (ux * ux + uy * uy + uz * uz);
+        const float e0 = w0 * rho * (1.0f - usq);
+        const float cu1 = ux;
+        const float e1 = w1 * rho * (1.0f + 3.0f * cu1 + 4.5f * cu1 * cu1 - usq);
+        const float cu2 = -ux;
+        const float e2 = w1 * rho * (1.0f + 3.0f * cu2 + 4.5f * cu2 * cu2 - usq);
+        const float cu3 = uy;
+        const float e3 = w1 * rho * (1.0f + 3.0f * cu3 + 4.5f * cu3 * cu3 - usq);
+        const float cu4 = -uy;
+        const float e4 = w1 * rho * (1.0f + 3.0f * cu4 + 4.5f * cu4 * cu4 - usq);
+        const float cu5 = uz;
+        const float e5 = w1 * rho * (1.0f + 3.0f * cu5 + 4.5f * cu5 * cu5 - usq);
+        const float cu6 = -uz;
+        const float e6 = w1 * rho * (1.0f + 3.0f * cu6 + 4.5f * cu6 * cu6 - usq);
+        const float cu7 = ux + uy;
+        const float e7 = w2 * rho * (1.0f + 3.0f * cu7 + 4.5f * cu7 * cu7 - usq);
+        const float cu8 = -ux - uy;
+        const float e8 = w2 * rho * (1.0f + 3.0f * cu8 + 4.5f * cu8 * cu8 - usq);
+        const float cu9 = ux - uy;
+        const float e9 = w2 * rho * (1.0f + 3.0f * cu9 + 4.5f * cu9 * cu9 - usq);
+        const float cu10 = -ux + uy;
+        const float e10 = w2 * rho * (1.0f + 3.0f * cu10 + 4.5f * cu10 * cu10 - usq);
+        const float cu11 = ux + uz;
+        const float e11 = w2 * rho * (1.0f + 3.0f * cu11 + 4.5f * cu11 * cu11 - usq);
+        const float cu12 = -ux - uz;
+        const float e12 = w2 * rho * (1.0f + 3.0f * cu12 + 4.5f * cu12 * cu12 - usq);
+        const float cu13 = ux - uz;
+        const float e13 = w2 * rho * (1.0f + 3.0f * cu13 + 4.5f * cu13 * cu13 - usq);
+        const float cu14 = -ux + uz;
+        const float e14 = w2 * rho * (1.0f + 3.0f * cu14 + 4.5f * cu14 * cu14 - usq);
+        const float cu15 = uy + uz;
+        const float e15 = w2 * rho * (1.0f + 3.0f * cu15 + 4.5f * cu15 * cu15 - usq);
+        const float cu16 = -uy - uz;
+        const float e16 = w2 * rho * (1.0f + 3.0f * cu16 + 4.5f * cu16 * cu16 - usq);
+        const float cu17 = uy - uz;
+        const float e17 = w2 * rho * (1.0f + 3.0f * cu17 + 4.5f * cu17 * cu17 - usq);
+        const float cu18 = -uy + uz;
+        const float e18 = w2 * rho * (1.0f + 3.0f * cu18 + 4.5f * cu18 * cu18 - usq);
+        const float d0 = f0 - e0;
+        const float d1 = f1 - e1;
+        const float d2 = f2 - e2;
+        const float d3 = f3 - e3;
+        const float d4 = f4 - e4;
+        const float d5 = f5 - e5;
+        const float d6 = f6 - e6;
+        const float d7 = f7 - e7;
+        const float d8 = f8 - e8;
+        const float d9 = f9 - e9;
+        const float d10 = f10 - e10;
+        const float d11 = f11 - e11;
+        const float d12 = f12 - e12;
+        const float d13 = f13 - e13;
+        const float d14 = f14 - e14;
+        const float d15 = f15 - e15;
+        const float d16 = f16 - e16;
+        const float d17 = f17 - e17;
+        const float d18 = f18 - e18;
+        const float pxx = d1 + d2 + d7 + d8 + d9 + d10 + d11 + d12 + d13 + d14;
+        const float pyy = d3 + d4 + d7 + d8 + d9 + d10 + d15 + d16 + d17 + d18;
+        const float pzz = d5 + d6 + d11 + d12 + d13 + d14 + d15 + d16 + d17 + d18;
+        const float pxy = d7 + d8 - d9 - d10;
+        const float pxz = d11 + d12 - d13 - d14;
+        const float pyz = d15 + d16 - d17 - d18;
+        const float q = std::sqrt(pxx * pxx + pyy * pyy + pzz * pzz + 2.0f * (pxy * pxy + pxz * pxz + pyz * pyz));
+        const float om = 2.0f / (tau0 + std::sqrt(tau0 * tau0 + smag * q * inv));
+        t0[c] = f0 - om * d0;
+        t1[c] = f1 - om * d1;
+        t2[c] = f2 - om * d2;
+        t3[c] = f3 - om * d3;
+        t4[c] = f4 - om * d4;
+        t5[c] = f5 - om * d5;
+        t6[c] = f6 - om * d6;
+        t7[c] = f7 - om * d7;
+        t8[c] = f8 - om * d8;
+        t9[c] = f9 - om * d9;
+        t10[c] = f10 - om * d10;
+        t11[c] = f11 - om * d11;
+        t12[c] = f12 - om * d12;
+        t13[c] = f13 - om * d13;
+        t14[c] = f14 - om * d14;
+        t15[c] = f15 - om * d15;
+        t16[c] = f16 - om * d16;
+        t17[c] = f17 - om * d17;
+        t18[c] = f18 - om * d18;
+        if constexpr (WriteMacro) { macro[4 * c] = rho; macro[4 * c + 1] = ux; macro[4 * c + 2] = uy; macro[4 * c + 3] = uz; }
+    }
+}
+
 }  // namespace
 
 LbmCpu::LbmCpu(const LbmSetup& s) : dims_(s.dims), solid_(s.solid), links_(s.links) {
@@ -41,6 +202,26 @@ LbmCpu::LbmCpu(const LbmSetup& s) : dims_(s.dims), solid_(s.solid), links_(s.lin
     macro_.resize(4 * cells);
     const int64_t nx = dims_[0], ny = dims_[1];
     for (int i = 0; i < 19; i++) off_[i] = LBM_CX[i] + nx * (LBM_CY[i] + ny * LBM_CZ[i]);
+    // per row, runs [x0, x1) of interior fluid cells with no solid neighbour (the fast path)
+    const int nz = dims_[2];
+    runStart_.assign(size_t(ny) * nz + 1, 0);
+    for (int z = 0; z < nz; z++)
+        for (int y = 0; y < ny; y++) {
+            if (y > 0 && z > 0 && y < ny - 1 && z < nz - 1) {
+                int x0 = -1;
+                for (int x = 1; x <= nx - 1; x++) {
+                    bool simple = x < nx - 1;
+                    if (simple) {
+                        const int64_t c = x + nx * (y + ny * int64_t(z));
+                        simple = !solid_[c];
+                        for (int i = 1; i < 19 && simple; i++) simple = !solid_[c - off_[i]];
+                    }
+                    if (simple && x0 < 0) x0 = x;
+                    if (!simple && x0 >= 0) { runs_.push_back({x0, x}); x0 = -1; }
+                }
+            }
+            runStart_[y + size_t(ny) * z + 1] = int64_t(runs_.size());
+        }
     reset();
 }
 
@@ -75,12 +256,27 @@ void LbmCpu::stepOnce(bool writeMacro) {
         feqIn[i] = LBM_W[i] * (1 + 3 * cu + 4.5 * cu * cu - 1.5 * uin * uin);
     }
     const double tau0 = tau0_, smag = smag_;
+    const float* src[19];
+    float* dst[19];
+    for (int i = 0; i < 19; i++) {
+        src[i] = f + i * N - off_[i];
+        dst[i] = g + i * N;
+    }
     parallelFor(int64_t(nz) * ny, [&](int64_t lo, int64_t hi) {
         double fi[19], fe[19];
         for (int64_t row = lo; row < hi; row++) {
             const int y = int(row % ny), z = int(row / ny);
             const bool edge = y == 0 || z == 0 || y == ny - 1 || z == nz - 1;
+            const int64_t rowStart = int64_t(nx) * row;
+            int64_t r = runStart_[row], rEnd = runStart_[row + 1];
             for (int x = 0; x < nx; x++) {
+                if (r < rEnd && x == runs_[r].first) {
+                    if (writeMacro) collideRun<true>(src, dst, macro, rowStart + x, rowStart + runs_[r].second, float(tau0), float(smag));
+                    else collideRun<false>(src, dst, macro, rowStart + x, rowStart + runs_[r].second, float(tau0), float(smag));
+                    x = runs_[r].second - 1;
+                    r++;
+                    continue;
+                }
                 const int64_t c = x + int64_t(nx) * (y + int64_t(ny) * z);
                 if (solid[c]) continue;
                 if (x == 0) {

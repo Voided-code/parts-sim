@@ -4,7 +4,8 @@
 // One temperature per grid node, 8-node brick conduction elements (conductivity scaled by each
 // voxel's fill fraction), lumped heat capacity, backward-Euler time steps. The linear systems are
 // solved with conjugate gradients preconditioned by a scalar geometric multigrid V-cycle with
-// Galerkin coarse operators, the same scheme as the structural solver.
+// Galerkin coarse operators, the same scheme as the structural solver (including its 27-point
+// stencil inside uniform regions).
 //
 // Normalized units: the system is divided by k*h (conductivity x voxel size), so temperatures
 // come out directly in degrees and a node's convection term is h_c * A / (k h).
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ps {
@@ -31,8 +33,11 @@ public:
         std::vector<int64_t> base;
         std::vector<double> rho, K, diagAdd, invDiag, r, z, t;
         std::vector<uint8_t> bc, fixed, active;
-        std::array<std::vector<int>, 8> colours;
-        double omega = 0.6;
+        std::vector<int> emap;          // voxel -> element (or -1)
+        std::vector<double> scale;      // element -> s when it is s * K0 (all of the finest level), else -1
+        std::vector<float> voxelScale;  // voxel -> scale (0 if empty)
+        std::vector<float> nodeScale;   // node -> s when its 8 voxels are all s * K0 (27-point stencil), else 0
+        double omega = 0.6;             // damped Jacobi
         int64_t freeDof = 0;
         std::vector<int> mx0, mx1, my0, my1, mz0, mz1;  // to the next coarser level
     };
@@ -51,6 +56,8 @@ public:
     Result solve(const std::vector<double>& f, const std::vector<double>& x0, double tol = 1e-8, int maxIter = 400);
 
     std::vector<Level> levels;
+    /** Diagnostics: time of the matrix product and of a V-cycle per level, one line each. */
+    std::string profile(int reps = 20);
 
 private:
     void finishLevel(Level& L);

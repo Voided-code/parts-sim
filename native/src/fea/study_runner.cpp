@@ -66,20 +66,17 @@ struct Engine {
     Block precond(const Block& R) {
         Block out;
         for (const auto& r : R) {
-            if (gpu) out.push_back(gpu->pcg(r, 0.15, 25));
-            else {
-                Vec z(r.size());
-                fea->precondition(r.data(), z.data());
-                out.push_back(std::move(z));
-            }
+            Vec z(r.size());
+            // one multigrid V-cycle, on the GPU when there is one
+            if (gpu) gpu->precondition(r.data(), z.data());
+            else fea->precondition(r.data(), z.data());
+            out.push_back(std::move(z));
         }
         return out;
     }
     void precond1(const double* r, double* z) {
-        if (gpu) {
-            const auto out = gpu->pcg(std::vector<double>(r, r + fea->nDof()), 0.15, 25);
-            std::copy(out.begin(), out.end(), z);
-        } else fea->precondition(r, z);
+        if (gpu) gpu->precondition(r, z);
+        else fea->precondition(r, z);
     }
     SolveResult solve(const std::vector<double>& f, SolveOptions o) {
         if (gpu) {
@@ -206,7 +203,7 @@ ModalRun runModal(const StructuralModel& m, const StructuralInput& in, int nev, 
 
 // ---------- linear buckling ----------
 
-BucklingRun runBuckling(const StructuralModel& m, const StructuralInput& in, int nev, const ProgressFn& progress) {
+BucklingRun runBuckling(const StructuralModel& m, const StructuralInput& in, int nev, double strength, const ProgressFn& progress) {
     BucklingRun out;
     auto fea = buildModel(in, false, nullptr, &out.removed);
     Engine engine(*fea, in.useGPU);
@@ -224,12 +221,19 @@ BucklingRun runBuckling(const StructuralModel& m, const StructuralInput& in, int
     const auto u = physical(sol.u, in);
     const auto sigma = elementStresses(*fea, u, in.h);
     nev = std::max(1, std::min(8, nev));
+    // Search up to 100 times the load that makes it yield (at least 1000 x the loads): a buckling
+    // load far beyond yielding is never reached, and near-zero eigenvalues are slow to resolve.
+    const auto st = fea->stresses(u, in.E, in.h, false);
+    double vmMax = 0;
+    for (float v : st.nodeVM) vmMax = std::max(vmMax, double(v));
+    const double yieldFactor = vmMax > 0 && strength > 0 ? strength / vmMax : INFINITY;
+    out.maxFactor = std::isfinite(yieldFactor) ? std::max(1000.0, 100 * yieldFactor) : INFINITY;
     auto r = bucklingFactors(*fea, sigma, nev, [&](const Block& R) { return engine.precond(R); }, [&](int it, double res, int conv) {
         return progress && progress(residualFraction(res), "Buckling modes on the " + engine.name + " · " + std::to_string(conv) + "/" + std::to_string(nev) +
                                                                " converged · iteration " + std::to_string(it));
-    });
+    }, 1e-5, out.maxFactor);
     const auto W = m.vertexWeights(fea->levels[0].activeNode);
-    out.vm = interpolate(W, fea->stresses(u, in.E, in.h).nodeVM.data());
+    out.vm = interpolate(W, st.nodeVM.data());
     for (size_t i = 0; i < r.factors.size(); i++) {
         BucklingRun::Mode md;
         md.factor = r.factors[i];

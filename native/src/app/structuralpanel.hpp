@@ -21,6 +21,7 @@ class QLabel;
 class QListWidget;
 class QPushButton;
 class QSlider;
+class QSpinBox;
 class QVBoxLayout;
 
 namespace ps {
@@ -46,6 +47,14 @@ public:
     void onMaterialChanged();
     void onPartScaled(double s, const Vec3& pivot);
     void updateMeshInfo();
+    /** Mesh size as a total voxel count (the grid is sized to match it). */
+    void setTargetVoxels(double n, bool markChanged = true);
+    double maxVoxels() const;
+    /** Automation: the mesh card's estimate and mesh lines; choose the engine (0 auto, 1 GPU, 2 CPU). */
+    QString meshSummary() const;
+    void setEngine(int index);
+    /** Voxel count at which "Automatic" switches to the GPU. */
+    static constexpr int AUTO_GPU_VOXELS = 40000;
     /** Show the voxel mesh instead of the part while "Preview voxel mesh" is on (setup view only). */
     void showVoxelPreview();
     void setVoxelPreview(bool on);
@@ -92,6 +101,11 @@ public:
 
 private:
     void buildUi();
+    void syncVoxelControls();
+    void learnVoxelFactor(const StructuralModel& m);
+    void recordRunTime(int voxels, const std::string& engine, double seconds);
+    void calibrate();
+    QString runEstimate() const;
     void renderLists();
     void renderLoadEditor();
     void setStudy(int index);
@@ -171,10 +185,21 @@ private:
     QListWidget* loadList_;
     QWidget* loadEditor_;
     QCheckBox* gravity_;
-    QSlider* res_;
+    // mesh size: the user sets a total voxel count; the grid is sized to match it
+    QSlider* voxelsSlider_;
+    QSpinBox* voxelsBox_;
+    QLabel* etaLabel_;
+    int resolution_ = 56;       // voxels on the longest side, derived from the target
+    double targetVoxels_ = 5e4;
+    double voxelFactor_ = 1;    // actual / estimated voxel count, learned from the meshes built for this part
+    // seconds per voxel of one bend test (voxelize, build and solve) on each engine: from a start-up
+    // calibration run, then from the real runs
+    double secPerVoxel_[2] = {3e-6, 2.5e-6};  // CPU, GPU
+    bool measured_[2] = {false, false};
+    bool calibrated_ = false;
+    std::shared_ptr<JobControl> calibration_;
     QCheckBox* voxelsChk_;
     std::shared_ptr<JobControl> previewJob_;
-    QLabel* resOut_;
     QComboBox* engine_;
     QLabel* meshInfo_;
     QPushButton* runBtn_;

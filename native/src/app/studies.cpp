@@ -742,7 +742,10 @@ public:
         const int nev = nev_;
         if (!panel_->startStudy(
                 tr("Buckling analysis…"), true, true,
-                [nev](StructuralPanel::Prepared& p, JobControl& ctl) -> std::any { return runBuckling(*p.model, p.input, nev, progressOf(ctl)); },
+                [nev](StructuralPanel::Prepared& p, JobControl& ctl) -> std::any {
+                    const double strength = (p.material.brittle ? p.material.uts : p.material.yield) * 1e6;
+                    return runBuckling(*p.model, p.input, nev, strength, progressOf(ctl));
+                },
                 [this, gen](std::any& value, StructuralPanel::Prepared& p) {
                     if (gen != runGen_) return;
                     r_ = std::any_cast<BucklingRun>(std::move(value));
@@ -756,7 +759,7 @@ public:
                     show();
                     const double bl = r_->modes.empty() ? INFINITY : r_->modes[0].factor;
                     status(std::isfinite(bl) ? tr("Lowest buckling load factor %1 %2: it buckles at about %3.").arg(num(bl), engineNote(r_->engine, r_->gpuNote), force(bl * totalF_))
-                                             : tr("No buckling under these loads (they do not compress the part) %1.").arg(engineNote(r_->engine, r_->gpuNote)),
+                                             : tr("No buckling below %1 %2.").arg(beyond(), engineNote(r_->engine, r_->gpuNote)),
                            std::isfinite(bl) && bl < 1 ? "error" : "");
                 }))
             --runGen_;
@@ -768,6 +771,11 @@ protected:
         return &r_->modes[view_.mode].shape;
     }
 
+    // "no buckling" means none below the searched range (it yields long before)
+    QString beyond() const {
+        return std::isfinite(r_->maxFactor) ? tr("%1 × the loads (it yields long before that)").arg(num(r_->maxFactor)) : tr("any load (nothing is compressed)");
+    }
+
     double yieldFactor() const {
         return maxVM_ > 0 ? (material_.brittle ? material_.uts : material_.yield) * 1e6 / maxVM_ : INFINITY;
     }
@@ -776,7 +784,8 @@ protected:
         setTitle(tr("Buckling"));
         QStringList rows;
         for (size_t i = 0; i < r_->modes.size(); i++)
-            rows << tr("Mode %1   %2").arg(i + 1).arg(std::isfinite(r_->modes[i].factor) ? tr("factor %1").arg(num(r_->modes[i].factor)) : tr("no buckling"));
+            rows << tr("Mode %1   %2").arg(i + 1).arg(std::isfinite(r_->modes[i].factor) ? tr("factor %1").arg(num(r_->modes[i].factor))
+                                                                                           : std::isfinite(r_->maxFactor) ? tr("factor > %1").arg(num(r_->maxFactor)) : tr("no buckling"));
         addModeControls(body, rows);
         const double bl = r_->modes.empty() ? INFINITY : r_->modes[0].factor;
         const double yl = yieldFactor();
@@ -795,7 +804,7 @@ protected:
         else if (bl < 3) { k = "warn"; t = tr("low margin"); }
         else { k = "good"; t = tr("safe margin"); }
         setKpis({
-            {tr("Buckling load factor"), std::isfinite(bl) ? num(bl) : "∞", "", k, t},
+            {tr("Buckling load factor"), std::isfinite(bl) ? num(bl) : std::isfinite(r_->maxFactor) ? "> " + num(r_->maxFactor) : "∞", "", k, t},
             {tr("Buckling load"), std::isfinite(bl) && totalF_ > 0 ? force(bl * totalF_) : "–", tr("loads × factor")},
             {tr("Yields first at"), std::isfinite(yl) ? "× " + num(yl) : "–", yl < bl ? tr("before it buckles") : tr("after buckling")},
         });
@@ -805,7 +814,7 @@ protected:
     void draw() override {
         if (!r_ || r_->modes.empty()) return;
         const auto& m = r_->modes[std::min(view_.mode, int(r_->modes.size()) - 1)];
-        drawShape(tr("Buckling mode %1 · factor %2").arg(view_.mode + 1).arg(std::isfinite(m.factor) ? num(m.factor) : "∞"));
+        drawShape(tr("Buckling mode %1 · factor %2").arg(view_.mode + 1).arg(std::isfinite(m.factor) ? num(m.factor) : std::isfinite(r_->maxFactor) ? "> " + num(r_->maxFactor) : "∞"));
     }
 
 private:

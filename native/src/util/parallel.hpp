@@ -86,6 +86,23 @@ double parallelSum(int64_t n, F&& fn, int64_t grain = 8192) {
     return s;
 }
 
+/** Parallel maximum of fn(begin, end) partials (0 when empty). */
+template <class F>
+double parallelMax(int64_t n, F&& fn, int64_t grain = 8192) {
+    if (n <= 0) return 0.0;
+    const int chunks = chunkCount(n, grain);
+    if (chunks <= 1) return fn(int64_t{0}, n);
+    std::vector<double> part(chunks, 0.0);
+    std::function<void(int)> job = [&](int c) {
+        const int64_t b = n * c / chunks, e = n * (c + 1) / chunks;
+        part[c] = b < e ? fn(b, e) : 0.0;
+    };
+    ThreadPool::instance().run(chunks, job);
+    double m = 0;
+    for (double v : part) m = v > m ? v : m;
+    return m;
+}
+
 inline double dot(const double* a, const double* b, int64_t n) {
     return parallelSum(n, [&](int64_t lo, int64_t hi) {
         double s = 0;

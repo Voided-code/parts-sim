@@ -108,7 +108,8 @@ TEST("flow past a cube stays stable and gives a bluff-body drag coefficient (CPU
 
 TEST("GPU flow solver matches the CPU solver") {
     if (!gpuAvailable()) { std::printf("  (no GPU: skipped)\n"); return; }
-    const auto s = cubeTunnel();
+    auto s = cubeTunnel();
+    s.gpuHalf = false;
     auto gpu = makeLbmGpu(s);
     double mlups, maxU;
     const double cd = cubeDrag(*gpu, s, &mlups, &maxU);
@@ -117,6 +118,20 @@ TEST("GPU flow solver matches the CPU solver") {
     const double cdCpu = cubeDrag(cpu, s, &m2, &u2);
     std::printf("  GPU: %.0f MLUPS, Cd %.4f vs CPU %.4f\n", mlups, cd, cdCpu);
     CHECK(std::abs(cd - cdCpu) < 0.01 * std::abs(cdCpu));
+}
+
+TEST("GPU flow solver with 16-bit populations stays within 1% of the 32-bit drag") {
+    if (!gpuAvailable()) { std::printf("  (no GPU: skipped)\n"); return; }
+    const auto s = cubeTunnel();
+    auto half = makeLbmGpu(s);
+    double mlups, maxU;
+    const double cd = cubeDrag(*half, s, &mlups, &maxU);
+    LbmCpu cpu(s);
+    double m2, u2;
+    const double cdCpu = cubeDrag(cpu, s, &m2, &u2);
+    std::printf("  GPU 16-bit: %.0f MLUPS, Cd %.4f vs 32-bit %.4f (%+.2f%%), max |u| %.3f vs %.3f\n", mlups, cd, cdCpu, 100 * (cd / cdCpu - 1), maxU, u2);
+    CHECK(std::abs(cd - cdCpu) < 0.01 * std::abs(cdCpu));
+    CHECK(std::abs(maxU - u2) < 0.02 * u2);
 }
 
 TEST("wall links measure the true wall position along lattice links") {

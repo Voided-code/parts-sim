@@ -45,6 +45,8 @@ public:
     void useAsLoad();
     /** Automation: set the grid size (cells). */
     void setCells(double n);
+    /** Script diagnostics: step count and force coefficients of the latest snapshot. */
+    QString aeroSummary() const;
 
 private:
     void buildUi();

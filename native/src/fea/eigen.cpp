@@ -103,6 +103,11 @@ std::vector<double> elementStresses(const VoxelFEA& fea, const Vec& u, double h)
 }
 
 GeometricStiffness::GeometricStiffness(const VoxelFEA& fea, const std::vector<double>& sigma) : L_(fea.levels[0]) {
+    for (size_t e = 0; e < L_.elems.size(); e++) {
+        const int v = L_.elems[e];
+        const int i = v % L_.nx, j = (v / L_.nx) % L_.ny, k = v / (L_.nx * L_.ny);
+        colours_[(i & 1) | ((j & 1) << 1) | ((k & 1) << 2)].push_back(int64_t(e));
+    }
     const auto& T = geometricTables();
     G_.assign(64 * L_.elems.size(), 0.0);
     for (size_t e = 0; e < L_.elems.size(); e++) {
@@ -119,13 +124,11 @@ void GeometricStiffness::apply(const double* x, double* y) const {
     const Level& L = L_;
     std::fill(y, y + L.nDof, 0.0);
     // element scatter, by colour so voxels updating the same node never run together
-    for (int colour = 0; colour < 8; colour++) {
-        parallelFor(int64_t(L.elems.size()), [&](int64_t lo, int64_t hi) {
+    for (const auto& list : colours_) {
+        parallelFor(int64_t(list.size()), [&](int64_t lo, int64_t hi) {
             double ue[24];
-            for (int64_t e = lo; e < hi; e++) {
-                const int v = L.elems[e];
-                const int i = v % L.nx, j = (v / L.nx) % L.ny, k = v / (L.nx * L.ny);
-                if (((i & 1) | ((j & 1) << 1) | ((k & 1) << 2)) != colour) continue;
+            for (int64_t t = lo; t < hi; t++) {
+                const int64_t e = list[t];
                 const int64_t n0 = L.base[e];
                 for (int a = 0; a < 8; a++) {
                     const int64_t n = 3 * (n0 + L.off[a]);
@@ -271,31 +274,76 @@ static void addInto(Block& a, const Block& b) {
     }
 }
 
+// All pairwise products G[i * B.size() + j] = A[i] . B[j] in one pass over memory (each vector is
+// read once instead of once per pair), with deterministic chunk-ordered sums.
+static std::vector<double> blockDot(const std::vector<const Vec*>& A, const std::vector<const Vec*>& B, int64_t n) {
+    const size_t ka = A.size(), kb = B.size();
+    std::vector<double> G(ka * kb, 0.0);
+    if (!ka || !kb || n <= 0) return G;
+    const int chunks = std::max(1, chunkCount(n, 4096));
+    std::vector<double> part(size_t(chunks) * ka * kb, 0.0);
+    std::function<void(int)> job = [&](int c) {
+        const int64_t lo = n * c / chunks, hi = n * (c + 1) / chunks;
+        double* g = &part[size_t(c) * ka * kb];
+        // 512-row tiles keep the rows of every vector in L1 while all pairs are formed
+        for (int64_t t0 = lo; t0 < hi; t0 += 512) {
+            const int64_t t1 = std::min(hi, t0 + 512);
+            for (size_t i = 0; i < ka; i++) {
+                const double* a = A[i]->data();
+                for (size_t j = 0; j < kb; j++) {
+                    const double* b = B[j]->data();
+                    double acc = 0;
+                    for (int64_t t = t0; t < t1; t++) acc += a[t] * b[t];
+                    g[i * kb + j] += acc;
+                }
+            }
+        }
+    };
+    ThreadPool::instance().run(chunks, job);
+    for (int c = 0; c < chunks; c++)
+        for (size_t q = 0; q < ka * kb; q++) G[q] += part[size_t(c) * ka * kb + q];
+    return G;
+}
+
+static std::vector<const Vec*> ptrs(const Block& V) {
+    std::vector<const Vec*> out;
+    for (const auto& v : V) out.push_back(&v);
+    return out;
+}
+
+// symmetric Gram matrix of S with its image AS: 0.5 (S^T AS + AS^T S)
+static std::vector<double> gram(const std::vector<const Vec*>& S, const std::vector<const Vec*>& AS, int64_t n) {
+    const int k = int(S.size());
+    auto G = blockDot(S, AS, n);
+    for (int i = 0; i < k; i++)
+        for (int j = 0; j < i; j++) G[i * k + j] = G[j * k + i] = 0.5 * (G[i * k + j] + G[j * k + i]);
+    return G;
+}
+
 // B-orthonormalize a block in place (with its A and B images) by Cholesky of its Gram matrix
 static bool bOrthonormalize(Block& V, Block* AV, Block& BV) {
     const int k = int(V.size());
     if (!k) return false;
     const int64_t n = int64_t(V[0].size());
-    std::vector<double> G(size_t(k * k));
-    for (int i = 0; i < k; i++)
-        for (int j = 0; j <= i; j++) G[i * k + j] = G[j * k + i] = dot(V[i].data(), BV[j].data(), n);
+    std::vector<double> G = gram(ptrs(V), ptrs(BV), n);
     double scale = 0;
     for (int i = 0; i < k; i++) scale = std::max(scale, G[i * k + i]);
     if (!(scale > 0) || !cholesky(G, k)) return false;
     for (int i = 0; i < k; i++)
         if (!(G[i * k + i] > 1e-7 * std::sqrt(scale))) return false;
+    // V <- V L^-T: row by row every entry is independent, so it runs in parallel over t
     for (Block* M : {&V, AV, &BV}) {
         if (!M) continue;
-        for (int j = 0; j < k; j++) {
-            double* v = (*M)[j].data();
-            for (int q = 0; q < j; q++) {
-                const double c = G[j * k + q];
-                const double* w = (*M)[q].data();
-                for (int64_t t = 0; t < n; t++) v[t] -= c * w[t];
-            }
-            const double d = G[j * k + j];
-            for (int64_t t = 0; t < n; t++) v[t] /= d;
-        }
+        std::vector<double*> v(k);
+        for (int j = 0; j < k; j++) v[j] = (*M)[j].data();
+        parallelFor(n, [&](int64_t lo, int64_t hi) {
+            for (int64_t t = lo; t < hi; t++)
+                for (int j = 0; j < k; j++) {
+                    double x = v[j][t];
+                    for (int q = 0; q < j; q++) x -= G[j * k + q] * v[q][t];
+                    v[j][t] = x / G[j * k + j];
+                }
+        }, 2048);
     }
     return true;
 }
@@ -320,12 +368,7 @@ LobpcgResult lobpcg(int64_t n, const std::function<void(const double*, double*)>
     Block AX = image(X, applyA);
     std::vector<double> theta;
     {
-        std::vector<double> gA(size_t(m * m)), gB(size_t(m * m)), vals, vecs;
-        for (int i = 0; i < m; i++)
-            for (int j = 0; j <= i; j++) {
-                gA[i * m + j] = gA[j * m + i] = dot(X[i].data(), AX[j].data(), n);
-                gB[i * m + j] = gB[j * m + i] = dot(X[i].data(), BX[j].data(), n);
-            }
+        std::vector<double> gA = gram(ptrs(X), ptrs(AX), n), gB = gram(ptrs(X), ptrs(BX), n), vals, vecs;
         if (!generalizedEigen(gA, gB, m, vals, vecs)) throw std::runtime_error("Eigenvalue solver failed to start.");
         X = combine(X, vecs, m, 0, m, n);
         AX = combine(AX, vecs, m, 0, m, n);
@@ -334,6 +377,8 @@ LobpcgResult lobpcg(int64_t n, const std::function<void(const double*, double*)>
     }
     Block P, AP, BP;
     std::vector<double> res(m, 1.0);
+    std::vector<uint8_t> settled(m, 0);
+    std::vector<std::vector<double>> history(10, std::vector<double>(m, 0.0));  // Ritz values of the last 10 iterations
     LobpcgResult out;
     int it = 0;
     for (; it < o.maxIter; it++) {
@@ -344,31 +389,38 @@ LobpcgResult lobpcg(int64_t n, const std::function<void(const double*, double*)>
             const double th = theta[j];
             const double* ax = AX[j].data();
             const double* bx = BX[j].data();
-            double rr = 0, na = 0, nb = 0;
-            for (int64_t t = 0; t < n; t++) {
-                const double v = ax[t] - th * bx[t];
-                r[t] = v;
-                rr += v * v;
-                na += ax[t] * ax[t];
-                nb += bx[t] * bx[t];
-            }
+            parallelFor(n, [&](int64_t lo, int64_t hi) { for (int64_t t = lo; t < hi; t++) r[t] = ax[t] - th * bx[t]; });
+            const double rr = dot(r.data(), r.data(), n), na = dot(ax, ax, n), nb = dot(bx, bx, n);
             const double den = std::sqrt(na) + std::abs(th) * std::sqrt(nb);
             res[j] = std::sqrt(rr) / (den > 0 ? den : 1);
-            if (res[j] > o.tol) { active.push_back(j); R.push_back(std::move(r)); }
+            settled[j] = it >= 10 && th > o.settleAbove && std::abs(th - history[it % 10][j]) <= 0.01 * std::abs(o.settleAbove);
+            if (res[j] > o.tol && !settled[j]) { active.push_back(j); R.push_back(std::move(r)); }
         }
+        history[it % 10] = theta;
         int conv = 0;
         double worst = 0;
-        for (int j = 0; j < nev; j++) { conv += res[j] <= o.tol; worst = std::max(worst, res[j]); }
+        for (int j = 0; j < nev; j++) {
+            conv += res[j] <= o.tol || settled[j];
+            if (!settled[j]) worst = std::max(worst, res[j]);
+        }
         if (o.onProgress && o.onProgress(it, worst, conv)) throw std::runtime_error("Cancelled");
         if (conv == nev) break;
         Block W = precond(R);
-        // B-orthogonal to X
-        for (auto& w : W)
-            for (int i = 0; i < m; i++) {
-                const double c = dot(BX[i].data(), w.data(), n);
-                const double* x = X[i].data();
-                for (int64_t t = 0; t < n; t++) w[t] -= c * x[t];
-            }
+        // B-orthogonal to X: W -= X (BX^T W), as one block product and one pass
+        {
+            const auto C = blockDot(ptrs(BX), ptrs(W), n);  // m x |W|
+            const int nw = int(W.size());
+            parallelFor(n, [&](int64_t lo, int64_t hi) {
+                for (int j = 0; j < nw; j++) {
+                    double* w = W[j].data();
+                    for (int i = 0; i < m; i++) {
+                        const double c = C[size_t(i) * nw + j];
+                        const double* x = X[i].data();
+                        for (int64_t t = lo; t < hi; t++) w[t] -= c * x[t];
+                    }
+                }
+            }, 8192);
+        }
         Block BW = image(W, applyB);
         if (!bOrthonormalize(W, nullptr, BW)) {
             // dependent search directions: drop the momentum and try once more with a jitter
@@ -389,14 +441,13 @@ LobpcgResult lobpcg(int64_t n, const std::function<void(const double*, double*)>
         const int nW = int(W.size()), nP = usedP ? int(P.size()) : 0;
         int k = m + nW + nP;
         auto vecAt = [&](const Block& a, const Block& b, const Block& c, int i) -> const Vec& { return i < m ? a[i] : i < m + nW ? b[i - m] : c[i - m - nW]; };
-        std::vector<double> gA(size_t(k * k)), gB(size_t(k * k));
-        for (int i = 0; i < k; i++)
-            for (int j = 0; j <= i; j++) {
-                const Vec& Si = vecAt(X, W, P, i);
-                const Vec& Sj = vecAt(X, W, P, j);
-                gA[i * k + j] = gA[j * k + i] = 0.5 * (dot(Si.data(), vecAt(AX, AW, AP, j).data(), n) + dot(Sj.data(), vecAt(AX, AW, AP, i).data(), n));
-                gB[i * k + j] = gB[j * k + i] = 0.5 * (dot(Si.data(), vecAt(BX, BW, BP, j).data(), n) + dot(Sj.data(), vecAt(BX, BW, BP, i).data(), n));
-            }
+        std::vector<const Vec*> S, AS, BS;
+        for (int i = 0; i < k; i++) {
+            S.push_back(&vecAt(X, W, P, i));
+            AS.push_back(&vecAt(AX, AW, AP, i));
+            BS.push_back(&vecAt(BX, BW, BP, i));
+        }
+        std::vector<double> gA = gram(S, AS, n), gB = gram(S, BS, n);
         std::vector<double> vals, C;
         bool ok = generalizedEigen(gA, gB, k, vals, C);
         if (!ok && usedP) {
@@ -431,7 +482,8 @@ LobpcgResult lobpcg(int64_t n, const std::function<void(const double*, double*)>
     out.vectors.assign(X.begin(), X.begin() + nev);
     out.residuals.assign(res.begin(), res.begin() + nev);
     out.iterations = it;
-    out.converged = std::all_of(out.residuals.begin(), out.residuals.end(), [&](double r) { return r <= o.tol * 10; });
+    out.converged = true;
+    for (int j = 0; j < nev; j++) out.converged = out.converged && (res[j] <= o.tol * 10 || settled[j]);
     return out;
 }
 
@@ -526,7 +578,24 @@ FrequencyResult naturalFrequencies(VoxelFEA& fea, int nev, double E, double dens
 }
 
 BucklingResult bucklingFactors(VoxelFEA& fea, const std::vector<double>& sigma, int nev, const FullPreconditioner& pre,
-                               const std::function<bool(int, double, int)>& onProgress, double tol) {
+                               const std::function<bool(int, double, int)>& onProgress, double tol, double maxFactor) {
+    BucklingResult r;
+    r.maxFactor = maxFactor;
+    // K_G is positive semi-definite when no voxel is in compression: nothing can buckle
+    double smax = 0, compression = 0;
+    for (size_t e = 0; 6 * e + 5 < sigma.size(); e++) {
+        const double* s6 = &sigma[6 * e];
+        double pr[3];
+        principalStresses(s6[0], s6[1], s6[2], s6[3], s6[4], s6[5], pr);
+        smax = std::max({smax, std::abs(pr[0]), std::abs(pr[2])});
+        compression = std::max(compression, -pr[2]);
+    }
+    if (!(compression > 1e-12 * smax)) {
+        r.factors.assign(nev, INFINITY);
+        r.modes.assign(nev, Vec(fea.nDof(), 0.0));
+        r.converged = true;
+        return r;
+    }
     GeometricStiffness KG(fea, sigma);
     Compact c(fea, pre);
     Vec full(fea.nDof()), out(fea.nDof());
@@ -534,6 +603,8 @@ BucklingResult bucklingFactors(VoxelFEA& fea, const std::vector<double>& sigma, 
     o.nev = nev;
     o.tol = tol;
     o.onProgress = onProgress;
+    const double floor = std::isfinite(maxFactor) && maxFactor > 0 ? 1 / maxFactor : 0;
+    o.settleAbove = floor > 0 ? -floor : INFINITY;
     // smallest (most negative) theta of K_G x = theta K x  <=>  buckling factor -1/theta
     auto res = lobpcg(c.map.n,
                       [&](const double* x, double* y) {
@@ -542,8 +613,7 @@ BucklingResult bucklingFactors(VoxelFEA& fea, const std::vector<double>& sigma, 
                           c.map.gather(out.data(), y);
                       },
                       [&](const double* x, double* y) { c.applyK(x, y); }, [&](const Block& R) { return c.precond(R); }, o);
-    BucklingResult r;
-    for (double t : res.values) r.factors.push_back(t < 0 ? -1 / t : INFINITY);
+    for (double t : res.values) r.factors.push_back(t < -floor ? -1 / t : INFINITY);
     for (auto& v : res.vectors) r.modes.push_back(c.expand(v));
     r.converged = res.converged;
     r.iterations = res.iterations;
