@@ -9,6 +9,8 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const UP = new THREE.Vector3(0, 1, 0);
+// leaves the CPU to the solver where WebGL runs in software
+const MAX_BUSY_FPS = 15;
 
 export class Viewer {
   constructor(container) {
@@ -70,6 +72,15 @@ export class Viewer {
     this.draggables = [];
     this.handlers = { move: null, click: null, leave: null };
     this.lastFrame = performance.now();
+    // Frames are drawn only when something visible changed (see changed()): an idle view costs
+    // nothing, which matters most where WebGL runs in software.
+    this.drawn = [];
+    this.next = [];
+    this.dirty = true;
+    this.busy = false; // while a solver runs, animations draw at most MAX_BUSY_FPS
+    this.lastDraw = 0;
+    for (const type of ['pointerdown', 'pointerup', 'wheel', 'keydown', 'input', 'change']) window.addEventListener(type, () => this.invalidate(), true);
+    renderer.domElement.addEventListener('webglcontextrestored', () => this.invalidate());
 
     this.initTriad();
     this.initPointer();
@@ -410,9 +421,10 @@ export class Viewer {
   resize() {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     if (!w || !h) return;
-    this.renderer.setSize(w, h);
+    this.renderer.setSize(w, h); // clears the canvas
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.invalidate();
   }
 
   /** Screen position (px, relative to the container) of a world point. */
@@ -557,6 +569,9 @@ export class Viewer {
     }
     const r = this.renderer;
     const w = this.container.clientWidth, h = this.container.clientHeight;
+    if (this.busy && !this.dirty && now - this.lastDraw < 1000 / MAX_BUSY_FPS) return;
+    if (!this.changed(w, h)) return;
+    this.lastDraw = now;
     r.setViewport(0, 0, w, h);
     r.setScissorTest(false);
     r.clear();
@@ -572,6 +587,51 @@ export class Viewer {
     this.triadCam.lookAt(0, 0, 0);
     r.render(this.triadScene, this.triadCam);
     r.setScissorTest(false);
+    // taken after drawing: the renderer itself bumps some material versions (two-pass transparency)
+    this.signature(w, h, this.drawn);
+    this.dirty = false;
+  }
+
+  /** Draw the next frame even if nothing in the scene seems to have changed. */
+  invalidate() {
+    this.dirty = true;
+  }
+
+  /** Whether the next frame would differ from the last one drawn (see signature()). */
+  changed(w, h) {
+    const sig = this.signature(w, h, this.next), last = this.drawn;
+    let same = !this.dirty && sig.length === last.length;
+    for (let i = 0; same && i < sig.length; i++) same = sig[i] === last[i] || (sig[i] !== sig[i] && last[i] !== last[i]); // NaN equals NaN here
+    return !same;
+  }
+
+  /**
+   * Numbers that change whenever the picture would: the canvas size, the camera, and every
+   * object's transform, visibility, geometry and material versions.
+   */
+  signature(w, h, sig) {
+    sig.length = 0;
+    const put = (a) => { for (let i = 0; i < a.length; i++) sig.push(a[i]); };
+    this.scene.updateMatrixWorld();
+    sig.push(w, h, this.renderer.getPixelRatio());
+    put(this.camera.projectionMatrix.elements);
+    this.scene.traverse((o) => {
+      sig.push(o.id, o.visible ? 1 : 0, o.renderOrder);
+      put(o.matrixWorld.elements);
+      const g = o.geometry;
+      if (g) {
+        sig.push(g.id, g.drawRange.start, g.drawRange.count, g.index ? g.index.version : -1);
+        for (const name in g.attributes) sig.push(g.attributes[name].version);
+      }
+      if (o.isInstancedMesh) sig.push(o.count, o.instanceMatrix.version, o.instanceColor ? o.instanceColor.version : -1);
+      const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
+      for (const m of mats) {
+        sig.push(m.id, m.version, m.opacity, m.visible ? 1 : 0, m.transparent ? 1 : 0);
+        if (m.color) sig.push(m.color.r, m.color.g, m.color.b);
+        if (m.map) sig.push(m.map.id, m.map.version);
+      }
+    });
+    return sig;
   }
 
   /** PNG data URL of the viewport over the page background color. */

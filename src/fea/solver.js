@@ -22,8 +22,22 @@ const COARSEST_MAX_DOF = 1100;
 // corner index of the element node at unit offset (x, y, z)
 const corner = (x, y, z) => (y ? (x ? 2 : 3) : (x ? 1 : 0)) + 4 * z;
 
+/** The smoother estimate's Lanczos start vector on a level: pseudo-random, unit length, 0 where held. */
+export function lanczosStart(L) {
+  const n = L.nDof, v = new Float64Array(n);
+  let seed = 12345, nv = 0;
+  for (let i = 0; i < n; i++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    v[i] = L.fixed[i] ? 0 : seed / 0x7fffffff - 0.5;
+    nv += v[i] * v[i];
+  }
+  nv = Math.sqrt(nv) || 1;
+  for (let i = 0; i < n; i++) v[i] /= nv;
+  return v;
+}
+
 /** Largest eigenvalue of a symmetric tridiagonal matrix (diagonal a, off-diagonal b), by bisection. */
-function tridiagonalMax(a, b) {
+export function tridiagonalMax(a, b) {
   const k = a.length;
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < k; i++) {
@@ -170,6 +184,7 @@ export class VoxelFEA {
     for (const rho of density) {
       if (!Number.isFinite(rho) || rho < 0 || rho > 1) throw new Error('Voxel density must be between zero and one.');
     }
+    this.options = { dims, density, nu, bc, coarsestMaxDof, diagAdd }; // lets a worker pool rebuild the same model
     this.nu = nu;
     const element = hexElement(nu);
     this.K0 = element.K;
@@ -216,7 +231,8 @@ export class VoxelFEA {
       if (L.nx <= 1 && L.ny <= 1 && L.nz <= 1) break;
       this.levels.push(this.coarsen(L));
     }
-    for (let l = 0; l < this.levels.length - 1; l++) this.estimateOmega(this.levels[l]);
+    // the smoothers' eigenvalue estimates come later: prepareSmoothers() before a CPU V-cycle, or the
+    // GPU solver, which makes them on the GPU (they are most of the setup time for large models)
     this.buildCoarseSolver(this.levels[this.levels.length - 1]);
   }
 
@@ -421,19 +437,17 @@ export class VoxelFEA {
     }
   }
 
+  /** Estimates the smoothers' eigenvalue ranges where they are not known yet. */
+  prepareSmoothers() {
+    for (let l = 0; l < this.levels.length - 1; l++) if (!(this.levels[l].lmax > 0)) this.estimateOmega(this.levels[l]);
+  }
+
   /** Largest eigenvalue of D^-1 K on a level: 10 Lanczos steps on D^-1/2 K D^-1/2. */
   estimateOmega(L) {
     const n = L.nDof, sq = new Float64Array(n);
     for (let i = 0; i < n; i++) sq[i] = Math.sqrt(L.invDiag[i]);
-    let v = new Float64Array(n), vPrev = new Float64Array(n);
+    let v = lanczosStart(L), vPrev = new Float64Array(n);
     const w = new Float64Array(n), x = new Float64Array(n);
-    let seed = 12345;
-    for (let i = 0; i < n; i++) {
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      v[i] = L.fixed[i] ? 0 : seed / 0x7fffffff - 0.5;
-    }
-    const nv = Math.sqrt(dot(v, v)) || 1;
-    for (let i = 0; i < n; i++) v[i] /= nv;
     const alpha = [], beta = [];
     let b = 0;
     for (let j = 0; j < 10; j++) {
@@ -619,6 +633,17 @@ export class VoxelFEA {
     }
   }
 
+  /** z = one multigrid V-cycle applied to the full-length vector r (its held DOFs are ignored). */
+  precondition(r, z = new Float64Array(r.length)) {
+    const L = this.levels[0];
+    this.prepareSmoothers();
+    L.r.set(r);
+    for (let i = 0; i < r.length; i++) if (L.fixed[i]) L.r[i] = 0;
+    this.vcycle(0);
+    z.set(L.z);
+    return z;
+  }
+
   vcycle(l) {
     const L = this.levels[l];
     if (l === this.levels.length - 1) { this.coarseSolve(L); return; }
@@ -656,6 +681,7 @@ export class VoxelFEA {
     if (bnorm === 0) return { u: x.fill(0), iterations: 0, residual: 0, converged: true };
     this.apply(L, x, q);
     for (let i = 0; i < n; i++) r[i] = fixed[i] ? 0 : f[i] - q[i];
+    this.prepareSmoothers();
     const precond = () => {
       L.r.set(r);
       this.vcycle(0);

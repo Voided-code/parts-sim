@@ -2,6 +2,7 @@
 //
 //   npm run build && npm run test:desktop
 //   PARTS_SIM_APP="release/mac-arm64/Parts Sim.app/Contents/MacOS/Parts Sim" npm run test:desktop   # packaged app
+//   ELECTRON_ARGS=--disable-gpu npm run test:desktop   # software rendering, like CI machines without a GPU
 //
 // Opens a synthetic SolidWorks assembly from the command line (so its part is read from the
 // same folder through the shell), then drives menu commands, a STEP import (WebAssembly under
@@ -26,14 +27,18 @@ const packaged = process.env.PARTS_SIM_APP;
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE; // leaked by editor terminals; would start Electron as plain Node
 env.PARTS_SIM_USER_DATA = path.join(dir, 'profile'); // run beside (not inside) a copy the user has open
+const extra = process.env.ELECTRON_ARGS?.split(' ').filter(Boolean) ?? [];
 const app = await electron.launch({
   env,
-  ...(packaged ? { executablePath: path.resolve(root, packaged), args: [path.join(dir, 'robot.SLDASM')] } : { args: [root, path.join(dir, 'robot.SLDASM')] }),
+  ...(packaged ? { executablePath: path.resolve(root, packaged), args: [...extra, path.join(dir, 'robot.SLDASM')] } : { args: [...extra, root, path.join(dir, 'robot.SLDASM')] }),
   cwd: root,
 });
 const errors = [];
+const output = []; // Electron's own log, printed when a step fails
+for (const stream of [app.process().stdout, app.process().stderr]) stream?.on('data', (d) => output.push(...String(d).split('\n').filter(Boolean)));
+let page = null;
 try {
-  const page = await app.firstWindow();
+  page = await app.firstWindow();
   page.on('pageerror', (e) => errors.push(e.stack || e.message));
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
   const idle = () => page.waitForFunction(() => document.querySelector('#busy').hidden, null, { timeout: 120000 });
@@ -150,6 +155,25 @@ try {
 
   assert.deepEqual(errors, []);
   console.log('PASS: no page errors');
+} catch (err) {
+  await report();
+  throw err;
 } finally {
-  await app.close();
+  const proc = app.process();
+  const closed = await Promise.race([app.close().then(() => true, () => false), new Promise((r) => setTimeout(r, 10000, false))]);
+  if (!closed) proc.kill();
+}
+
+/** Prints what the app was doing when a step failed, and saves a screenshot next to the others. */
+async function report() {
+  const within = (p) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('no answer within 10 s')), 10000))]);
+  console.log(`--- page errors: ${errors.length ? `\n${errors.join('\n')}` : 'none'}`);
+  console.log(`--- Electron output (last 40 lines):\n${output.slice(-40).join('\n')}`);
+  if (!page) return;
+  const state = await within(page.evaluate(() => {
+    const a = window.partsSim, text = (s) => document.querySelector(s)?.textContent.trim();
+    return { app: !!a, part: a?.part?.name, info: a?.partInfo, tab: a?.tab, status: text('#status'), busy: document.querySelector('#busy')?.hidden === false ? text('#busy-text') : null };
+  })).catch((e) => e.message);
+  console.log(`--- app state: ${JSON.stringify(state)}`);
+  await within(page.screenshot({ path: path.join(root, 'test-artifacts/desktop-failure.png') })).catch(() => {});
 }

@@ -40,6 +40,10 @@ if (process.platform === 'linux') {
   app.commandLine.appendSwitch('enable-unsafe-webgpu');
   app.commandLine.appendSwitch('enable-features', 'Vulkan');
 }
+// Without a usable GPU (virtual machines, remote desktops, blocklisted drivers) Chromium no longer
+// falls back to software WebGL on its own, and the 3D view could not start. The fallback is only
+// "unsafe" for untrusted web content; this window runs nothing but the bundled app.
+app.commandLine.appendSwitch('enable-unsafe-swiftshader');
 
 let win = null;
 let rendererReady = false;

@@ -8,6 +8,7 @@ import { naturalFrequencies, bucklingFactors, elementStresses, cpuPreconditioner
 import { NonlinearModel, loadRamp, hardeningFor, equilibrate } from './nonlinear.js';
 import { dropTestCPU, maxEigenvalue } from './explicit.js';
 import { GPUExplicit } from './gpu-explicit.js';
+import { BlockPool } from './pool.js';
 import { optimizeTopology } from './topology.js';
 import { solveHeat, heatFlux } from './thermal.js';
 import { vertexWeights, interpolate } from './mapping.js';
@@ -67,6 +68,24 @@ async function engineFor(m, fea) {
   return { name: 'CPU', note, precond: async (R) => pre(R), solve: async (f, o) => fea.solve(f, o), destroy() {} };
 }
 
+/**
+ * The eigenvalue solvers' block operations (a V-cycle or a stiffness product for each vector of a
+ * block). The CPU engine spreads them over helper threads, which start building their copies of
+ * the model right away while this thread carries on.
+ */
+function blockOps(engine, fea, block) {
+  const pool = engine.name === 'CPU' ? BlockPool.create(fea, { maxThreads: block - 1 }) : Promise.resolve(null);
+  const L = fea.levels[0];
+  return {
+    precondFull: async (R) => (await pool)?.precondition(R) ?? engine.precond(R),
+    applyFull: async (X) => (await pool)?.apply(X) ?? X.map((x) => { const y = new Float64Array(L.nDof); fea.apply(L, x, y); return y; }),
+    destroy: () => pool.then((p) => p?.destroy()),
+  };
+}
+
+/** LOBPCG's default block size for nev eigenpairs (eigen.js). */
+const blockSize = (nev) => nev + Math.min(4, Math.max(2, nev));
+
 function progress(post, stage, frac) {
   post({ type: 'progress', stage, it: 0, res: 1, frac });
 }
@@ -103,11 +122,12 @@ async function modal(m, post) {
       : null,
   });
   const engine = await engineFor(m, fea);
+  const want = nev + (free ? 6 : 0);
+  const ops = blockOps(engine, fea, blockSize(want));
   try {
     progress(post, `Finding natural frequencies on the ${engine.name}`, 0);
-    const want = nev + (free ? 6 : 0);
     const r = await naturalFrequencies(fea, {
-      nev: want, E: m.E, density: m.rho, h: m.h, shift, precondFull: (R) => engine.precond(R),
+      nev: want, E: m.E, density: m.rho, h: m.h, shift, precondFull: ops.precondFull, applyFull: ops.applyFull,
       onProgress: (it, res, conv) => { post({ type: 'progress', stage: `Natural frequencies on the ${engine.name} · ${conv}/${want} converged`, it, res }); },
     });
     const L = fea.levels[0];
@@ -167,6 +187,7 @@ async function modal(m, post) {
     }
     post(out, transfer);
   } finally {
+    ops.destroy();
     engine.destroy();
   }
 }
@@ -176,12 +197,13 @@ async function modal(m, post) {
 async function buckling(m, post) {
   const { fea, removed } = buildModel(m);
   const engine = await engineFor(m, fea);
+  const nev = Math.max(1, Math.min(8, m.nev || 3));
+  const ops = blockOps(engine, fea, blockSize(nev));
   try {
     progress(post, `Pre-buckling stresses on the ${engine.name}`, 0);
     const sol = await engine.solve(m.f, { tol: 1e-8, maxIter: 3000, onProgress: (it, res) => post({ type: 'progress', stage: `Pre-buckling stresses on the ${engine.name}`, it, res }) });
     const u = sol.u.map((v) => v / (m.E * m.h));
     const sigma = elementStresses(fea, u, m.h);
-    const nev = Math.max(1, Math.min(8, m.nev || 3));
     // Search up to 100 times the load that makes it yield (at least 1000 x the loads): a buckling
     // load far beyond yielding is never reached, and near-zero eigenvalues are slow to resolve.
     const nodeVM = nodalVM(fea, u, m.E, m.h);
@@ -190,7 +212,7 @@ async function buckling(m, post) {
     const yieldFactor = vmMax > 0 && m.strength > 0 ? m.strength / vmMax : Infinity;
     const maxFactor = Number.isFinite(yieldFactor) ? Math.max(1000, 100 * yieldFactor) : Infinity;
     const r = await bucklingFactors(fea, sigma, {
-      nev, maxFactor, precondFull: (R) => engine.precond(R),
+      nev, maxFactor, precondFull: ops.precondFull, applyFull: ops.applyFull,
       onProgress: (it, res, conv) => { post({ type: 'progress', stage: `Buckling modes on the ${engine.name} · ${conv}/${nev} converged`, it, res }); },
     });
     const L = fea.levels[0];
@@ -202,6 +224,7 @@ async function buckling(m, post) {
       converged: r.converged, iterations: r.iterations, modes, vm, activeNode: L.activeNode,
     }, [vm.buffer, ...modes.map((md) => md.shape.buffer)]);
   } finally {
+    ops.destroy();
     engine.destroy();
   }
 }

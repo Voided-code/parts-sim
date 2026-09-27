@@ -12,6 +12,9 @@
 // 64-bit accuracy comes from reliable updates: whenever the GPU's residual has dropped tenfold, its
 // solution is added to a float64 one on the CPU and the true residual f - K u, computed there,
 // replaces the GPU's.
+import { hardwareAdapter } from '../core/webgpu.js';
+import { tridiagonalMax, lanczosStart } from './solver.js';
+
 const WG = 64;
 const RED_GROUPS = 1024;
 export const GPU_COARSEST_DOF = 300;
@@ -25,8 +28,10 @@ const SHADER = /* wgsl */ `
 //
 // Matrix products gather, for each node, the rows of its 8 surrounding voxels from a 3x3x3 block of
 // neighbour values loaded once. Each voxel is one word: 0 = empty, > 0 = the f32 bits of s for an
-// s * Kb element (Kb, the level's uniform element, is matrix 0 of Ke), < 0 = sign bit | index - 1
-// of its own 24x24 matrix in Ke (coarse levels). A node whose 8 voxels are the same s * Kb uses the
+// s * Kb element (Kb, the level's uniform element, is the start of Ke), < 0 = sign bit | index of
+// its own 24x24 matrix after it in Ke (coarse levels; pairs of 16-bit halves times the level's
+// scale L.hs, which halves the memory traffic of these bandwidth-bound products). A node whose 8
+// voxels are the same s * Kb uses the
 // assembled 27-point stencil (243 multiply-adds, not 576). The product and the smoothing steps built
 // on it share one kernel ("op"), so drivers compile the large unrolled code once.
 
@@ -34,7 +39,7 @@ struct Level {
   nx: u32, ny: u32, nz: u32, NX: u32,
   NY: u32, NZ: u32, nNodes: u32, nDof: u32,
   p0: u32, strideN: u32, strideD: u32, m: u32,
-  first: f32, c1: f32, c2: f32, p3: f32,     // Chebyshev smoother coefficients
+  first: f32, c1: f32, c2: f32, hs: f32,     // Chebyshev smoother coefficients; scale of the halves in Ke
   CNX: u32, CNY: u32, CNZ: u32, cNodes: u32,
   cStrideN: u32, hasDiag: u32, p5: u32, p6: u32,
 };
@@ -45,7 +50,7 @@ struct Red { slot: u32, count: u32, q0: u32, q1: u32 };
 @group(0) @binding(2) var<storage, read_write> vout: array<f32>;
 @group(0) @binding(3) var<storage, read> invD: array<f32>;
 @group(0) @binding(4) var<storage, read> ew: array<i32>;          // voxel words (coarsest: free DOF list)
-@group(0) @binding(5) var<storage, read> Ke: array<vec4<f32>>;    // element matrices (0 = Kb), 144 vec4 each
+@group(0) @binding(5) var<storage, read> Ke: array<vec4<u32>>;    // Kb (f32 bits, 144 vec4), then own matrices (halves, 72 vec4 each)
 @group(0) @binding(7) var<storage, read> rhs: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vout2: array<f32>;
 @group(0) @binding(9) var<storage, read> vin2: array<f32>;
@@ -71,15 +76,28 @@ fn word(i: i32, j: i32, k: i32) -> i32 {
   return ew[u32(i) + L.nx * (u32(j) + L.ny * u32(k))];
 }
 
+// eight halves of a matrix row times eight values
+fn h8(q: vec4<u32>, lo: vec4<f32>, hi: vec4<f32>) -> f32 {
+  return dot(vec4<f32>(unpack2x16float(q.x), unpack2x16float(q.y)), lo) + dot(vec4<f32>(unpack2x16float(q.z), unpack2x16float(q.w)), hi);
+}
+
+// row b of Kb (six vec4 from index b) times 24 values
+fn kb(b: u32, v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, v5: vec4<f32>) -> f32 {
+  return dot(bitcast<vec4<f32>>(Ke[b]), v0) + dot(bitcast<vec4<f32>>(Ke[b + 1u]), v1) + dot(bitcast<vec4<f32>>(Ke[b + 2u]), v2) +
+    dot(bitcast<vec4<f32>>(Ke[b + 3u]), v3) + dot(bitcast<vec4<f32>>(Ke[b + 4u]), v4) + dot(bitcast<vec4<f32>>(Ke[b + 5u]), v5);
+}
+
 // the three rows of corner a (from vec4 index r = 18a) of a voxel's matrix times its corner values
 fn rows(w: i32, r: u32, v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, v5: vec4<f32>) -> vec3<f32> {
-  let own = w < 0;
-  let b = select(0u, u32(w & 0x7fffffff) + 1u, own) * 144u + r;
-  let s = select(bitcast<f32>(w), 1.0, own);
-  return s * vec3<f32>(
-    dot(Ke[b], v0) + dot(Ke[b + 1u], v1) + dot(Ke[b + 2u], v2) + dot(Ke[b + 3u], v3) + dot(Ke[b + 4u], v4) + dot(Ke[b + 5u], v5),
-    dot(Ke[b + 6u], v0) + dot(Ke[b + 7u], v1) + dot(Ke[b + 8u], v2) + dot(Ke[b + 9u], v3) + dot(Ke[b + 10u], v4) + dot(Ke[b + 11u], v5),
-    dot(Ke[b + 12u], v0) + dot(Ke[b + 13u], v1) + dot(Ke[b + 14u], v2) + dot(Ke[b + 15u], v3) + dot(Ke[b + 16u], v4) + dot(Ke[b + 17u], v5));
+  if (w < 0) {
+    let h = 144u + u32(w & 0x7fffffff) * 72u + r / 2u;
+    return L.hs * vec3<f32>(
+      h8(Ke[h], v0, v1) + h8(Ke[h + 1u], v2, v3) + h8(Ke[h + 2u], v4, v5),
+      h8(Ke[h + 3u], v0, v1) + h8(Ke[h + 4u], v2, v3) + h8(Ke[h + 5u], v4, v5),
+      h8(Ke[h + 6u], v0, v1) + h8(Ke[h + 7u], v2, v3) + h8(Ke[h + 8u], v4, v5));
+  }
+  return bitcast<f32>(w) * vec3<f32>(
+    kb(r, v0, v1, v2, v3, v4, v5), kb(r + 6u, v0, v1, v2, v3, v4, v5), kb(r + 12u, v0, v1, v2, v3, v4, v5));
 }
 
 fn elem(w: i32, a: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, p4: vec3<f32>, p5: vec3<f32>, p6: vec3<f32>, p7: vec3<f32>) -> vec3<f32> {
@@ -415,8 +433,7 @@ let devicePromise = null;
 export function gpuDevice() {
   devicePromise ??= (async () => {
     try {
-      if (typeof navigator === 'undefined' || !navigator.gpu) return null;
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      const adapter = await hardwareAdapter({ powerPreference: 'high-performance' });
       if (!adapter) return null;
       const device = await adapter.requestDevice({
         requiredLimits: {
@@ -471,11 +488,32 @@ function pipelines(device) {
     const module = device.createShaderModule({ code: SHADER });
     const pipe = (entryPoint) => device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } });
     pipelineCache.set(device, Object.fromEntries(
-      ['op', 'cheb_first', 'restrict_', 'prolong', 'coarse_gather', 'coarsest', 'update_xr', 'update_p', 'dot_partial', 'reduce', 'cg_alpha', 'cg_beta']
+      ['op', 'cheb_first', 'restrict_', 'prolong', 'coarse_gather', 'coarsest', 'update_xr', 'update_p', 'dot_partial', 'reduce', 'cg_alpha', 'cg_beta',
+        'lz_x', 'lz_w', 'lz_axpy', 'lz_next', 'lz_store']
         .map((e) => [e, pipe(e)]),
     ));
   }
   return pipelineCache.get(device);
+}
+
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+/** IEEE half-precision bits of v (rounded to float32, then to the nearest half, ties to even). */
+export function toHalf(v) {
+  f32[0] = v;
+  const x = u32[0], sign = (x >>> 16) & 0x8000, mant = x & 0x7fffff, exp = ((x >>> 23) & 0xff) - 112;
+  if (exp >= 31) return sign | 0x7c00;
+  if (exp <= 0) { // subnormal half
+    if (exp < -10) return sign;
+    const m = mant | 0x800000, shift = 14 - exp;
+    let h = m >>> shift;
+    const rem = m & ((1 << shift) - 1), half = 1 << (shift - 1);
+    if (rem > half || (rem === half && (h & 1))) h++;
+    return sign | h;
+  }
+  let h = (exp << 10) | (mant >>> 13);
+  const rem = mant & 0x1fff;
+  if (rem > 0x1000 || (rem === 0x1000 && (h & 1))) h++; // a carry correctly bumps the exponent
+  return sign | h;
 }
 
 /** Degree-2 Chebyshev coefficients over [0.1, 1.15] * lmax (as solver.js). */
@@ -496,6 +534,7 @@ export class GPUFEASolver {
     let solver;
     try {
       solver = new GPUFEASolver(device, fea);
+      await solver.estimateSmoothers();
     } finally {
       const oom = await device.popErrorScope();
       const invalid = await device.popErrorScope();
@@ -531,14 +570,14 @@ export class GPUFEASolver {
 
     this.L = levels.map((lv, l) => {
       const { nx, ny, nz } = lv;
-      // one word per voxel: 0 empty, f32 bits of s for s * Kb (matrix 0), sign bit | element index
-      // otherwise (the element's own matrix is e + 1)
-      const words = new Int32Array(nx * ny * nz);
+      // one word per voxel: 0 empty, f32 bits of s for s * Kb, sign bit | the index of its own matrix
+      // (after Kb in Ke) otherwise
+      const words = new Int32Array(nx * ny * nz), own = [];
       for (let e = 0; e < lv.elems.length; e++) {
         if (lv.scale[e] > 0) {
           bitsF[0] = lv.scale[e];
           words[lv.elems[e]] = bits[0];
-        } else words[lv.elems[e]] = (0x80000000 | e) | 0;
+        } else words[lv.elems[e]] = (0x80000000 | own.push(e) - 1) | 0;
       }
       const invD = new Float32Array(lv.nDof);
       for (let i = 0; i < lv.nDof; i++) invD[i] = lv.fixed[i] ? 0 : lv.invDiag[i];
@@ -550,9 +589,15 @@ export class GPUFEASolver {
       const params = new ArrayBuffer(96);
       const u = new Uint32Array(params), f = new Float32Array(params);
       u.set([nx, ny, nz, lv.NX, lv.NY, lv.NZ, lv.nNodes, lv.nDof, 0, strideN, strideD, last ? coarse.m : 0]);
-      if (!last) f.set(chebyshev(lv.lmax), 12);
+      if (!last && lv.lmax > 0) f.set(chebyshev(lv.lmax), 12); // otherwise set by estimateSmoothers()
       if (next) u.set([next.NX, next.NY, next.NZ, next.nNodes, cStrideN], 16);
       u[21] = lv.diagAdd ? 1 : 0;
+      // the level's own element matrices in 16-bit halves (their products are bandwidth-bound), with
+      // a power-of-two scale that keeps the largest entries near 2^14, well inside the half range
+      let kmax = 0;
+      for (const e of own) for (let i = 576 * e; i < 576 * (e + 1); i++) kmax = Math.max(kmax, Math.abs(lv.K[i]));
+      const hs = kmax > 0 ? 2 ** Math.ceil(Math.log2(kmax / 16384)) : 1;
+      f[15] = hs;
       // the level's uniform element (rows as 6 vec4) and its 27-point stencil: neighbour
       // m = ox + 3 oy + 9 oz, row d -> [3m + d].xyz (from solver.js's layout [(row 3 + d) 9 + 3 ox + c])
       const st = new Float32Array(81 * 4);
@@ -567,10 +612,11 @@ export class GPUFEASolver {
         params: upload(new Uint8Array(params), U),
         invD: upload(invD),
         words: upload(words),
+        // Kb in 32 bits, then the own matrices as halves / hs
         Ke: upload((() => {
-          const ke = new Float32Array(576 + (lv.K ? lv.K.length : 0));
-          ke.set(lv.Kb);
-          if (lv.K) ke.set(lv.K, 576);
+          const ke = new Uint16Array(576 * (2 + own.length));
+          new Float32Array(ke.buffer, 0, 576).set(lv.Kb.subarray(0, 576));
+          own.forEach((e, q) => { for (let i = 0; i < 576; i++) ke[576 * (2 + q) + i] = toHalf(lv.K[576 * e + i] / hs); });
           return ke;
         })()),
         stencil: upload(st, U),
@@ -625,6 +671,14 @@ export class GPUFEASolver {
         resid: [0, 1].map((p) => op(3, L.buf(p), L.buf(1 - p))),
       };
       if (N) {
+        // Lanczos steps (estimateSmoothers): v = z, vPrev = d, w = t, x = r
+        L.bg.lz = {
+          x: bg(P.lz_x, { 0: L.params, 1: L.z, 2: L.r, 3: L.invD }),
+          mv: op(0, L.r, L.t),
+          w: bg(P.lz_w, { 0: L.params, 1: L.d, 2: L.t, 3: L.invD, 10: this.S }),
+          axpy: bg(P.lz_axpy, { 0: L.params, 1: L.z, 2: L.t, 10: this.S }),
+          next: bg(P.lz_next, { 0: L.params, 1: L.t, 2: L.z, 8: L.d, 10: this.S }),
+        };
         L.bg.restrict = [0, 1].map((p) => bg(P.restrict_, { 0: L.params, 1: L.buf(p), 2: N.r, 3: N.invD }));
         L.bg.prolong = [0, 1].map((p) => bg(P.prolong, { 0: L.params, 1: N.buf(N.out), 2: L.buf(p), 3: L.invD }));
       } else {
@@ -639,19 +693,20 @@ export class GPUFEASolver {
       updP: bg(P.update_p, { 0: L0.params, 1: z0, 2: this.pv, 10: this.S }),
       alpha: bg(P.cg_alpha, { 10: this.S }),
       beta: bg(P.cg_beta, { 10: this.S }),
+      lzStore: bg(P.lz_store, { 10: this.S }),
       // one bind group per scalar slot (auto layouts cannot take dynamic offsets)
       reduce: Array.from({ length: 10 }, (_, slot) => bg(P.reduce, { 10: this.S, 11: this.partials, 12: { buffer: this.red, offset: slot * 256, size: 16 } })),
     };
     this.dotBG = new Map();
   }
 
-  dotBindGroup(a, b) {
-    const key = `${this.buffers.indexOf(a)}:${this.buffers.indexOf(b)}`;
+  dotBindGroup(a, b, params = this.L[0].params) {
+    const key = `${this.buffers.indexOf(a)}:${this.buffers.indexOf(b)}:${this.buffers.indexOf(params)}`;
     if (!this.dotBG.has(key)) {
       this.dotBG.set(key, this.device.createBindGroup({
         layout: this.p.dot_partial.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: this.L[0].params } },
+          { binding: 0, resource: { buffer: params } },
           { binding: 1, resource: { buffer: a } },
           { binding: 9, resource: { buffer: b } },
           { binding: 11, resource: { buffer: this.partials } },
@@ -668,9 +723,10 @@ export class GPUFEASolver {
     pass.dispatchWorkgroups(x, y);
   }
 
-  dot(pass, a, b, slot) {
+  /** S[slot] = a.b over the DOFs of level l (the same number of partial sums on every level). */
+  dot(pass, a, b, slot, l = 0) {
     pass.setPipeline(this.p.dot_partial);
-    pass.setBindGroup(0, this.dotBindGroup(a, b));
+    pass.setBindGroup(0, this.dotBindGroup(a, b, this.L[l].params));
     pass.dispatchWorkgroups(this.dotGroups);
     pass.setPipeline(this.p.reduce);
     pass.setBindGroup(0, this.bg.reduce[slot]);
@@ -696,6 +752,56 @@ export class GPUFEASolver {
     this.run(pass, P.prolong, L.bg.prolong[1], nN); //     t += P z_coarse
     this.run(pass, P.op, L.bg.chebA[1], nN); //            t -> z
     this.run(pass, P.op, L.bg.chebB[0], nN); //            z -> t
+  }
+
+  /**
+   * The smoothers' eigenvalue estimates for the levels that have none (as the native GPU solver):
+   * 10 Lanczos steps on each, all levels in one submission and one read-back. They also serve a
+   * CPU solve of the same hierarchy.
+   */
+  async estimateSmoothers() {
+    const todo = this.L.filter((L) => !L.last && !(L.lv.lmax > 0));
+    if (!todo.length) return;
+    const dev = this.device, P = this.p, STEPS = 10;
+    const read = dev.createBuffer({ size: 256 * todo.length, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = dev.createCommandEncoder();
+    todo.forEach((L, i) => {
+      const lv = L.lv, m = lv.nDof, l = this.L.indexOf(L);
+      // the CPU estimate's start vector (VoxelFEA.estimateOmega), so both give the same estimates
+      dev.queue.writeBuffer(L.z, 0, Float32Array.from(lanczosStart(lv)));
+      enc.clearBuffer(L.d);
+      enc.clearBuffer(this.S);
+      const pass = enc.beginComputePass();
+      for (let j = 0; j < STEPS; j++) {
+        this.run(pass, P.lz_x, L.bg.lz.x, m);
+        this.run(pass, P.op, L.bg.lz.mv, lv.nNodes);
+        this.run(pass, P.lz_w, L.bg.lz.w, m);
+        this.dot(pass, L.t, L.z, 8, l);
+        this.run(pass, P.lz_axpy, L.bg.lz.axpy, m);
+        this.dot(pass, L.t, L.t, 9, l);
+        this.run(pass, P.lz_next, L.bg.lz.next, m);
+        this.run(pass, P.lz_store, this.bg.lzStore, 1);
+      }
+      pass.end();
+      enc.copyBufferToBuffer(this.S, 0, read, 256 * i, 256);
+    });
+    dev.queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const sc = new Float32Array(read.getMappedRange().slice(0));
+    read.unmap();
+    read.destroy();
+    todo.forEach((L, i) => {
+      const o = 64 * i, alpha = [], beta = [];
+      for (let j = 0; j < STEPS; j++) {
+        alpha.push(sc[o + 16 + j]);
+        if (!(sc[o + 32 + j] > 1e-24 * sc[o + 16 + j] * sc[o + 16 + j]) || j + 1 === STEPS) break;
+        beta.push(Math.sqrt(sc[o + 32 + j]));
+      }
+      const lv = L.lv;
+      lv.lmax = tridiagonalMax(alpha, beta);
+      lv.omega = 1.2 / (lv.lmax * 1.05);
+      dev.queue.writeBuffer(L.params, 48, new Float32Array(chebyshev(lv.lmax)));
+    });
   }
 
   async read(buffer, staging, bytes) {
@@ -876,10 +982,13 @@ export class GPUFEASolver {
           if (rel <= tol) break;
           this.upload(L0.r, r, scale);
         }
-        // wait for the GPU about every 8 ms (rarely enough to keep it busy), and not past convergence
+        // wait for the GPU about every 8 ms (rarely enough to keep it busy), and not past the next
+        // fold or convergence (both only happen between batches)
         const per = (performance.now() - t0) / k;
-        const toGo = Math.ceil(Math.log(tol / lastEst) / Math.log(rho));
-        batch = Math.max(1, Math.min(8, Math.floor(8 / Math.max(per, 0.01)), toGo));
+        // (predicted with convergence speeding up by half again: overshooting a fold lets the float32
+        // residual drift from the true one, which costs iterations)
+        const toGo = Math.ceil(Math.log(Math.max(tol, 0.1 * peak) / lastEst) / (1.5 * Math.log(rho)));
+        batch = Math.max(1, Math.min(8, 2 * k, Math.floor(8 / Math.max(per, 0.01)), toGo)); // growing at most twofold
       }
       if (dirty) rel = await foldIn();
     }

@@ -249,27 +249,68 @@ function generalizedEigen(gA, gB, k) {
 
 // ---------- LOBPCG ----------
 
-const dotv = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+// The block operations below walk the vectors in cache-sized chunks, so a block of a few dozen
+// long vectors is read from memory once per operation rather than once per pair of vectors.
+const CHUNK = 2048;
 
-/** out[j] = sum_i V[i] * C[(rowOff + i) * k + j] for j < cols. */
-function combine(V, C, k, rowOff, cols, n) {
-  const out = [];
-  for (let j = 0; j < cols; j++) {
-    const o = new Float64Array(n);
-    for (let i = 0; i < V.length; i++) {
-      const c = C[(rowOff + i) * k + j];
-      if (c === 0) continue;
-      const v = V[i];
-      for (let t = 0; t < n; t++) o[t] += c * v[t];
+/** G[(r0 + i) * ld + c0 + j] = U[i] . V[j] for every pair (only j <= i when `lower`). */
+function gram(U, V, G, ld, r0, c0, lower = false) {
+  const n = U.length ? U[0].length : 0;
+  for (let i = 0; i < U.length; i++) for (let j = 0; j < (lower ? i + 1 : V.length); j++) G[(r0 + i) * ld + c0 + j] = 0;
+  for (let t0 = 0; t0 < n; t0 += CHUNK) {
+    const t1 = Math.min(n, t0 + CHUNK);
+    for (let i = 0; i < U.length; i++) {
+      const u = U[i];
+      for (let j = 0; j < (lower ? i + 1 : V.length); j++) {
+        const v = V[j];
+        let s0 = 0, s1 = 0, t = t0;
+        for (; t + 1 < t1; t += 2) { s0 += u[t] * v[t]; s1 += u[t + 1] * v[t + 1]; }
+        if (t < t1) s0 += u[t] * v[t];
+        G[(r0 + i) * ld + c0 + j] += s0 + s1;
+      }
     }
-    out.push(o);
+  }
+}
+
+/**
+ * New vectors out[j] = sum over the parts [V, row] of sum_i V[i] * C[(row + i) * k + j], j < cols.
+ * With `plus`, out[j] also gets plus[j] added.
+ */
+function combine(parts, C, k, cols, n, plus = null) {
+  const out = Array.from({ length: cols }, () => new Float64Array(n));
+  for (let t0 = 0; t0 < n; t0 += CHUNK) {
+    const t1 = Math.min(n, t0 + CHUNK);
+    for (let j = 0; j < cols; j++) {
+      const o = out[j];
+      if (plus) { const p = plus[j]; for (let t = t0; t < t1; t++) o[t] = p[t]; }
+      for (const [V, row] of parts) {
+        for (let i = 0; i < V.length; i++) {
+          const c = C[(row + i) * k + j];
+          if (c === 0) continue;
+          const v = V[i];
+          for (let t = t0; t < t1; t++) o[t] += c * v[t];
+        }
+      }
+    }
   }
   return out;
 }
 
-function addInto(a, b) {
-  for (let j = 0; j < a.length; j++) { const x = a[j], y = b[j]; for (let t = 0; t < x.length; t++) x[t] += y[t]; }
-  return a;
+/** W[j] -= sum_i X[i] * C[i * ld + j], in place. */
+function subtractCombination(W, X, C, ld) {
+  const n = W.length ? W[0].length : 0;
+  for (let t0 = 0; t0 < n; t0 += CHUNK) {
+    const t1 = Math.min(n, t0 + CHUNK);
+    for (let j = 0; j < W.length; j++) {
+      const w = W[j];
+      for (let i = 0; i < X.length; i++) {
+        const c = C[i * ld + j];
+        if (c === 0) continue;
+        const x = X[i];
+        for (let t = t0; t < t1; t++) w[t] -= c * x[t];
+      }
+    }
+  }
 }
 
 /**
@@ -279,24 +320,28 @@ function addInto(a, b) {
 function bOrthonormalize(V, AV, BV) {
   const k = V.length;
   const G = new Float64Array(k * k);
-  for (let i = 0; i < k; i++) for (let j = 0; j <= i; j++) G[i * k + j] = G[j * k + i] = dotv(V[i], BV[j]);
+  gram(V, BV, G, k, 0, 0, true);
+  for (let i = 0; i < k; i++) for (let j = 0; j < i; j++) G[j * k + i] = G[i * k + j];
   let scale = 0;
   for (let i = 0; i < k; i++) scale = Math.max(scale, G[i * k + i]);
   if (!(scale > 0)) return false;
   if (!cholesky(G, k)) return false;
   for (let i = 0; i < k; i++) if (!(G[i * k + i] > 1e-7 * Math.sqrt(scale))) return false;
-  // V <- V L^-T, column by column
+  // V <- V L^-T: column j only needs the finished columns before it, chunk by chunk
+  const n = V[0].length;
   for (const M of [V, AV, BV]) {
     if (!M) continue;
-    for (let j = 0; j < k; j++) {
-      const v = M[j];
-      for (let q = 0; q < j; q++) {
-        const c = G[j * k + q];
-        const w = M[q];
-        for (let t = 0; t < v.length; t++) v[t] -= c * w[t];
+    for (let t0 = 0; t0 < n; t0 += CHUNK) {
+      const t1 = Math.min(n, t0 + CHUNK);
+      for (let j = 0; j < k; j++) {
+        const v = M[j];
+        for (let q = 0; q < j; q++) {
+          const c = G[j * k + q], w = M[q];
+          for (let t = t0; t < t1; t++) v[t] -= c * w[t];
+        }
+        const inv = 1 / G[j * k + j];
+        for (let t = t0; t < t1; t++) v[t] *= inv;
       }
-      const d = G[j * k + j];
-      for (let t = 0; t < v.length; t++) v[t] /= d;
     }
   }
   return true;
@@ -308,17 +353,22 @@ function bOrthonormalize(V, AV, BV) {
  * @param {number} o.n                vector length
  * @param {(x: Float64Array, y: Float64Array) => void} o.applyA
  * @param {(x: Float64Array, y: Float64Array) => void} o.applyB
+ * @param {(V: Float64Array[]) => Promise<Float64Array[]>} [o.blockA]  A times a block, e.g. on
+ *                                    several threads (instead of applyA per vector)
+ * @param {(V: Float64Array[]) => Promise<Float64Array[]>} [o.blockB]  likewise for B
+ * @param {boolean} [o.cheapB]        B is cheap to apply (a diagonal): its images are recomputed
+ *                                    rather than carried along as combinations
  * @param {(r: Float64Array[]) => Promise<Float64Array[]>|Float64Array[]} o.precond  ~ A^-1 (or a shifted inverse)
  * @param {number} o.nev              eigenpairs wanted
  * @param {number} [o.block]          block size (extra "guard" vectors speed up convergence)
  * @param {Float64Array} [o.mask]     1 on DOFs that take part (0 = held)
  * @param {(it: number, res: number, conv: number) => boolean|void} [o.onProgress] return true to cancel
  */
-export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Math.min(4, Math.max(2, nev)), tol = 1e-5, maxIter = 300, mask = null, onProgress = null, seed = 12345, settleAbove = Infinity }) {
+export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, cheapB = false, precond, nev, block = nev + Math.min(4, Math.max(2, nev)), tol = 1e-5, maxIter = 300, mask = null, onProgress = null, seed = 12345, settleAbove = Infinity }) {
   const m = Math.max(nev, block);
   const vec = () => new Float64Array(n);
-  const imageA = (V) => V.map((v) => { const y = vec(); applyA(v, y); return y; });
-  const imageB = (V) => V.map((v) => { const y = vec(); applyB(v, y); return y; });
+  const imageA = blockA || ((V) => V.map((v) => { const y = vec(); applyA(v, y); return y; }));
+  const imageB = blockB || ((V) => V.map((v) => { const y = vec(); applyB(v, y); return y; }));
   let s = seed;
   const rand = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff - 0.5; };
   // start from preconditioned random vectors (smooth, low-energy shapes)
@@ -329,22 +379,21 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
     X.push(v);
   }
   X = await precond(X);
-  let BX = imageB(X);
+  let BX = await imageB(X);
   if (!bOrthonormalize(X, null, BX)) throw new Error('Could not start the eigenvalue solver (model has too few free nodes).');
-  let AX = imageA(X);
+  let AX = await imageA(X);
   let theta;
   // initial Rayleigh-Ritz on X
   {
     const gA = new Float64Array(m * m), gB = new Float64Array(m * m);
-    for (let i = 0; i < m; i++) for (let j = 0; j <= i; j++) {
-      gA[i * m + j] = gA[j * m + i] = dotv(X[i], AX[j]);
-      gB[i * m + j] = gB[j * m + i] = dotv(X[i], BX[j]);
-    }
+    gram(X, AX, gA, m, 0, 0, true);
+    gram(X, BX, gB, m, 0, 0, true);
+    for (let i = 0; i < m; i++) for (let j = 0; j < i; j++) { gA[j * m + i] = gA[i * m + j]; gB[j * m + i] = gB[i * m + j]; }
     const ev = generalizedEigen(gA, gB, m);
     if (!ev) throw new Error('Eigenvalue solver failed to start.');
-    X = combine(X, ev.vectors, m, 0, m, n);
-    AX = combine(AX, ev.vectors, m, 0, m, n);
-    BX = combine(BX, ev.vectors, m, 0, m, n);
+    X = combine([[X, 0]], ev.vectors, m, m, n);
+    AX = combine([[AX, 0]], ev.vectors, m, m, n);
+    BX = cheapB ? await imageB(X) : combine([[BX, 0]], ev.vectors, m, m, n);
     theta = ev.values.slice(0, m);
   }
   let P = null, AP = null, BP = null;
@@ -377,22 +426,19 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
     // preconditioned residuals, B-orthogonal to X
     let W = await precond(R);
     if (mask) for (const w of W) for (let t = 0; t < n; t++) if (!mask[t]) w[t] = 0;
-    for (let j = 0; j < W.length; j++) {
-      for (let i = 0; i < m; i++) {
-        const c = dotv(BX[i], W[j]);
-        const w = W[j], x = X[i];
-        for (let t = 0; t < n; t++) w[t] -= c * x[t];
-      }
-    }
-    let BW = imageB(W);
+    const nW = W.length;
+    const XBW = new Float64Array(m * nW);
+    gram(BX, W, XBW, nW, 0, 0);
+    subtractCombination(W, X, XBW, nW);
+    let BW = await imageB(W);
     if (!bOrthonormalize(W, null, BW)) {
       // dependent search directions: restart the momentum and try once more with a jitter
       P = AP = BP = null;
       for (const w of W) for (let t = 0; t < n; t++) if (!mask || mask[t]) w[t] += 1e-8 * rand();
-      BW = imageB(W);
+      BW = await imageB(W);
       if (!bOrthonormalize(W, null, BW)) break;
     }
-    const AW = imageA(W);
+    const AW = await imageA(W);
     let usedP = false;
     if (P) {
       const keep = active.map((j) => j); // P columns follow the active set
@@ -401,21 +447,34 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
       BP = keep.map((j) => BP[j]).filter(Boolean);
       usedP = P.length > 0 && bOrthonormalize(P, AP, BP);
     }
-    const blocks = usedP ? [X, W, P] : [X, W];
-    const Ablocks = usedP ? [AX, AW, AP] : [AX, AW];
-    const Bblocks = usedP ? [BX, BW, BP] : [BX, BW];
-    const S = blocks.flat(), AS = Ablocks.flat(), BS = Bblocks.flat();
-    const k = S.length;
+    // Rayleigh-Ritz on [X W P]. X, W and P are each B-orthonormal and X^T A X = diag(theta), so
+    // only the other blocks of the projected matrices need products.
+    const nP = usedP ? P.length : 0;
+    const k = m + nW + nP;
     const gA = new Float64Array(k * k), gB = new Float64Array(k * k);
-    for (let i = 0; i < k; i++) for (let j = 0; j <= i; j++) {
-      gA[i * k + j] = gA[j * k + i] = 0.5 * (dotv(S[i], AS[j]) + dotv(S[j], AS[i]));
-      gB[i * k + j] = gB[j * k + i] = 0.5 * (dotv(S[i], BS[j]) + dotv(S[j], BS[i]));
+    for (let i = 0; i < m; i++) gA[i * k + i] = theta[i];
+    for (let i = 0; i < k; i++) gB[i * k + i] = 1;
+    gram(X, AW, gA, k, 0, m);
+    gram(W, AW, gA, k, m, m, true);
+    gram(X, BW, gB, k, 0, m);
+    if (usedP) {
+      gram(X, AP, gA, k, 0, m + nW);
+      gram(W, AP, gA, k, m, m + nW);
+      gram(P, AP, gA, k, m + nW, m + nW, true);
+      gram(X, BP, gB, k, 0, m + nW);
+      gram(W, BP, gB, k, m, m + nW);
+    }
+    // mirror: blocks above the diagonal were filled, and the lower triangles of the diagonal blocks
+    const blockOf = (i) => (i < m ? 0 : i < m + nW ? 1 : 2);
+    for (let i = 0; i < k; i++) for (let j = i + 1; j < k; j++) {
+      if (blockOf(i) === blockOf(j)) { gA[i * k + j] = gA[j * k + i]; gB[i * k + j] = gB[j * k + i]; }
+      else { gA[j * k + i] = gA[i * k + j]; gB[j * k + i] = gB[i * k + j]; }
     }
     let ev = generalizedEigen(gA, gB, k);
     let kk = k;
     if (!ev && usedP) {
       // ill-conditioned with the momentum block: drop it
-      kk = m + W.length;
+      kk = m + nW;
       const sub = (G) => { const o = new Float64Array(kk * kk); for (let i = 0; i < kk; i++) for (let j = 0; j < kk; j++) o[i * kk + j] = G[i * k + j]; return o; };
       ev = generalizedEigen(sub(gA), sub(gB), kk);
       usedP = false;
@@ -423,20 +482,15 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
     if (!ev) break;
     theta = ev.values.slice(0, m);
     const C = ev.vectors;
-    const nW = W.length;
-    // new momentum: the W and P parts of the Ritz vectors
-    const newP = combine(W, C, kk, m, m, n);
-    const newAP = combine(AW, C, kk, m, m, n);
-    const newBP = combine(BW, C, kk, m, m, n);
-    if (usedP) {
-      addInto(newP, combine(P, C, kk, m + nW, m, n));
-      addInto(newAP, combine(AP, C, kk, m + nW, m, n));
-      addInto(newBP, combine(BP, C, kk, m + nW, m, n));
-    }
-    X = addInto(combine(X, C, kk, 0, m, n), newP);
-    AX = addInto(combine(AX, C, kk, 0, m, n), newAP);
-    BX = addInto(combine(BX, C, kk, 0, m, n), newBP);
-    P = newP; AP = newAP; BP = newBP;
+    // new momentum: the W and P parts of the Ritz vectors; new X adds its X part
+    const step = (Xb, Wb, Pb) => {
+      const p = combine(usedP ? [[Wb, m], [Pb, m + nW]] : [[Wb, m]], C, kk, m, n);
+      return [combine([[Xb, 0]], C, kk, m, n, p), p];
+    };
+    [X, P] = step(X, W, P);
+    [AX, AP] = step(AX, AW, AP);
+    if (cheapB) { BX = await imageB(X); BP = await imageB(P); }
+    else [BX, BP] = step(BX, BW, BP);
   }
   return {
     values: theta.slice(0, nev),
@@ -467,27 +521,21 @@ export function freeDofs(fea) {
 
 /** Default preconditioner: one multigrid V-cycle per vector (full-length vectors). */
 export function cpuPreconditioner(fea) {
-  const L = fea.levels[0];
-  return (R) => R.map((r) => {
-    L.r.set(r);
-    for (let i = 0; i < r.length; i++) if (L.fixed[i]) L.r[i] = 0;
-    fea.vcycle(0);
-    return Float64Array.from(L.z);
-  });
+  return (R) => R.map((r) => fea.precondition(r));
 }
 
-function compactOps(fea, precondFull) {
+function compactOps(fea, precondFull, applyFull) {
   const L = fea.levels[0];
   const map = freeDofs(fea);
   const full = new Float64Array(L.nDof), out = new Float64Array(L.nDof);
   const pre = precondFull || cpuPreconditioner(fea);
+  const onFull = async (op, V) => (await op(V.map((v) => map.scatter(v, new Float64Array(L.nDof))))).map((y) => map.gather(y, new Float64Array(map.n)));
   return {
     map,
     applyK(x, y) { fea.apply(L, map.scatter(x, full), out); map.gather(out, y); },
-    async precond(R) {
-      const Z = await pre(R.map((r) => map.scatter(r, new Float64Array(L.nDof))));
-      return Z.map((z) => map.gather(z, new Float64Array(map.n)));
-    },
+    /** K times a block on the given (e.g. multi-threaded) full-length product, if any. */
+    blockK: applyFull ? (V) => onFull(applyFull, V) : null,
+    precond: (R) => onFull(pre, R),
     expand(x) { return map.scatter(x, new Float64Array(L.nDof)); },
   };
 }
@@ -498,14 +546,16 @@ function compactOps(fea, precondFull) {
  * @returns {{freqs: number[], lambdas: number[], modes: Float64Array[], mass: Float64Array, converged: boolean, iterations: number}}
  *          modes are full-length, normalized so that mode^T M mode = 1 with the normalized mass.
  */
-export async function naturalFrequencies(fea, { nev, E, density, h, shift = 0, precondFull = null, onProgress = null, tol = 1e-5 }) {
+export async function naturalFrequencies(fea, { nev, E, density, h, shift = 0, precondFull = null, applyFull = null, onProgress = null, tol = 1e-5 }) {
   const mass = lumpedMass(fea);
-  const ops = compactOps(fea, precondFull);
+  const ops = compactOps(fea, precondFull, applyFull);
   const mc = ops.map.gather(mass, new Float64Array(ops.map.n));
   const r = await lobpcg({
     n: ops.map.n, nev, tol, onProgress,
     applyA: ops.applyK,
+    blockA: ops.blockK,
     applyB: (x, y) => { for (let t = 0; t < x.length; t++) y[t] = mc[t] * x[t]; },
+    cheapB: true,
     precond: (R) => ops.precond(R),
   });
   // normalized eigenvalue lambda = w^2 rho h^2 / E
@@ -518,7 +568,7 @@ export async function naturalFrequencies(fea, { nev, E, density, h, shift = 0, p
  * Linear buckling load factors: K x = -lambda K_G x, smallest positive lambda first.
  * `sigma` is the dimensionless voxel stress (elementStresses) of the applied loads.
  */
-export async function bucklingFactors(fea, sigma, { nev, precondFull = null, onProgress = null, tol = 1e-5, maxFactor = Infinity }) {
+export async function bucklingFactors(fea, sigma, { nev, precondFull = null, applyFull = null, onProgress = null, tol = 1e-5, maxFactor = Infinity }) {
   // K_G is positive semi-definite when no voxel is in compression: nothing can buckle
   let smax = 0, compression = 0;
   const pr = [0, 0, 0];
@@ -536,7 +586,7 @@ export async function bucklingFactors(fea, sigma, { nev, precondFull = null, onP
   // them, and the search there is slow (a cluster of eigenvalues near zero) and ill-conditioned
   const floor = Number.isFinite(maxFactor) && maxFactor > 0 ? 1 / maxFactor : 0;
   const KG = new GeometricStiffness(fea, sigma);
-  const ops = compactOps(fea, precondFull);
+  const ops = compactOps(fea, precondFull, applyFull);
   const L = fea.levels[0];
   const full = new Float64Array(L.nDof), out = new Float64Array(L.nDof);
   // smallest (most negative) theta of K_G x = theta K x  <=>  buckling factor -1/theta
@@ -544,6 +594,7 @@ export async function bucklingFactors(fea, sigma, { nev, precondFull = null, onP
     n: ops.map.n, nev, tol, onProgress, settleAbove: floor > 0 ? -floor : Infinity,
     applyA: (x, y) => { KG.apply(ops.map.scatter(x, full), out); ops.map.gather(out, y); },
     applyB: ops.applyK,
+    blockB: ops.blockK,
     precond: (R) => ops.precond(R),
   });
   const factors = r.values.map((t) => (t < -floor ? -1 / t : Infinity));

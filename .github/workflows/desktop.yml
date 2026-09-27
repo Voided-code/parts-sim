@@ -44,6 +44,13 @@ jobs:
       - name: Desktop end-to-end test
         if: runner.os != 'Linux'
         run: npm run test:desktop
+      - name: Upload end-to-end screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-screenshots-${{ matrix.name }}
+          if-no-files-found: ignore
+          path: test-artifacts/
       - uses: actions/upload-artifact@v4
         with:
           name: parts-sim-${{ matrix.name }}

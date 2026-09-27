@@ -172,3 +172,27 @@ test('worker cancellation ignores late messages and callback errors terminate th
   await assert.rejects(badCallback.promise, /Display failed/);
   assert.equal(badCallback.worker.terminated, true);
 });
+
+test('the GPU solver runs the native app\'s shader, with coarse matrices rounded to halves', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { toHalf } = await import('../src/fea/gpu-solver.js');
+  const js = await readFile(new URL('../src/fea/gpu-solver.js', import.meta.url), 'utf8');
+  const start = js.indexOf('const SHADER = /* wgsl */ `') + 'const SHADER = /* wgsl */ `'.length;
+  const native = await readFile(new URL('../native/shaders/fea.wgsl', import.meta.url), 'utf8');
+  assert.equal(js.slice(start, js.indexOf('`;', start)).trim(), native.trim());
+  // half bits -> value, to check the rounding
+  const value = (h) => {
+    const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    return e === 0 ? s * m * 2 ** -24 : s * (1 + m / 1024) * 2 ** (e - 15);
+  };
+  for (const [v, h] of [[0, 0], [1, 0x3c00], [-2, 0xc000], [0.5, 0x3800], [65504, 0x7bff], [2 ** -24, 1], [1 + 2 ** -11, 0x3c00], [1 + 3 * 2 ** -11, 0x3c02]]) {
+    assert.equal(toHalf(v), h, `${v}`);
+  }
+  let seed = 1;
+  for (let i = 0; i < 10000; i++) {
+    seed = (seed * 16807) % 2147483647;
+    const v = (seed / 2147483647 - 0.5) * 2 ** ((i % 26) - 10); // up to 2^15, inside the half range
+    const back = value(toHalf(v));
+    assert.ok(Math.abs(back - v) <= Math.max(Math.abs(v) * 2 ** -11, 2 ** -25), `${v} -> ${back}`);
+  }
+});

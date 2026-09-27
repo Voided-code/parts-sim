@@ -33,6 +33,7 @@ const app = {
   busy: {
     show(text, onCancel = null) {
       $('#busy').hidden = false;
+      app.viewer.busy = true;
       $('#busy-text').textContent = text;
       $('#busy-bar').style.width = '0';
       $('#busy-cancel').hidden = !onCancel;
@@ -44,6 +45,7 @@ const app = {
     },
     hide() {
       $('#busy').hidden = true;
+      app.viewer.busy = false;
       this.onCancel = null;
     },
   },

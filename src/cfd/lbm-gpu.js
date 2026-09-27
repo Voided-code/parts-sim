@@ -2,6 +2,7 @@
 // interpolated bounce-back and collision model), with the native app's kernel: unrolled over the
 // directions, a per-cell flags word for walls, and 16-bit population storage where supported.
 import { CX, CY, CZ, lbmParams, inletVelocity, validateGrid } from './lbm-cpu.js';
+import { hardwareAdapter } from '../core/webgpu.js';
 
 const WG = 64;
 const MAX_BATCH = 400;
@@ -279,9 +280,7 @@ function cellFlags(dims, solid) {
 
 export async function webgpuAvailable() {
   try {
-    if (!navigator.gpu) return false;
-    const adapter = await navigator.gpu.requestAdapter();
-    return !!adapter;
+    return !!(await hardwareAdapter());
   } catch {
     return false;
   }
@@ -289,7 +288,7 @@ export async function webgpuAvailable() {
 
 /** Largest grid (cells) the GPU can hold: 19 populations per cell (16-bit where supported) in one storage buffer. */
 export async function gpuMaxCells() {
-  const adapter = await navigator.gpu.requestAdapter();
+  const adapter = await hardwareAdapter();
   if (!adapter) throw new Error('No WebGPU adapter');
   const lim = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
   return Math.floor(lim / (19 * (adapter.features.has('shader-f16') ? 2 : 4)));
@@ -299,7 +298,7 @@ export class LBMGPU {
   static async create(o) {
     validateGrid(o);
     lbmParams(o);
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    const adapter = await hardwareAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('No WebGPU adapter');
     const half = o.half !== false && adapter.features.has('shader-f16');
     const device = await adapter.requestDevice({
