@@ -115,13 +115,13 @@ For the browser version, run `npm run build` and serve the static `dist/` folder
 - The part is **voxelised** by supersampled ray casting with a majority vote across X, Y and Z, which tolerates small holes and flipped triangles. Each voxel's filled fraction scales its stiffness, which smooths the staircase on curved surfaces.
 - **Thin walls** (sheet metal, channels, enclosures) are measured by ray casting through the part. Walls thinner than about 1.5 voxels become a connected layer of voxels that holds exactly the wall's volume, so they neither vanish nor break apart when they run diagonally through the grid. Their in-plane stiffness and stress match the real wall; bending of the wall itself is approximate, so the automatic resolution still aims for about two voxels through every wall.
 - Each voxel is an **8-node hexahedron with Wilson incompatible modes**. The condensed 24×24 matrix removes the shear locking of plain bricks, so bending is accurate even with only 2–4 voxels through a wall.
-- `K u = f` is solved **matrix-free with conjugate gradients preconditioned by a geometric multigrid V-cycle**. The coarse levels are exact Galerkin products, and the coarsest level uses a dense Cholesky factorisation. Typical runs take 10–40 iterations, so a 65,000-voxel model solves in about 3 s on the CPU.
-- **On the GPU** (`src/fea/gpu-solver.js`), the same multigrid-preconditioned CG runs as WebGPU compute shaders:
-  - the matrix-free product uses one thread per grid node, gathering from its 8 voxels;
-  - the V-cycle uses Jacobi smoothing, restriction, prolongation and a dense coarsest inverse;
-  - dot products are reduced on the GPU.
+- `K u = f` is solved **matrix-free with conjugate gradients preconditioned by a geometric multigrid V-cycle** with degree-2 Chebyshev smoothing. The coarse levels are exact Galerkin products, and the coarsest level uses a dense Cholesky factorisation. Inside uniform regions the matrix product uses the assembled 27-point stencil (243 multiply-adds per node instead of 576). Typical runs take 10–40 iterations, so a 65,000-voxel model solves in about 1–3 s on the CPU.
+- **On the GPU** (`src/fea/gpu-solver.js`, the same shader as the native app), the whole CG loop runs as WebGPU compute shaders:
+  - the matrix-free product uses one thread per grid node, gathering from its 8 voxels (the stencil inside uniform regions), from neighbour differences so that 32-bit floats keep their accuracy;
+  - the V-cycle fuses the Chebyshev smoothing into the products, then restriction, prolongation and a dense coarsest inverse;
+  - dot products and the CG scalars stay on the GPU.
 
-  GPUs compute in 32-bit floats, so the GPU solve acts as the preconditioner of a 64-bit flexible CG on the CPU. Results match the CPU solver to about 10⁻⁹, and bend tests run about 2–9× faster (break tests about 3.5×).
+  GPUs compute in 32-bit floats. Reliable updates keep 64-bit accuracy: whenever the GPU's residual has dropped tenfold, its solution is added to a 64-bit one on the CPU and the true residual, computed there, replaces the GPU's. Results match the CPU solver to about 10⁻⁷.
 - **Stresses** are evaluated at element corners (including the condensed modes) and averaged at the nodes, then interpolated onto a refined copy of your surface mesh for display.
 - The **break test** is a brittle progressive-damage model. At each step the voxels at the peak of the failure measure (von Mises for ductile materials, max principal stress for brittle ones) are removed where they reach the ultimate tensile strength, fragments that detach are dropped, and the model is re-solved.
 
@@ -141,7 +141,7 @@ One temperature per grid node, 8-node conduction bricks scaled by the voxel fill
 
 ### Airflow solver (`src/cfd`)
 
-- **D3Q19 lattice Boltzmann** with BGK collision and a **Smagorinsky** sub-grid model (a simple LES). It runs as a WGSL compute shader at about 300–450 million cell updates per second on an Apple-silicon GPU, with an identical JavaScript fallback in a Web Worker.
+- **D3Q19 lattice Boltzmann** with BGK collision and a **Smagorinsky** sub-grid model (a simple LES). It runs as a WGSL compute shader, unrolled over the 19 directions and storing the populations in 16 bits where the GPU supports it (shifted by their rest weights, as in FluidX3D: half the memory traffic, drag within 0.1% of 32-bit storage), at about 1,100–1,300 million cell updates per second on an Apple-silicon GPU, with an identical JavaScript fallback in a Web Worker.
 - **Interpolated (Bouzidi) bounce-back.** Each wall link's exact distance comes from ray casting against your mesh (via three-mesh-bvh), so curved surfaces are not treated as staircases.
 - **Boundaries.** A velocity inlet, and open pressure boundaries on the outlet and all four sides, so displaced air escapes as it would in open air rather than being squeezed as in a closed tunnel.
 - **Forces** are the time-averaged pressure integrated over the wetted voxel faces (pressure drag and lift). Skin friction is not resolved.
@@ -162,7 +162,7 @@ All figures are reproducible. The FEA and voxeliser numbers come from `npm test`
 | Beam sample (200×20×10 mm steel, 800 N tip load), tip deflection | 1.54 mm | 1.60 mm (beam theory) |
 | Beam sample, tip deflection at 40–128 voxels on the long side | within 6% at every resolution | beam theory |
 | 1 mm wall in 1.56 mm voxels, bent in its plane, at 0° / 30° / 45° to the grid | deflection 0.99 / 1.00 / 0.95×, stress 0.99 / 1.05 / 1.00× | beam theory |
-| GPU solver against the CPU solver (cantilevers, thin-walled channel, samples) | 10⁻¹¹–10⁻⁹ relative difference | CPU multigrid solver |
+| GPU solver against the CPU solver (samples, both solved to a 10⁻⁶ residual) | 10⁻⁸–10⁻⁷ relative difference | CPU multigrid solver |
 | Voxelised sphere volume | −0.12% | exact |
 | Sphere drag, D = 100 mm at 20 m/s (medium) | Cd 0.37 | 0.40–0.47 (subcritical) |
 | Ahmed body, 25° slant (medium / high) | Cd 0.48 / 0.42 | 0.285 (Ahmed et al., 1984) |

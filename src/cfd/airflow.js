@@ -15,7 +15,7 @@ const MIN_NU_LAT = 0.0005;
 export const FLOW_CELLS = { min: 50e3, gpuDefault: 1.0e6, cpuDefault: 170e3, cpuMax: 1.0e6, gpuMax: 60e6 };
 // memory per cell: GPU (in/out distributions, moments, solid flag, wall links, read-back) and the page
 // (snapshot, time averages, solid flag, wall links, voxelizer)
-export const FLOW_BYTES = { gpu: 2 * 76 + 16 + 4 + 19 + 16, page: 16 + 16 + 1 + 19 + 4 };
+export const FLOW_BYTES = { gpu: 2 * 76 + 16 + 4 + 4 + 19 + 16, page: 16 + 16 + 1 + 19 + 4 };
 
 /** Grid-size range for an engine: {min, max, default} cells. */
 export async function flowCapacity(useGPU) {

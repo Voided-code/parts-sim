@@ -5,17 +5,74 @@
 // smooths out the staircase along curved or inclined surfaces.
 //
 // K u = f is solved matrix-free with conjugate gradients preconditioned by a geometric
-// multigrid V-cycle. Coarse operators are exact Galerkin products (P^T K P) computed
-// element-by-element, which keeps the iteration count low (typically 15-60) even for
-// long slender parts in bending, where plain Jacobi-CG would need thousands.
+// multigrid V-cycle with degree-2 Chebyshev smoothing. Coarse operators are exact Galerkin
+// products (P^T K P) computed element-by-element, which keeps the iteration count low
+// (typically 10-50) even for long slender parts in bending, where plain Jacobi-CG would need
+// thousands. Matrix products gather each node's rows from its 8 voxels; inside a uniform region
+// (the 8 voxels the same s * Kb, the level's uniform element) they use the assembled 27-point
+// stencil, 243 multiply-adds instead of 576 (the native app's scheme).
 //
 // Units: the solver works in a normalized system (E = 1, voxel size = 1). With
 // physical E [Pa] and voxel size h [m], u_physical = u_normalized / (E * h) for forces in N.
 
 import { HEX_NODES, hexElement } from './hex8.js';
 
-const SMOOTH_SWEEPS = 2;
 const COARSEST_MAX_DOF = 1100;
+
+// corner index of the element node at unit offset (x, y, z)
+const corner = (x, y, z) => (y ? (x ? 2 : 3) : (x ? 1 : 0)) + 4 * z;
+
+/** Largest eigenvalue of a symmetric tridiagonal matrix (diagonal a, off-diagonal b), by bisection. */
+function tridiagonalMax(a, b) {
+  const k = a.length;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < k; i++) {
+    const r = (i > 0 ? Math.abs(b[i - 1]) : 0) + (i + 1 < k ? Math.abs(b[i]) : 0);
+    lo = Math.min(lo, a[i] - r);
+    hi = Math.max(hi, a[i] + r);
+  }
+  const above = (x) => {
+    let count = 0, q = 1;
+    for (let i = 0; i < k; i++) {
+      q = a[i] - x - (i > 0 ? (b[i - 1] * b[i - 1]) / q : 0);
+      if (q === 0) q = 1e-300;
+      if (q > 0) count++;
+    }
+    return count;
+  };
+  for (let it = 0; it < 100 && hi - lo > 1e-12 * Math.abs(hi); it++) {
+    const mid = 0.5 * (lo + hi);
+    if (above(mid) > 0) lo = mid;
+    else hi = mid;
+  }
+  return hi;
+}
+
+/**
+ * A level's uniform element Kb (K0 on the finest level, then the exact Galerkin product of 8 uniform
+ * children - not 2 K0, the element is not a plain trilinear one) and its assembled stencil: for each
+ * neighbour row (oy, oz) of three nodes (ox = 0..2, 9 contiguous DOFs), the 3 x 9 block on them.
+ */
+function setBase(L, K) {
+  L.Kb = Float64Array.from(K);
+  L.S = new Float64Array(243);
+  for (let v = 0; v < 8; v++) {
+    const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2, a = corner(1 - di, 1 - dj, 1 - dk);
+    for (let w = 0; w < 8; w++) {
+      const bx = w & 1, by = (w >> 1) & 1, bz = w >> 2, b = corner(bx, by, bz);
+      const row = dj + by + 3 * (dk + bz), col = 3 * (di + bx);
+      for (let d = 0; d < 3; d++) for (let c = 0; c < 3; c++) L.S[(row * 3 + d) * 9 + col + c] += K[(3 * a + d) * 24 + 3 * b + c];
+    }
+  }
+}
+
+/** Degree-2 Chebyshev smoother over [0.1, 1.15] * lmax of D^-1 K (Adams et al. 2003). */
+function chebyshevCoefficients(lmax) {
+  const b = 1.15 * lmax, a = 0.1 * lmax;
+  const theta = (b + a) / 2, delta = (b - a) / 2, sigma = theta / delta;
+  const rho0 = 1 / sigma, rho1 = 1 / (2 * sigma - rho0);
+  return { first: 1 / theta, c1: rho1 * rho0, c2: (2 * rho1) / delta };
+}
 
 // Trilinear prolongation from a coarse element to each of its 8 children.
 // CHILD_P[c][a] = [b0, w0, b1, w1, ...]: fine child-node a interpolates coarse nodes b with weight w.
@@ -117,15 +174,10 @@ export class VoxelFEA {
     const element = hexElement(nu);
     this.K0 = element.K;
     this.cornerStress = element.cornerStress;
-    this.M0 = [];
     const T = new Float64Array(576);
-    for (let c = 0; c < 8; c++) {
-      const M = new Float64Array(576);
-      galerkinAdd(M, 0, this.K0, 0, 1, CHILD_P[c], T);
-      this.M0.push(M);
-    }
     this.ue = new Float64Array(24);
     this.T = T;
+
 
     const L0 = makeLevel(dims[0], dims[1], dims[2]);
     const { nx, ny, NX, NY } = L0;
@@ -134,6 +186,8 @@ export class VoxelFEA {
     L0.elems = new Int32Array(count);
     L0.base = new Int32Array(count);
     L0.rho = new Float64Array(count);
+    L0.scale = L0.rho;
+    setBase(L0, this.K0);
     let q = 0;
     for (let k = 0; k < dims[2]; k++) {
       for (let j = 0; j < ny; j++) {
@@ -202,6 +256,26 @@ export class VoxelFEA {
     L.r = new Float64Array(L.nDof);
     L.z = new Float64Array(L.nDof);
     L.t = new Float64Array(L.nDof);
+    L.d = new Float64Array(L.nDof);
+    // voxel -> element; node -> s when its 8 voxels are all the same s * K0 (27-point stencil), else 0
+    const { nx, ny, nz, NX, NY } = L;
+    L.emap = new Int32Array(nx * ny * nz).fill(-1);
+    const vs = new Float64Array(nx * ny * nz);
+    for (let e = 0; e < nE; e++) {
+      L.emap[L.elems[e]] = e;
+      vs[L.elems[e]] = L.scale[e] > 0 ? L.scale[e] : -1;
+    }
+    L.nodeScale = new Float64Array(L.nNodes);
+    for (let k = 1; k < nz; k++) {
+      for (let j = 1; j < ny; j++) {
+        for (let i = 1; i < nx; i++) {
+          const s0 = vs[i - 1 + nx * (j - 1 + ny * (k - 1))];
+          let u = s0 > 0;
+          for (let v = 1; v < 8 && u; v++) u = vs[i - 1 + (v & 1) + nx * (j - 1 + ((v >> 1) & 1) + ny * (k - 1 + (v >> 2)))] === s0;
+          if (u) L.nodeScale[i + NX * (j + NY * k)] = s0;
+        }
+      }
+    }
   }
 
   coarsen(F) {
@@ -227,15 +301,32 @@ export class VoxelFEA {
       C.base[q] = I + C.NX * (J + C.NY * K);
     }
     C.K = new Float64Array(nE * 576);
+    // Galerkin products of the fine level's uniform element per child position; a coarse element
+    // whose 8 children are s * Kb is s times their sum, the coarse level's own uniform element
+    const M = [], Kc = new Float64Array(576);
+    for (let c = 0; c < 8; c++) {
+      const Mc = new Float64Array(576);
+      galerkinAdd(Mc, 0, F.Kb, 0, 1, CHILD_P[c], this.T);
+      for (let t = 0; t < 576; t++) Kc[t] += Mc[t];
+      M.push(Mc);
+    }
+    setBase(C, Kc);
+    const kids = new Int32Array(nE), first = new Float64Array(nE).fill(NaN);
+    C.scale = new Float64Array(nE);
     for (let q = 0; q < F.elems.length; q++) {
-      const out = fineCoarse[q] * 576, c = fineChild[q];
-      if (F.K) {
-        galerkinAdd(C.K, out, F.K, q * 576, 1, CHILD_P[c], this.T);
+      const cq = fineCoarse[q], out = cq * 576, c = fineChild[q];
+      kids[cq]++;
+      const sq = F.scale[q] > 0 ? F.scale[q] : -1;
+      if (Number.isNaN(first[cq])) first[cq] = sq;
+      else if (first[cq] !== sq) first[cq] = -1;
+      if (F.scale[q] > 0) {
+        const Mc = M[c], s = F.scale[q];
+        for (let t = 0; t < 576; t++) C.K[out + t] += s * Mc[t];
       } else {
-        const M = this.M0[c], s = F.rho[q];
-        for (let t = 0; t < 576; t++) C.K[out + t] += s * M[t];
+        galerkinAdd(C.K, out, F.K, q * 576, 1, CHILD_P[c], this.T);
       }
     }
+    for (let q = 0; q < nE; q++) C.scale[q] = kids[q] === 8 && first[q] > 0 ? first[q] : -1;
     // A coarse DOF is held if it interpolates onto any held fine DOF.
     const mx = transferMap(F.nx), my = transferMap(F.ny), mz = transferMap(F.nz);
     C.bc = new Uint8Array(C.nDof);
@@ -272,62 +363,95 @@ export class VoxelFEA {
 
   /** y = K x on free DOFs (held/inactive DOFs of y are zeroed unless raw). */
   apply(L, x, y, raw = false) {
-    y.fill(0);
-    const off = L.off, ue = this.ue;
-    const nE = L.elems.length;
-    const Kmat = L.K ? L.K : this.K0;
-    const shared = !L.K;
-    for (let e = 0; e < nE; e++) {
-      const n0 = L.base[e];
-      for (let a = 0; a < 8; a++) {
-        const n = 3 * (n0 + off[a]);
-        ue[3 * a] = x[n];
-        ue[3 * a + 1] = x[n + 1];
-        ue[3 * a + 2] = x[n + 2];
-      }
-      const kb = shared ? 0 : e * 576;
-      const s = shared ? L.rho[e] : 1;
-      for (let a = 0; a < 8; a++) {
-        const n = 3 * (n0 + off[a]);
-        for (let d = 0; d < 3; d++) {
-          const row = kb + (3 * a + d) * 24;
-          let sum = 0;
-          for (let c = 0; c < 24; c++) sum += Kmat[row + c] * ue[c];
-          y[n + d] += s * sum;
+    const { NX, NY, NZ, nx, ny, nz, off, emap, nodeScale, activeNode, fixed } = L;
+    const NXY = NX * NY, S0 = L.S, D = L.diagAdd;
+    const Kmat = L.K || this.K0, own = !!L.K;
+    for (let k = 0; k < NZ; k++) {
+      for (let j = 0; j < NY; j++) {
+        for (let i = 0; i < NX; i++) {
+          const n = i + NX * (j + NY * k), o = 3 * n;
+          let a0 = 0, a1 = 0, a2 = 0;
+          if (activeNode[n]) {
+            const s0 = nodeScale[n];
+            if (s0 > 0) {
+              // 27-point stencil: nine rows of three neighbours, 9 contiguous DOFs each
+              const b = o - 3 * (1 + NX + NXY);
+              for (let r = 0; r < 9; r++) {
+                const xr = b + 3 * ((r % 3) * NX + ((r / 3) | 0) * NXY), sr = r * 27;
+                for (let c = 0; c < 9; c++) {
+                  const u = x[xr + c];
+                  a0 += S0[sr + c] * u;
+                  a1 += S0[sr + 9 + c] * u;
+                  a2 += S0[sr + 18 + c] * u;
+                }
+              }
+              a0 *= s0; a1 *= s0; a2 *= s0;
+            } else {
+              // the rows of this node's corner in each of its voxels
+              for (let v = 0; v < 8; v++) {
+                const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2;
+                const ei = i + di - 1, ej = j + dj - 1, ek = k + dk - 1;
+                if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+                const e = emap[ei + nx * (ej + ny * ek)];
+                if (e < 0) continue;
+                const nb = n - (1 - di) - NX * (1 - dj) - NXY * (1 - dk);
+                const kb = (own ? e * 576 : 0) + 72 * corner(1 - di, 1 - dj, 1 - dk);
+                let s0_ = 0, s1 = 0, s2 = 0;
+                for (let c = 0; c < 8; c++) {
+                  const p = 3 * (nb + off[c]), kc = kb + 3 * c;
+                  const u0 = x[p], u1 = x[p + 1], u2 = x[p + 2];
+                  s0_ += Kmat[kc] * u0 + Kmat[kc + 1] * u1 + Kmat[kc + 2] * u2;
+                  s1 += Kmat[kc + 24] * u0 + Kmat[kc + 25] * u1 + Kmat[kc + 26] * u2;
+                  s2 += Kmat[kc + 48] * u0 + Kmat[kc + 49] * u1 + Kmat[kc + 50] * u2;
+                }
+                const s = own ? 1 : L.rho[e];
+                a0 += s * s0_; a1 += s * s1; a2 += s * s2;
+              }
+            }
+            if (D) { a0 += D[o] * x[o]; a1 += D[o + 1] * x[o + 1]; a2 += D[o + 2] * x[o + 2]; }
+          }
+          if (raw) { y[o] = a0; y[o + 1] = a1; y[o + 2] = a2; }
+          else {
+            y[o] = fixed[o] ? 0 : a0;
+            y[o + 1] = fixed[o + 1] ? 0 : a1;
+            y[o + 2] = fixed[o + 2] ? 0 : a2;
+          }
         }
       }
     }
-    if (L.diagAdd) {
-      const D = L.diagAdd;
-      for (let i = 0; i < y.length; i++) y[i] += D[i] * x[i];
-    }
-    if (!raw) {
-      const fixed = L.fixed;
-      for (let i = 0; i < y.length; i++) if (fixed[i]) y[i] = 0;
-    }
   }
 
+  /** Largest eigenvalue of D^-1 K on a level: 10 Lanczos steps on D^-1/2 K D^-1/2. */
   estimateOmega(L) {
-    let v = new Float64Array(L.nDof);
+    const n = L.nDof, sq = new Float64Array(n);
+    for (let i = 0; i < n; i++) sq[i] = Math.sqrt(L.invDiag[i]);
+    let v = new Float64Array(n), vPrev = new Float64Array(n);
+    const w = new Float64Array(n), x = new Float64Array(n);
     let seed = 12345;
-    for (let i = 0; i < v.length; i++) {
+    for (let i = 0; i < n; i++) {
       seed = (seed * 1103515245 + 12345) & 0x7fffffff;
       v[i] = L.fixed[i] ? 0 : seed / 0x7fffffff - 0.5;
     }
-    let w = new Float64Array(L.nDof);
-    let lambda = 1;
-    for (let it = 0; it < 12; it++) {
-      let nv = 0;
-      for (let i = 0; i < v.length; i++) nv += v[i] * v[i];
-      nv = Math.sqrt(nv) || 1;
-      for (let i = 0; i < v.length; i++) v[i] /= nv;
-      this.apply(L, v, w);
-      let nw = 0;
-      for (let i = 0; i < w.length; i++) { w[i] *= L.invDiag[i]; nw += w[i] * w[i]; }
-      lambda = Math.sqrt(nw);
-      [v, w] = [w, v];
+    const nv = Math.sqrt(dot(v, v)) || 1;
+    for (let i = 0; i < n; i++) v[i] /= nv;
+    const alpha = [], beta = [];
+    let b = 0;
+    for (let j = 0; j < 10; j++) {
+      for (let i = 0; i < n; i++) x[i] = sq[i] * v[i];
+      this.apply(L, x, w);
+      for (let i = 0; i < n; i++) w[i] = sq[i] * w[i] - b * vPrev[i];
+      const a = dot(w, v);
+      for (let i = 0; i < n; i++) w[i] -= a * v[i];
+      alpha.push(a);
+      b = Math.sqrt(dot(w, w));
+      if (!(b > 1e-12 * Math.abs(a))) break;
+      beta.push(b);
+      [vPrev, v] = [v, vPrev];
+      for (let i = 0; i < n; i++) v[i] = w[i] / b;
     }
-    L.omega = 1.2 / (lambda * 1.05);
+    beta.length = alpha.length - 1;
+    L.lmax = tridiagonalMax(alpha, beta);
+    L.omega = 1.2 / (L.lmax * 1.05); // damped Jacobi (coarsest-level fallback, GPU solver)
   }
 
   buildCoarseSolver(L) {
@@ -391,12 +515,27 @@ export class VoxelFEA {
       for (let k = 0; k < i; k++) s -= A[ri + k] * y[k];
       y[i] = s / A[ri + i];
     }
+    // backward by column sweeps: each reads a row of the factor
     for (let i = m - 1; i >= 0; i--) {
-      let s = y[i];
-      for (let k = i + 1; k < m; k++) s -= A[k * m + i] * y[k];
-      y[i] = s / A[i * m + i];
+      const ri = i * m, xi = y[i] / A[ri + i];
+      y[i] = xi;
+      for (let k = 0; k < i; k++) y[k] -= A[ri + k] * xi;
     }
     for (let i = 0; i < L.nDof; i++) if (map[i] >= 0) z[i] = y[map[i]];
+  }
+
+  /** Degree-2 Chebyshev smoothing of L.z (from zero, or from its current value). */
+  chebyshev(L, fromZero) {
+    const { r, z, t, d, invDiag: Di } = L;
+    const c = chebyshevCoefficients(L.lmax), n = z.length;
+    if (fromZero) {
+      for (let i = 0; i < n; i++) { d[i] = c.first * Di[i] * r[i]; z[i] = d[i]; }
+    } else {
+      this.apply(L, z, t);
+      for (let i = 0; i < n; i++) { d[i] = c.first * Di[i] * (r[i] - t[i]); z[i] += d[i]; }
+    }
+    this.apply(L, z, t);
+    for (let i = 0; i < n; i++) { d[i] = c.c1 * d[i] + c.c2 * Di[i] * (r[i] - t[i]); z[i] += d[i]; }
   }
 
   jacobiSweep(L, z, fromZero) {
@@ -485,14 +624,13 @@ export class VoxelFEA {
     if (l === this.levels.length - 1) { this.coarseSolve(L); return; }
     const C = this.levels[l + 1];
     const { r, z, t } = L;
-    this.jacobiSweep(L, z, true);
-    for (let s = 1; s < SMOOTH_SWEEPS; s++) this.jacobiSweep(L, z, false);
+    this.chebyshev(L, true);
     this.apply(L, z, t);
     for (let i = 0; i < t.length; i++) t[i] = r[i] - t[i];
     this.restrict(L, C, t, C.r);
     this.vcycle(l + 1);
     this.prolongAdd(L, C, C.z, z);
-    for (let s = 0; s < SMOOTH_SWEEPS; s++) this.jacobiSweep(L, z, false);
+    this.chebyshev(L, false);
   }
 
   /**

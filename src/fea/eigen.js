@@ -6,6 +6,7 @@
 // that already solves K u = f makes a very good preconditioner here, so a handful of modes
 // converge in a few dozen iterations even on large, slender models.
 import { elasticityMatrix, HEX_NODES } from './hex8.js';
+import { principalStresses } from './solver.js';
 
 /** Lumped mass per DOF in normalized units (voxel side 1, density 1): fill fraction / 8 per node. */
 export function lumpedMass(fea) {
@@ -313,7 +314,7 @@ function bOrthonormalize(V, AV, BV) {
  * @param {Float64Array} [o.mask]     1 on DOFs that take part (0 = held)
  * @param {(it: number, res: number, conv: number) => boolean|void} [o.onProgress] return true to cancel
  */
-export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Math.min(4, Math.max(2, nev)), tol = 1e-5, maxIter = 300, mask = null, onProgress = null, seed = 12345 }) {
+export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Math.min(4, Math.max(2, nev)), tol = 1e-5, maxIter = 300, mask = null, onProgress = null, seed = 12345, settleAbove = Infinity }) {
   const m = Math.max(nev, block);
   const vec = () => new Float64Array(n);
   const imageA = (V) => V.map((v) => { const y = vec(); applyA(v, y); return y; });
@@ -348,6 +349,8 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
   }
   let P = null, AP = null, BP = null;
   let res = new Array(m).fill(1);
+  const settled = new Array(m).fill(false);
+  const history = Array.from({ length: 10 }, () => new Array(m).fill(0)); // Ritz values of the last 10 iterations
   let it = 0;
   for (; it < maxIter; it++) {
     // residuals
@@ -361,10 +364,14 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
         rr += v * v; na += ax[t] * ax[t]; nb += bx[t] * bx[t];
       }
       res[j] = Math.sqrt(rr) / (Math.sqrt(na) + Math.abs(th) * Math.sqrt(nb) || 1);
-      if (res[j] > tol) { active.push(j); R.push(r); }
+      // settled above the bound: its eigenvalue lies outside the searched range (Ritz values only
+      // decrease towards the eigenvalues), so it needs no more accuracy
+      settled[j] = it >= 10 && th > settleAbove && Math.abs(th - history[it % 10][j]) <= 0.01 * Math.abs(settleAbove);
+      if (res[j] > tol && !settled[j]) { active.push(j); R.push(r); }
     }
-    const conv = res.slice(0, nev).filter((r) => r <= tol).length;
-    const worst = Math.max(...res.slice(0, nev));
+    history[it % 10] = theta.slice();
+    const conv = res.slice(0, nev).filter((r, j) => r <= tol || settled[j]).length;
+    const worst = Math.max(0, ...res.slice(0, nev).filter((_, j) => !settled[j]));
     if (onProgress && onProgress(it, worst, conv) === true) throw Object.assign(new Error('Cancelled'), { cancelled: true });
     if (conv === nev) break;
     // preconditioned residuals, B-orthogonal to X
@@ -436,7 +443,7 @@ export async function lobpcg({ n, applyA, applyB, precond, nev, block = nev + Ma
     vectors: X.slice(0, nev),
     residuals: res.slice(0, nev),
     iterations: it,
-    converged: res.slice(0, nev).every((r) => r <= tol * 10),
+    converged: res.slice(0, nev).every((r, j) => r <= tol * 10 || settled[j]),
   };
 }
 
@@ -511,18 +518,34 @@ export async function naturalFrequencies(fea, { nev, E, density, h, shift = 0, p
  * Linear buckling load factors: K x = -lambda K_G x, smallest positive lambda first.
  * `sigma` is the dimensionless voxel stress (elementStresses) of the applied loads.
  */
-export async function bucklingFactors(fea, sigma, { nev, precondFull = null, onProgress = null, tol = 1e-5 }) {
+export async function bucklingFactors(fea, sigma, { nev, precondFull = null, onProgress = null, tol = 1e-5, maxFactor = Infinity }) {
+  // K_G is positive semi-definite when no voxel is in compression: nothing can buckle
+  let smax = 0, compression = 0;
+  const pr = [0, 0, 0];
+  for (let e = 0; 6 * e + 5 < sigma.length; e++) {
+    const o = 6 * e;
+    principalStresses(sigma[o], sigma[o + 1], sigma[o + 2], sigma[o + 3], sigma[o + 4], sigma[o + 5], pr);
+    smax = Math.max(smax, Math.abs(pr[0]), Math.abs(pr[2]));
+    compression = Math.max(compression, -pr[2]);
+  }
+  if (!(compression > 1e-12 * smax)) {
+    const L = fea.levels[0];
+    return { factors: new Array(nev).fill(Infinity), modes: Array.from({ length: nev }, () => new Float64Array(L.nDof)), converged: true, iterations: 0, residuals: [], maxFactor };
+  }
+  // factors above maxFactor are reported as Infinity: a part that yields long before never reaches
+  // them, and the search there is slow (a cluster of eigenvalues near zero) and ill-conditioned
+  const floor = Number.isFinite(maxFactor) && maxFactor > 0 ? 1 / maxFactor : 0;
   const KG = new GeometricStiffness(fea, sigma);
   const ops = compactOps(fea, precondFull);
   const L = fea.levels[0];
   const full = new Float64Array(L.nDof), out = new Float64Array(L.nDof);
   // smallest (most negative) theta of K_G x = theta K x  <=>  buckling factor -1/theta
   const r = await lobpcg({
-    n: ops.map.n, nev, tol, onProgress,
+    n: ops.map.n, nev, tol, onProgress, settleAbove: floor > 0 ? -floor : Infinity,
     applyA: (x, y) => { KG.apply(ops.map.scatter(x, full), out); ops.map.gather(out, y); },
     applyB: ops.applyK,
     precond: (R) => ops.precond(R),
   });
-  const factors = r.values.map((t) => (t < 0 ? -1 / t : Infinity));
-  return { factors, modes: r.vectors.map((v) => ops.expand(v)), converged: r.converged, iterations: r.iterations, residuals: r.residuals };
+  const factors = r.values.map((t) => (t < -floor ? -1 / t : Infinity));
+  return { factors, modes: r.vectors.map((v) => ops.expand(v)), converged: r.converged, iterations: r.iterations, residuals: r.residuals, maxFactor };
 }

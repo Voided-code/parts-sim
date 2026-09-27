@@ -1,30 +1,38 @@
-// WebGPU version of the multigrid-preconditioned conjugate-gradient solve in solver.js.
+// WebGPU version of the multigrid-preconditioned conjugate-gradient solve in solver.js (the native
+// app's GPU solver, same shader).
 //
-// The multigrid hierarchy (Galerkin coarse operators, smoothing weights, held DOFs) is built
-// once on the CPU by VoxelFEA and uploaded; the whole CG loop then runs on the GPU:
-//   - matrix-free K*x with one thread per grid node, gathering from its 8 surrounding voxels
-//     (no atomics needed),
-//   - V-cycle: damped Jacobi smoothing, full-weighting restriction, trilinear prolongation,
-//     and a dense inverse on the (small) coarsest level,
+// The multigrid hierarchy (Galerkin coarse operators, smoother eigenvalue ranges, held DOFs) is
+// built once on the CPU by VoxelFEA and uploaded; the CG loop then runs on the GPU in 32-bit:
+//   - matrix-free K*x with one thread per grid node, gathering from its 8 surrounding voxels from a
+//     3x3x3 block of neighbour differences (accurate in float32 for smooth fields), with the
+//     assembled 27-point stencil inside uniform regions,
+//   - V-cycle: degree-2 Chebyshev smoothing fused into the products, full-weighting restriction,
+//     trilinear prolongation and a dense inverse on the (small) coarsest level,
 //   - dot products by workgroup reduction, with the CG scalars kept on the GPU.
-// The GPU computes in 32-bit floats, so the GPU solve is used as the preconditioner of an
-// outer flexible CG in 64 bits on the CPU, which reaches the same accuracy as solver.js.
-import { HEX_NODES } from './hex8.js';
-
+// 64-bit accuracy comes from reliable updates: whenever the GPU's residual has dropped tenfold, its
+// solution is added to a float64 one on the CPU and the true residual f - K u, computed there,
+// replaces the GPU's.
 const WG = 64;
 const RED_GROUPS = 1024;
-const SMOOTH_SWEEPS = 2; // same as solver.js
 export const GPU_COARSEST_DOF = 300;
 
-// scalar slots on the GPU
-const RZ = 0, PQ = 1, RR = 4, RZN = 5, BB = 6;
+// scalar slots on the GPU (0 = rz, 3 = beta)
+const PQ = 1, ALPHA = 2, RR = 4, RZN = 5, ZQ = 7;
 
 const SHADER = /* wgsl */ `
+// Multigrid V-cycle (degree-2 Chebyshev smoothing) and float32 conjugate gradients for the voxel
+// FEA on the GPU. Workgroup size 64.
+//
+// Matrix products gather, for each node, the rows of its 8 surrounding voxels from a 3x3x3 block of
+// neighbour values loaded once. Each voxel is one word: 0 = empty, > 0 = the f32 bits of s for an
+// s * K0 element, < 0 = sign bit | index of its own 24x24 matrix in Ke (coarse levels). A node whose
+// 8 voxels are the same s * K0 uses the assembled 27-point stencil (243 multiply-adds, not 576).
+
 struct Level {
   nx: u32, ny: u32, nz: u32, NX: u32,
   NY: u32, NZ: u32, nNodes: u32, nDof: u32,
-  sharedK: u32, strideN: u32, strideD: u32, m: u32,
-  omega: f32, p1: f32, p2: f32, p3: f32,
+  p0: u32, strideN: u32, strideD: u32, m: u32,
+  first: f32, c1: f32, c2: f32, p3: f32,     // Chebyshev smoother coefficients
   CNX: u32, CNY: u32, CNZ: u32, cNodes: u32,
   cStrideN: u32, hasDiag: u32, p5: u32, p6: u32,
 };
@@ -34,9 +42,9 @@ struct Red { slot: u32, count: u32, q0: u32, q1: u32 };
 @group(0) @binding(1) var<storage, read> vin: array<f32>;
 @group(0) @binding(2) var<storage, read_write> vout: array<f32>;
 @group(0) @binding(3) var<storage, read> invD: array<f32>;
-@group(0) @binding(4) var<storage, read> emap: array<i32>;
-@group(0) @binding(5) var<storage, read> edata: array<f32>;
-@group(0) @binding(6) var<storage, read> K0: array<f32>;
+@group(0) @binding(4) var<storage, read> ew: array<i32>;          // voxel words (coarsest: free DOF list)
+@group(0) @binding(5) var<storage, read> Ke: array<vec4<f32>>;    // element matrices, 144 vec4 each
+@group(0) @binding(6) var<uniform> K0: array<vec4<f32>, 144>;     // unit element, rows as 6 vec4
 @group(0) @binding(7) var<storage, read> rhs: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vout2: array<f32>;
 @group(0) @binding(9) var<storage, read> vin2: array<f32>;
@@ -44,95 +52,194 @@ struct Red { slot: u32, count: u32, q0: u32, q1: u32 };
 @group(0) @binding(11) var<storage, read_write> partials: array<f32>;
 @group(0) @binding(12) var<uniform> R: Red;
 @group(0) @binding(13) var<storage, read> dadd: array<f32>;
+@group(0) @binding(14) var<uniform> ST: array<vec4<f32>, 81>;     // stencil: neighbour m, row d -> ST[3m + d].xyz
+@group(0) @binding(15) var<storage, read> ainv: array<f32>;       // coarsest: dense inverse (symmetric)
 
-var<private> OFF: array<vec3<u32>, 8> = array<vec3<u32>, 8>(
-  ${HEX_NODES.map(([x, y, z]) => `vec3<u32>(${x}u, ${y}u, ${z}u)`).join(', ')});
-
-fn corner(x: u32, y: u32, z: u32) -> u32 {
-  let c = select(select(0u, 1u, x == 1u), select(3u, 2u, x == 1u), y == 1u);
-  return c + 4u * z;
+fn nodeU(i: i32, j: i32, k: i32) -> vec3<f32> {
+  let x = u32(clamp(i, 0, i32(L.NX) - 1));
+  let y = u32(clamp(j, 0, i32(L.NY) - 1));
+  let z = u32(clamp(k, 0, i32(L.NZ) - 1));
+  let m = 3u * (x + L.NX * (y + L.NY * z));
+  return vec3<f32>(vin[m], vin[m + 1u], vin[m + 2u]);
 }
 
-@compute @workgroup_size(${WG})
+fn word(i: i32, j: i32, k: i32) -> i32 {
+  if (i < 0 || j < 0 || k < 0 || i >= i32(L.nx) || j >= i32(L.ny) || k >= i32(L.nz)) { return 0; }
+  return ew[u32(i) + L.nx * (u32(j) + L.ny * u32(k))];
+}
+
+// the three rows of corner a (from vec4 index r = 18a) of a voxel's matrix times its corner values
+fn rows(w: i32, r: u32, v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>, v5: vec4<f32>) -> vec3<f32> {
+  if (w > 0) {
+    return bitcast<f32>(w) * vec3<f32>(
+      dot(K0[r + 0u], v0) + dot(K0[r + 1u], v1) + dot(K0[r + 2u], v2) + dot(K0[r + 3u], v3) + dot(K0[r + 4u], v4) + dot(K0[r + 5u], v5),
+      dot(K0[r + 6u], v0) + dot(K0[r + 7u], v1) + dot(K0[r + 8u], v2) + dot(K0[r + 9u], v3) + dot(K0[r + 10u], v4) + dot(K0[r + 11u], v5),
+      dot(K0[r + 12u], v0) + dot(K0[r + 13u], v1) + dot(K0[r + 14u], v2) + dot(K0[r + 15u], v3) + dot(K0[r + 16u], v4) + dot(K0[r + 17u], v5));
+  }
+  let b = u32(w & 0x7fffffff) * 144u + r;
+  return vec3<f32>(
+      dot(Ke[b + 0u], v0) + dot(Ke[b + 1u], v1) + dot(Ke[b + 2u], v2) + dot(Ke[b + 3u], v3) + dot(Ke[b + 4u], v4) + dot(Ke[b + 5u], v5),
+      dot(Ke[b + 6u], v0) + dot(Ke[b + 7u], v1) + dot(Ke[b + 8u], v2) + dot(Ke[b + 9u], v3) + dot(Ke[b + 10u], v4) + dot(Ke[b + 11u], v5),
+      dot(Ke[b + 12u], v0) + dot(Ke[b + 13u], v1) + dot(Ke[b + 14u], v2) + dot(Ke[b + 15u], v3) + dot(Ke[b + 16u], v4) + dot(Ke[b + 17u], v5));
+}
+
+fn elem(w: i32, a: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, p4: vec3<f32>, p5: vec3<f32>, p6: vec3<f32>, p7: vec3<f32>) -> vec3<f32> {
+  if (w == 0) { return vec3<f32>(0.0); }
+  return rows(w, 18u * a, vec4<f32>(p0, p1.x), vec4<f32>(p1.yz, p2.xy), vec4<f32>(p2.z, p3), vec4<f32>(p4, p5.x), vec4<f32>(p5.yz, p6.xy),
+              vec4<f32>(p6.z, p7));
+}
+
+fn st(m: u32, u: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(dot(ST[3u * m].xyz, u), dot(ST[3u * m + 1u].xyz, u), dot(ST[3u * m + 2u].xyz, u));
+}
+
+// (K u) at node n, from neighbour differences u_m - u_n (K annihilates translations): for smooth
+// fields they are small and exact, which keeps float32 products accurate to many more digits
+fn applyK(n: u32) -> vec3<f32> {
+  let i = i32(n % L.NX);
+  let j = i32((n / L.NX) % L.NY);
+  let k = i32(n / (L.NX * L.NY));
+  let w0 = word(i + -1, j + -1, k + -1);
+  let w1 = word(i + 0, j + -1, k + -1);
+  let w2 = word(i + -1, j + 0, k + -1);
+  let w3 = word(i + 0, j + 0, k + -1);
+  let w4 = word(i + -1, j + -1, k + 0);
+  let w5 = word(i + 0, j + -1, k + 0);
+  let w6 = word(i + -1, j + 0, k + 0);
+  let w7 = word(i + 0, j + 0, k + 0);
+  let own = nodeU(i + 0, j + 0, k + 0);
+  let u13 = vec3<f32>(0.0);
+  let u0 = nodeU(i + -1, j + -1, k + -1) - own;
+  let u1 = nodeU(i + 0, j + -1, k + -1) - own;
+  let u2 = nodeU(i + 1, j + -1, k + -1) - own;
+  let u3 = nodeU(i + -1, j + 0, k + -1) - own;
+  let u4 = nodeU(i + 0, j + 0, k + -1) - own;
+  let u5 = nodeU(i + 1, j + 0, k + -1) - own;
+  let u6 = nodeU(i + -1, j + 1, k + -1) - own;
+  let u7 = nodeU(i + 0, j + 1, k + -1) - own;
+  let u8 = nodeU(i + 1, j + 1, k + -1) - own;
+  let u9 = nodeU(i + -1, j + -1, k + 0) - own;
+  let u10 = nodeU(i + 0, j + -1, k + 0) - own;
+  let u11 = nodeU(i + 1, j + -1, k + 0) - own;
+  let u12 = nodeU(i + -1, j + 0, k + 0) - own;
+  let u14 = nodeU(i + 1, j + 0, k + 0) - own;
+  let u15 = nodeU(i + -1, j + 1, k + 0) - own;
+  let u16 = nodeU(i + 0, j + 1, k + 0) - own;
+  let u17 = nodeU(i + 1, j + 1, k + 0) - own;
+  let u18 = nodeU(i + -1, j + -1, k + 1) - own;
+  let u19 = nodeU(i + 0, j + -1, k + 1) - own;
+  let u20 = nodeU(i + 1, j + -1, k + 1) - own;
+  let u21 = nodeU(i + -1, j + 0, k + 1) - own;
+  let u22 = nodeU(i + 0, j + 0, k + 1) - own;
+  let u23 = nodeU(i + 1, j + 0, k + 1) - own;
+  let u24 = nodeU(i + -1, j + 1, k + 1) - own;
+  let u25 = nodeU(i + 0, j + 1, k + 1) - own;
+  let u26 = nodeU(i + 1, j + 1, k + 1) - own;
+  var acc: vec3<f32>;
+  if (w0 > 0 && w1 == w0 && w2 == w0 && w3 == w0 && w4 == w0 && w5 == w0 && w6 == w0 && w7 == w0) {
+    acc = bitcast<f32>(w0) * (
+      st(0u, u0) + st(1u, u1) + st(2u, u2) + st(3u, u3) + st(4u, u4) +
+      st(5u, u5) + st(6u, u6) + st(7u, u7) + st(8u, u8) + st(9u, u9) +
+      st(10u, u10) + st(11u, u11) + st(12u, u12) + st(14u, u14) +
+      st(15u, u15) + st(16u, u16) + st(17u, u17) + st(18u, u18) + st(19u, u19) +
+      st(20u, u20) + st(21u, u21) + st(22u, u22) + st(23u, u23) + st(24u, u24) +
+      st(25u, u25) + st(26u, u26));
+  } else {
+    acc = elem(w0, 6u, u0, u1, u4, u3, u9, u10, u13, u12) +
+          elem(w1, 7u, u1, u2, u5, u4, u10, u11, u14, u13) +
+          elem(w2, 5u, u3, u4, u7, u6, u12, u13, u16, u15) +
+          elem(w3, 4u, u4, u5, u8, u7, u13, u14, u17, u16) +
+          elem(w4, 2u, u9, u10, u13, u12, u18, u19, u22, u21) +
+          elem(w5, 3u, u10, u11, u14, u13, u19, u20, u23, u22) +
+          elem(w6, 1u, u12, u13, u16, u15, u21, u22, u25, u24) +
+          elem(w7, 0u, u13, u14, u17, u16, u22, u23, u26, u25);
+  }
+  if (L.hasDiag == 1u) { acc += vec3<f32>(dadd[3u * n], dadd[3u * n + 1u], dadd[3u * n + 2u]) * own; }
+  return acc;
+}
+
+fn freeOf(n: u32) -> vec3<f32> { return vec3<f32>(invD[3u * n], invD[3u * n + 1u], invD[3u * n + 2u]); }
+
+fn put(n: u32, y: vec3<f32>) {
+  vout[3u * n] = y.x;
+  vout[3u * n + 1u] = y.y;
+  vout[3u * n + 2u] = y.z;
+}
+
+// vout = K vin (held DOFs zero)
+@compute @workgroup_size(64)
 fn matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x + gid.y * L.strideN;
   if (n >= L.nNodes) { return; }
-  let NX = L.NX; let NY = L.NY;
-  let i = n % NX; let j = (n / NX) % NY; let k = n / (NX * NY);
-  let free = vec3<f32>(invD[3u * n], invD[3u * n + 1u], invD[3u * n + 2u]);
-  var acc = vec3<f32>(0.0);
-  if (any(free != vec3<f32>(0.0))) {
-    for (var dk = 0u; dk < 2u; dk++) {
-      if (k + dk < 1u || k + dk > L.nz) { continue; }
-      let ek = k + dk - 1u;
-      for (var dj = 0u; dj < 2u; dj++) {
-        if (j + dj < 1u || j + dj > L.ny) { continue; }
-        let ej = j + dj - 1u;
-        for (var di = 0u; di < 2u; di++) {
-          if (i + di < 1u || i + di > L.nx) { continue; }
-          let ei = i + di - 1u;
-          let e = emap[ei + L.nx * (ej + L.ny * ek)];
-          if (e < 0) { continue; }
-          let a = corner(1u - di, 1u - dj, 1u - dk);
-          let nb = ei + NX * (ej + NY * ek);
-          var ue: array<f32, 24>;
-          for (var c = 0u; c < 8u; c++) {
-            let o = OFF[c];
-            let m = 3u * (nb + o.x + NX * (o.y + NY * o.z));
-            ue[3u * c] = vin[m];
-            ue[3u * c + 1u] = vin[m + 1u];
-            ue[3u * c + 2u] = vin[m + 2u];
-          }
-          if (L.sharedK == 1u) {
-            let s = edata[u32(e)];
-            for (var d = 0u; d < 3u; d++) {
-              let row = (3u * a + d) * 24u;
-              var sum = 0.0;
-              for (var c = 0u; c < 24u; c++) { sum += K0[row + c] * ue[c]; }
-              acc[d] += s * sum;
-            }
-          } else {
-            let base = u32(e) * 576u;
-            for (var d = 0u; d < 3u; d++) {
-              let row = base + (3u * a + d) * 24u;
-              var sum = 0.0;
-              for (var c = 0u; c < 24u; c++) { sum += edata[row + c] * ue[c]; }
-              acc[d] += sum;
-            }
-          }
-        }
-      }
-    }
+  let d = freeOf(n);
+  var y = vec3<f32>(0.0);
+  if (any(d != vec3<f32>(0.0))) { y = select(vec3<f32>(0.0), applyK(n), d != vec3<f32>(0.0)); }
+  put(n, y);
+}
+
+// Chebyshev smoother step into a second buffer: d = c1 d + c2 D^-1 (rhs - K vin), vout = vin + d
+// (d, per DOF, is updated in place in vout2)
+fn chebStep(n: u32, c1: f32, c2: f32) {
+  let dI = freeOf(n);
+  let q = 3u * n;
+  var z = vec3<f32>(0.0);
+  var d = vec3<f32>(0.0);
+  if (any(dI != vec3<f32>(0.0))) {
+    let zo = vec3<f32>(vin[q], vin[q + 1u], vin[q + 2u]);
+    let r = vec3<f32>(rhs[q], rhs[q + 1u], rhs[q + 2u]);
+    let dOld = vec3<f32>(vout2[q], vout2[q + 1u], vout2[q + 2u]);
+    d = select(vec3<f32>(0.0), c1 * dOld + c2 * dI * (r - applyK(n)), dI != vec3<f32>(0.0));
+    z = zo + d;
   }
-  if (L.hasDiag == 1u) {
-    for (var d = 0u; d < 3u; d++) { acc[d] += dadd[3u * n + d] * vin[3u * n + d]; }
-  }
-  for (var d = 0u; d < 3u; d++) { vout[3u * n + d] = select(0.0, acc[d], free[d] != 0.0); }
+  put(n, z);
+  vout2[q] = d.x;
+  vout2[q + 1u] = d.y;
+  vout2[q + 2u] = d.z;
 }
 
-@compute @workgroup_size(${WG})
-fn jacobi_first(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let q = gid.x + gid.y * L.strideD;
-  if (q >= L.nDof) { return; }
-  vout[q] = L.omega * invD[q] * rhs[q];
+// first step from a nonzero vin
+@compute @workgroup_size(64)
+fn cheb_a(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x + gid.y * L.strideN;
+  if (n >= L.nNodes) { return; }
+  chebStep(n, 0.0, L.first);
 }
 
-@compute @workgroup_size(${WG})
-fn jacobi(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let q = gid.x + gid.y * L.strideD;
-  if (q >= L.nDof) { return; }
-  vout[q] = vout[q] + L.omega * invD[q] * (rhs[q] - vin[q]);
+// second step
+@compute @workgroup_size(64)
+fn cheb_b(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x + gid.y * L.strideN;
+  if (n >= L.nNodes) { return; }
+  chebStep(n, L.c1, L.c2);
 }
 
-@compute @workgroup_size(${WG})
+// vout = rhs - K vin (held DOFs zero)
+@compute @workgroup_size(64)
 fn resid(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x + gid.y * L.strideN;
+  if (n >= L.nNodes) { return; }
+  let d = freeOf(n);
+  var y = vec3<f32>(0.0);
+  if (any(d != vec3<f32>(0.0))) {
+    let q = 3u * n;
+    let r = vec3<f32>(rhs[q], rhs[q + 1u], rhs[q + 2u]);
+    y = select(vec3<f32>(0.0), r - applyK(n), d != vec3<f32>(0.0));
+  }
+  put(n, y);
+}
+
+// first step from zero: vout = d = first D^-1 rhs
+@compute @workgroup_size(64)
+fn cheb_first(@builtin(global_invocation_id) gid: vec3<u32>) {
   let q = gid.x + gid.y * L.strideD;
   if (q >= L.nDof) { return; }
-  vout[q] = select(0.0, rhs[q] - vout[q], invD[q] != 0.0);
+  let d = L.first * invD[q] * rhs[q];
+  vout[q] = d;
+  vout2[q] = d;
 }
 
 // coarse r = P^T fine t, one thread per coarse node (invD is the coarse level's)
-@compute @workgroup_size(${WG})
+@compute @workgroup_size(64)
 fn restrict_(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cn = gid.x + gid.y * L.cStrideN;
   if (cn >= L.cNodes) { return; }
@@ -159,7 +266,7 @@ fn restrict_(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // fine z += P coarse z, one thread per fine node (invD is the fine level's)
-@compute @workgroup_size(${WG})
+@compute @workgroup_size(64)
 fn prolong(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x + gid.y * L.strideN;
   if (n >= L.nNodes) { return; }
@@ -186,32 +293,77 @@ fn prolong(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 
-// coarsest level: z = A^-1 r over the free DOFs (emap = free DOF list, edata = dense inverse)
-@compute @workgroup_size(${WG})
-fn coarsest(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let row = gid.x + gid.y * L.strideD;
-  if (row >= L.m) { return; }
+// coarsest level: z = A^-1 r over the free DOFs (ew = free DOF list, at most 3000; ainv symmetric).
+// A workgroup takes 32 rows, 8 threads per row each summing every 8th column (neighbouring threads
+// read neighbouring words of a column), then adds up the 8 parts. r is gathered into workgroup
+// memory first.
+var<workgroup> cr: array<f32, 3000>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn coarsest(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  for (var c = lid.x; c < L.m; c += 256u) { cr[c] = vin[u32(ew[c])]; }
+  workgroupBarrier();
+  let row = wid.x * 32u + lid.x % 32u;
+  let k = lid.x / 32u;
   var s = 0.0;
-  for (var c = 0u; c < L.m; c++) { s += edata[row * L.m + c] * vin[u32(emap[c])]; }
-  vout[u32(emap[row])] = s;
+  if (row < L.m) {
+    for (var c = k; c < L.m; c += 8u) { s += ainv[c * L.m + row] * cr[c]; }
+  }
+  part[lid.x] = s;
+  workgroupBarrier();
+  if (lid.x < 32u && row < L.m) {
+    var t = 0.0;
+    for (var q = 0u; q < 8u; q++) { t += part[lid.x + 32u * q]; }
+    vout[u32(ew[row])] = t;
+  }
 }
 
-@compute @workgroup_size(${WG})
-fn copy(@builtin(global_invocation_id) gid: vec3<u32>) {
+// Lanczos steps on D^-1/2 K D^-1/2 for the smoother's eigenvalue estimate (per DOF of one level):
+// x = D^-1/2 v; w = K x; w = D^-1/2 w - beta vPrev; alpha = w.v; w -= alpha v; beta^2 = w.w;
+// vPrev = v; v = w / beta. S[8] = alpha, S[9] = beta^2, S[10] = the previous beta^2, S[11] = step;
+// step j keeps alpha in S[16 + j] and beta^2 in S[32 + j].
+@compute @workgroup_size(64)
+fn lz_x(@builtin(global_invocation_id) gid: vec3<u32>) {
   let q = gid.x + gid.y * L.strideD;
   if (q >= L.nDof) { return; }
-  vout[q] = vin[q];
+  vout[q] = sqrt(invD[q]) * vin[q];
 }
 
-@compute @workgroup_size(${WG})
-fn init_r(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(64)
+fn lz_w(@builtin(global_invocation_id) gid: vec3<u32>) {
   let q = gid.x + gid.y * L.strideD;
   if (q >= L.nDof) { return; }
-  vout[q] = select(0.0, rhs[q] - vin[q], invD[q] != 0.0);
+  vout[q] = sqrt(invD[q]) * vout[q] - sqrt(max(S[10], 0.0)) * vin[q];
+}
+
+@compute @workgroup_size(64)
+fn lz_axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let q = gid.x + gid.y * L.strideD;
+  if (q >= L.nDof) { return; }
+  vout[q] = vout[q] - S[8] * vin[q];
+}
+
+@compute @workgroup_size(64)
+fn lz_next(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let q = gid.x + gid.y * L.strideD;
+  if (q >= L.nDof) { return; }
+  let b = sqrt(max(S[9], 0.0));
+  vout2[q] = vout[q];
+  vout[q] = select(0.0, vin[q] / b, b > 0.0);
+}
+
+@compute @workgroup_size(1)
+fn lz_store() {
+  let j = u32(S[11]);
+  S[16u + j] = S[8];
+  S[32u + j] = S[9];
+  S[10] = S[9];
+  S[11] = S[11] + 1.0;
 }
 
 // x += alpha p ; r -= alpha q
-@compute @workgroup_size(${WG})
+@compute @workgroup_size(64)
 fn update_xr(@builtin(global_invocation_id) gid: vec3<u32>) {
   let q = gid.x + gid.y * L.strideD;
   if (q >= L.nDof) { return; }
@@ -221,7 +373,7 @@ fn update_xr(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // p = z + beta p
-@compute @workgroup_size(${WG})
+@compute @workgroup_size(64)
 fn update_p(@builtin(global_invocation_id) gid: vec3<u32>) {
   let q = gid.x + gid.y * L.strideD;
   if (q >= L.nDof) { return; }
@@ -261,9 +413,10 @@ fn reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
 @compute @workgroup_size(1)
 fn cg_alpha() { S[2] = select(0.0, S[0] / S[1], S[1] > 0.0); }
 
+// flexible (Polak-Ribiere) beta = z.(r - r_old) / rz_old with r - r_old = -alpha q
 @compute @workgroup_size(1)
 fn cg_beta() {
-  S[3] = select(0.0, S[5] / S[0], S[0] != 0.0);
+  S[3] = select(0.0, max(0.0, -S[2] * S[7] / S[0]), S[0] != 0.0);
   S[0] = S[5];
 }
 `;
@@ -306,26 +459,46 @@ function coarseInverse(coarse) {
   for (let col = 0; col < m; col++) {
     y.fill(0);
     y[col] = 1;
-    for (let i = 0; i < m; i++) {
+    for (let i = col; i < m; i++) {
       const ri = i * m;
       let s = y[i];
-      for (let k = 0; k < i; k++) s -= Lf[ri + k] * y[k];
+      for (let k = col; k < i; k++) s -= Lf[ri + k] * y[k];
       y[i] = s / Lf[ri + i];
     }
+    // backward by column sweeps, reading rows of L
     for (let i = m - 1; i >= 0; i--) {
-      let s = y[i];
-      for (let k = i + 1; k < m; k++) s -= Lf[k * m + i] * y[k];
-      y[i] = s / Lf[i * m + i];
+      const ri = i * m, xi = y[i] / Lf[ri + i];
+      y[i] = xi;
+      for (let k = 0; k < i; k++) y[k] -= Lf[ri + k] * xi;
     }
     for (let i = 0; i < m; i++) inv[i * m + col] = y[i];
   }
   return inv;
 }
 
-export class GPUFEASolver {
-  /** Relative accuracy asked of each float32 GPU solve inside the float64 outer iteration. */
-  static innerTol = 0.1;
+// compiled once per device: every study builds a new solver
+const pipelineCache = new WeakMap();
+function pipelines(device) {
+  if (!pipelineCache.has(device)) {
+    const module = device.createShaderModule({ code: SHADER });
+    const pipe = (entryPoint) => device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } });
+    pipelineCache.set(device, Object.fromEntries(
+      ['matvec', 'cheb_first', 'cheb_a', 'cheb_b', 'resid', 'restrict_', 'prolong', 'coarsest', 'update_xr', 'update_p', 'dot_partial', 'reduce', 'cg_alpha', 'cg_beta']
+        .map((e) => [e, pipe(e)]),
+    ));
+  }
+  return pipelineCache.get(device);
+}
 
+/** Degree-2 Chebyshev coefficients over [0.1, 1.15] * lmax (as solver.js). */
+function chebyshev(lmax) {
+  const b = 1.15 * lmax, a = 0.1 * lmax;
+  const theta = (b + a) / 2, delta = (b - a) / 2, sigma = theta / delta;
+  const rho0 = 1 / sigma, rho1 = 1 / (2 * sigma - rho0);
+  return [1 / theta, rho1 * rho0, (2 * rho1) / delta];
+}
+
+export class GPUFEASolver {
   /** @param {import('./solver.js').VoxelFEA} fea built with coarsestMaxDof <= GPU_COARSEST_DOF */
   static async create(fea) {
     const device = await gpuDevice();
@@ -364,18 +537,20 @@ export class GPUFEASolver {
       device.queue.writeBuffer(b, 0, arr.buffer, arr.byteOffset, arr.byteLength);
       return b;
     };
-    this.module = device.createShaderModule({ code: SHADER });
-    const pipe = (entryPoint) => device.createComputePipeline({ layout: 'auto', compute: { module: this.module, entryPoint } });
-    this.p = Object.fromEntries(
-      ['matvec', 'jacobi_first', 'jacobi', 'resid', 'restrict_', 'prolong', 'coarsest', 'copy', 'init_r', 'update_xr', 'update_p', 'dot_partial', 'reduce', 'cg_alpha', 'cg_beta']
-        .map((e) => [e, pipe(e)]),
-    );
-    const K0 = upload(Float32Array.from(fea.K0));
+    const U = GPUBufferUsage.UNIFORM | D;
+    this.p = pipelines(device);
+    const bits = new Int32Array(1), bitsF = new Float32Array(bits.buffer);
 
     this.L = levels.map((lv, l) => {
-      const nx = lv.nx, ny = lv.ny, nz = lv.nz;
-      const emap = new Int32Array(nx * ny * nz).fill(-1);
-      for (let q = 0; q < lv.elems.length; q++) emap[lv.elems[q]] = q;
+      const { nx, ny, nz } = lv;
+      // one word per voxel: 0 empty, f32 bits of s for s * Kb, sign bit | element index otherwise
+      const words = new Int32Array(nx * ny * nz);
+      for (let e = 0; e < lv.elems.length; e++) {
+        if (lv.scale[e] > 0) {
+          bitsF[0] = lv.scale[e];
+          words[lv.elems[e]] = bits[0];
+        } else words[lv.elems[e]] = (0x80000000 | e) | 0;
+      }
       const invD = new Float32Array(lv.nDof);
       for (let i = 0; i < lv.nDof; i++) invD[i] = lv.fixed[i] ? 0 : lv.invDiag[i];
       const last = l === levels.length - 1;
@@ -385,19 +560,31 @@ export class GPUFEASolver {
       const [, , cStrideN] = next ? dispatchSize(next.nNodes, device) : [0, 0, 0];
       const params = new ArrayBuffer(96);
       const u = new Uint32Array(params), f = new Float32Array(params);
-      u.set([nx, ny, nz, lv.NX, lv.NY, lv.NZ, lv.nNodes, lv.nDof, lv.K ? 0 : 1, strideN, strideD, last ? coarse.m : 0]);
-      f[12] = lv.omega;
+      u.set([nx, ny, nz, lv.NX, lv.NY, lv.NZ, lv.nNodes, lv.nDof, 0, strideN, strideD, last ? coarse.m : 0]);
+      if (!last) f.set(chebyshev(lv.lmax), 12);
       if (next) u.set([next.NX, next.NY, next.NZ, next.nNodes, cStrideN], 16);
       u[21] = lv.diagAdd ? 1 : 0;
+      // the level's uniform element (rows as 6 vec4) and its 27-point stencil: neighbour
+      // m = ox + 3 oy + 9 oz, row d -> [3m + d].xyz (from solver.js's layout [(row 3 + d) 9 + 3 ox + c])
+      const st = new Float32Array(81 * 4);
+      for (let row = 0; row < 9; row++) {
+        for (let col = 0; col < 9; col++) {
+          const m = ((col / 3) | 0) + 3 * row, c = col % 3;
+          for (let d = 0; d < 3; d++) st[(3 * m + d) * 4 + c] = lv.S[(row * 3 + d) * 9 + col];
+        }
+      }
       const L = {
-        lv, last,
-        params: upload(new Uint8Array(params), GPUBufferUsage.UNIFORM | D),
+        lv, last, out: last ? 0 : 1,
+        params: upload(new Uint8Array(params), U),
         invD: upload(invD),
-        emap: upload(emap),
-        edata: upload(lv.K ? Float32Array.from(lv.K) : Float32Array.from(lv.rho)),
+        words: upload(words),
+        Ke: upload(lv.K ? Float32Array.from(lv.K) : new Float32Array(4)),
+        K0: upload(Float32Array.from(lv.Kb), U),
+        stencil: upload(st, U),
         dadd: upload(lv.diagAdd ? Float32Array.from(lv.diagAdd) : new Float32Array(4)),
-        r: make(4 * lv.nDof), z: make(4 * lv.nDof), t: make(4 * lv.nDof),
+        r: make(4 * lv.nDof), z: make(4 * lv.nDof), t: make(4 * lv.nDof), d: make(4 * lv.nDof),
       };
+      L.buf = (p) => (p ? L.t : L.z);
       if (last) {
         const free = new Int32Array(coarse.m);
         for (let i = 0; i < lv.nDof; i++) if (coarse.map[i] >= 0) free[coarse.map[i]] = i;
@@ -410,20 +597,20 @@ export class GPUFEASolver {
     const n = levels[0].nDof;
     this.n = n;
     this.x = make(4 * n);
-    this.b = make(4 * n);
     this.pv = make(4 * n);
     this.qv = make(4 * n);
-    this.S = make(64);
+    this.S = make(256);
     this.partials = make(4 * RED_GROUPS);
+    this.dotGroups = Math.min(RED_GROUPS, Math.ceil(n / 256));
     // reduction slots, one 256-byte-aligned entry per scalar
-    const red = new Uint32Array(64 * 8);
-    for (let s = 0; s < 8; s++) red.set([s, 0], s * 64);
-    this.red = upload(red, GPUBufferUsage.UNIFORM | D);
-    this.readBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | D });
+    const red = new Uint32Array(64 * 10);
+    for (let s = 0; s < 10; s++) red.set([s, this.dotGroups], s * 64);
+    this.red = upload(red, U);
+    this.readBuf = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | D });
     this.xRead = device.createBuffer({ size: 4 * n, usage: GPUBufferUsage.MAP_READ | D });
     this.buffers.push(this.readBuf, this.xRead);
 
-    // bind groups
+    // bind groups: [p] reads buffer p (0 = z, 1 = t) and writes the other
     const bg = (pipeline, entries) => device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: Object.entries(entries).map(([binding, res]) =>
@@ -432,35 +619,33 @@ export class GPUFEASolver {
     const P = this.p;
     this.L.forEach((L, l) => {
       const N = this.L[l + 1];
+      const op = (pipeline, from, to, withD) => bg(pipeline, {
+        0: L.params, 1: from, 2: to, 3: L.invD, 4: L.words, 5: L.Ke, 6: L.K0, 7: L.r, 13: L.dadd, 14: L.stencil, ...(withD ? { 8: L.d } : {}),
+      });
       L.bg = {
-        mvZT: bg(P.matvec, { 0: L.params, 1: L.z, 2: L.t, 3: L.invD, 4: L.emap, 5: L.edata, 6: K0, 13: L.dadd }),
-        smoothFirst: bg(P.jacobi_first, { 0: L.params, 2: L.z, 3: L.invD, 7: L.r }),
-        smooth: bg(P.jacobi, { 0: L.params, 1: L.t, 2: L.z, 3: L.invD, 7: L.r }),
-        resid: bg(P.resid, { 0: L.params, 2: L.t, 3: L.invD, 7: L.r }),
+        first: bg(P.cheb_first, { 0: L.params, 2: L.z, 3: L.invD, 7: L.r, 8: L.d }),
+        chebA: [0, 1].map((p) => op(P.cheb_a, L.buf(p), L.buf(1 - p), true)),
+        chebB: [0, 1].map((p) => op(P.cheb_b, L.buf(p), L.buf(1 - p), true)),
+        resid: [0, 1].map((p) => op(P.resid, L.buf(p), L.buf(1 - p), false)),
       };
       if (N) {
-        L.bg.restrict = bg(P.restrict_, { 0: L.params, 1: L.t, 2: N.r, 3: N.invD });
-        L.bg.prolong = bg(P.prolong, { 0: L.params, 1: N.z, 2: L.z, 3: L.invD });
+        L.bg.restrict = [0, 1].map((p) => bg(P.restrict_, { 0: L.params, 1: L.buf(p), 2: N.r, 3: N.invD }));
+        L.bg.prolong = [0, 1].map((p) => bg(P.prolong, { 0: L.params, 1: N.buf(N.out), 2: L.buf(p), 3: L.invD }));
+      } else {
+        L.bg.coarsest = bg(P.coarsest, { 0: L.params, 1: L.r, 2: L.z, 4: L.free, 15: L.ainv });
       }
-      if (L.last) L.bg.coarsest = bg(P.coarsest, { 0: L.params, 1: L.r, 2: L.z, 4: L.free, 5: L.ainv });
     });
+    const z0 = L0.buf(L0.out);
     this.bg = {
-      mvP: bg(P.matvec, { 0: L0.params, 1: this.pv, 2: this.qv, 3: L0.invD, 4: L0.emap, 5: L0.edata, 6: K0, 13: L0.dadd }),
-      mvX: bg(P.matvec, { 0: L0.params, 1: this.x, 2: this.qv, 3: L0.invD, 4: L0.emap, 5: L0.edata, 6: K0, 13: L0.dadd }),
-      initR: bg(P.init_r, { 0: L0.params, 1: this.qv, 2: L0.r, 3: L0.invD, 7: this.b }),
-      copyZP: bg(P.copy, { 0: L0.params, 1: L0.z, 2: this.pv }),
+      mvP: bg(P.matvec, { 0: L0.params, 1: this.pv, 2: this.qv, 3: L0.invD, 4: L0.words, 5: L0.Ke, 6: L0.K0, 13: L0.dadd, 14: L0.stencil }),
       updXR: bg(P.update_xr, { 0: L0.params, 1: this.pv, 2: this.x, 8: L0.r, 9: this.qv, 10: this.S }),
-      updP: bg(P.update_p, { 0: L0.params, 1: L0.z, 2: this.pv, 10: this.S }),
+      updP: bg(P.update_p, { 0: L0.params, 1: z0, 2: this.pv, 10: this.S }),
       alpha: bg(P.cg_alpha, { 10: this.S }),
       beta: bg(P.cg_beta, { 10: this.S }),
       // one bind group per scalar slot (auto layouts cannot take dynamic offsets)
-      reduce: Array.from({ length: 8 }, (_, slot) => bg(P.reduce, { 10: this.S, 11: this.partials, 12: { buffer: this.red, offset: slot * 256, size: 16 } })),
+      reduce: Array.from({ length: 10 }, (_, slot) => bg(P.reduce, { 10: this.S, 11: this.partials, 12: { buffer: this.red, offset: slot * 256, size: 16 } })),
     };
     this.dotBG = new Map();
-    this.dotGroups = Math.min(RED_GROUPS, Math.ceil(n / 256));
-    const counts = new Uint32Array(64 * 8);
-    for (let s = 0; s < 8; s++) counts.set([s, this.dotGroups], s * 64);
-    device.queue.writeBuffer(this.red, 0, counts);
   }
 
   dotBindGroup(a, b) {
@@ -495,101 +680,135 @@ export class GPUFEASolver {
     pass.dispatchWorkgroups(1);
   }
 
+  /** V-cycle as in solver.js: Chebyshev pre-smoothing from zero, coarse correction, post-smoothing. */
   vcycle(pass, l) {
-    const L = this.L[l], lv = L.lv;
+    const L = this.L[l], P = this.p;
     if (L.last) {
-      this.run(pass, this.p.coarsest, L.bg.coarsest, this.fea.coarse.m);
+      pass.setPipeline(P.coarsest);
+      pass.setBindGroup(0, L.bg.coarsest);
+      pass.dispatchWorkgroups(Math.ceil(this.fea.coarse.m / 32)); // 32 rows per workgroup
       return;
     }
-    const nD = lv.nDof, nN = lv.nNodes;
-    this.run(pass, this.p.jacobi_first, L.bg.smoothFirst, nD);
-    for (let s = 1; s < SMOOTH_SWEEPS; s++) {
-      this.run(pass, this.p.matvec, L.bg.mvZT, nN);
-      this.run(pass, this.p.jacobi, L.bg.smooth, nD);
-    }
-    this.run(pass, this.p.matvec, L.bg.mvZT, nN);
-    this.run(pass, this.p.resid, L.bg.resid, nD);
-    this.run(pass, this.p.restrict_, L.bg.restrict, this.L[l + 1].lv.nNodes);
+    const nD = L.lv.nDof, nN = L.lv.nNodes;
+    this.run(pass, P.cheb_first, L.bg.first, nD); //       z
+    this.run(pass, P.cheb_b, L.bg.chebB[0], nN); //        z -> t
+    this.run(pass, P.resid, L.bg.resid[1], nN); //         t -> residual in z
+    this.run(pass, P.restrict_, L.bg.restrict[0], this.L[l + 1].lv.nNodes);
     this.vcycle(pass, l + 1);
-    this.run(pass, this.p.prolong, L.bg.prolong, nN);
-    for (let s = 0; s < SMOOTH_SWEEPS; s++) {
-      this.run(pass, this.p.matvec, L.bg.mvZT, nN);
-      this.run(pass, this.p.jacobi, L.bg.smooth, nD);
-    }
+    this.run(pass, P.prolong, L.bg.prolong[1], nN); //     t += P z_coarse
+    this.run(pass, P.cheb_a, L.bg.chebA[1], nN); //        t -> z
+    this.run(pass, P.cheb_b, L.bg.chebB[0], nN); //        z -> t
   }
 
-  async readScalars() {
+  async read(buffer, staging, bytes) {
     const enc = this.device.createCommandEncoder();
-    enc.copyBufferToBuffer(this.S, 0, this.readBuf, 0, 64);
+    enc.copyBufferToBuffer(buffer, 0, staging, 0, bytes);
     this.device.queue.submit([enc.finish()]);
-    await this.readBuf.mapAsync(GPUMapMode.READ);
-    const s = new Float32Array(this.readBuf.getMappedRange().slice(0));
-    this.readBuf.unmap();
-    return s;
+    await staging.mapAsync(GPUMapMode.READ, 0, bytes);
+    const out = new Float32Array(staging.getMappedRange(0, bytes).slice(0));
+    staging.unmap();
+    return out;
   }
 
-  /** Preconditioned CG on the GPU from x = 0 for K x = rhs (float32). */
-  async pcg(rhs, { tol, maxIter, onProgress }) {
-    const dev = this.device, L0 = this.L[0], lv = L0.lv, n = this.n;
-    const b32 = new Float32Array(n);
-    for (let i = 0; i < n; i++) b32[i] = lv.fixed[i] ? 0 : rhs[i];
-    dev.queue.writeBuffer(this.b, 0, b32);
-    dev.queue.writeBuffer(this.x, 0, new Float32Array(n));
-    let enc = dev.createCommandEncoder();
-    let pass = enc.beginComputePass();
-    this.run(pass, this.p.matvec, this.bg.mvX, lv.nNodes);
-    this.run(pass, this.p.init_r, this.bg.initR, n);
+  /** dst = float32(scale * v), held DOFs zero. */
+  upload(dst, v, scale) {
+    const fixed = this.fea.levels[0].fixed, n = this.n, h = new Float32Array(n);
+    for (let i = 0; i < n; i++) h[i] = fixed[i] ? 0 : v[i] * scale;
+    this.device.queue.writeBuffer(dst, 0, h);
+  }
+
+  clear(...bufs) {
+    const enc = this.device.createCommandEncoder();
+    for (const b of bufs) enc.clearBuffer(b);
+    this.device.queue.submit([enc.finish()]);
+  }
+
+  /** One multigrid V-cycle on the GPU: z ~ K^-1 r (float64 in and out; the eigen preconditioner). */
+  async precondition(r) {
+    const fixed = this.fea.levels[0].fixed, n = this.n;
+    // the V-cycle is linear: scale r to order one so float32 neither underflows nor loses digits
+    let rmax = 0;
+    for (let i = 0; i < n; i++) if (!fixed[i]) rmax = Math.max(rmax, Math.abs(r[i]));
+    const z = new Float64Array(n);
+    if (!(rmax > 0)) return z;
+    const L0 = this.L[0];
+    this.upload(L0.r, r, 1 / rmax);
+    const enc = this.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
     this.vcycle(pass, 0);
-    this.run(pass, this.p.copy, this.bg.copyZP, n);
-    this.dot(pass, L0.r, L0.z, RZ);
-    this.dot(pass, this.b, this.b, BB);
-    this.dot(pass, L0.r, L0.r, RR);
     pass.end();
-    dev.queue.submit([enc.finish()]);
-    let s = await this.readScalars();
-    const bnorm = Math.sqrt(s[BB]);
-    if (!(bnorm > 0)) return { x: new Float64Array(n), iterations: 0, residual: 0, broke: false };
-    let res = Math.sqrt(s[RR]) / bnorm;
-    let it = 0, broke = false;
-    const CHECK = 6;
-    while (it < maxIter && res > tol) {
-      enc = dev.createCommandEncoder();
-      pass = enc.beginComputePass();
-      const batch = Math.min(CHECK, maxIter - it);
-      for (let k = 0; k < batch; k++) {
-        this.run(pass, this.p.matvec, this.bg.mvP, lv.nNodes);
-        this.dot(pass, this.pv, this.qv, PQ);
-        this.run(pass, this.p.cg_alpha, this.bg.alpha, 1);
-        this.run(pass, this.p.update_xr, this.bg.updXR, n);
-        this.vcycle(pass, 0);
-        this.dot(pass, L0.r, L0.z, RZN);
-        this.run(pass, this.p.cg_beta, this.bg.beta, 1);
-        this.run(pass, this.p.update_p, this.bg.updP, n);
-      }
-      this.dot(pass, L0.r, L0.r, RR);
-      pass.end();
-      dev.queue.submit([enc.finish()]);
-      it += batch;
-      s = await this.readScalars();
-      if (!(s[PQ] > 0) || !Number.isFinite(s[RR])) { broke = true; break; }
-      res = Math.sqrt(s[RR]) / bnorm;
-      onProgress?.(it, res);
-    }
-    enc = dev.createCommandEncoder();
-    enc.copyBufferToBuffer(this.x, 0, this.xRead, 0, 4 * n);
-    dev.queue.submit([enc.finish()]);
-    await this.xRead.mapAsync(GPUMapMode.READ);
-    const x32 = new Float32Array(this.xRead.getMappedRange().slice(0));
-    this.xRead.unmap();
-    return { x: Float64Array.from(x32), iterations: it, residual: res, broke };
+    this.device.queue.submit([enc.finish()]);
+    const z32 = await this.read(L0.buf(L0.out), this.xRead, 4 * n);
+    for (let i = 0; i < n; i++) z[i] = fixed[i] ? 0 : z32[i] * rmax;
+    return z;
   }
 
   /**
-   * Solve K u = f (normalized units, like VoxelFEA.solve).
-   * Outer loop: flexible conjugate gradients in float64 on the CPU (one exact K*p per step).
-   * Preconditioner: a float32 multigrid-PCG solve on the GPU. Because the outer iteration only
-   * asks the GPU for an approximate correction, float32 round-off - which grows with the
-   * stiffness condition number, large for thin walls - never limits the final accuracy.
+   * Approximate K^-1 r for each vector of a block: `iterations` steps of the GPU's multigrid-CG from
+   * zero (0 = one V-cycle), all in one submission and one read-back - the eigen solvers'
+   * preconditioner (a GPU round trip per vector would cost more than the work).
+   */
+  async preconditionBlock(R, iterations = 0) {
+    const fixed = this.fea.levels[0].fixed, n = this.n, k = R.length, dev = this.device;
+    if (!this.blockIn || this.blockK < k) {
+      for (const b of [this.blockIn, this.blockOut, this.blockRead]) if (b) { b.destroy(); this.buffers.splice(this.buffers.indexOf(b), 1); }
+      this.blockK = k;
+      const S = GPUBufferUsage.STORAGE, D = GPUBufferUsage.COPY_DST, C = GPUBufferUsage.COPY_SRC;
+      this.blockIn = dev.createBuffer({ size: 4 * n * k, usage: S | D | C });
+      this.blockOut = dev.createBuffer({ size: 4 * n * k, usage: S | D | C });
+      this.blockRead = dev.createBuffer({ size: 4 * n * k, usage: GPUBufferUsage.MAP_READ | D });
+      this.buffers.push(this.blockIn, this.blockOut, this.blockRead);
+    }
+    // each vector scaled to order one (the V-cycle is linear)
+    const scales = R.map((r) => {
+      let m = 0;
+      for (let i = 0; i < n; i++) if (!fixed[i]) m = Math.max(m, Math.abs(r[i]));
+      return m;
+    });
+    const h = new Float32Array(n * k);
+    R.forEach((r, j) => {
+      const s = scales[j] > 0 ? 1 / scales[j] : 0;
+      for (let i = 0; i < n; i++) h[j * n + i] = fixed[i] ? 0 : r[i] * s;
+    });
+    dev.queue.writeBuffer(this.blockIn, 0, h);
+    const L0 = this.L[0], P = this.p, z0 = L0.buf(L0.out), nN = this.fea.levels[0].nNodes;
+    const enc = dev.createCommandEncoder();
+    for (let j = 0; j < k; j++) {
+      enc.copyBufferToBuffer(this.blockIn, 4 * n * j, L0.r, 0, 4 * n);
+      if (iterations) for (const b of [this.x, this.pv, this.qv, this.S]) enc.clearBuffer(b);
+      const pass = enc.beginComputePass();
+      if (!iterations) this.vcycle(pass, 0);
+      for (let s = 0; s < iterations; s++) {
+        this.vcycle(pass, 0);
+        this.dot(pass, L0.r, z0, RZN);
+        this.dot(pass, z0, this.qv, ZQ);
+        this.run(pass, P.cg_beta, this.bg.beta, 1);
+        this.run(pass, P.update_p, this.bg.updP, n);
+        this.run(pass, P.matvec, this.bg.mvP, nN);
+        this.dot(pass, this.pv, this.qv, PQ);
+        this.run(pass, P.cg_alpha, this.bg.alpha, 1);
+        this.run(pass, P.update_xr, this.bg.updXR, n);
+      }
+      pass.end();
+      enc.copyBufferToBuffer(iterations ? this.x : z0, 0, this.blockOut, 4 * n * j, 4 * n);
+    }
+    enc.copyBufferToBuffer(this.blockOut, 0, this.blockRead, 0, 4 * n * k);
+    dev.queue.submit([enc.finish()]);
+    await this.blockRead.mapAsync(GPUMapMode.READ, 0, 4 * n * k);
+    const z32 = new Float32Array(this.blockRead.getMappedRange(0, 4 * n * k).slice(0));
+    this.blockRead.unmap();
+    return R.map((_, j) => {
+      const z = new Float64Array(n);
+      for (let i = 0; i < n; i++) z[i] = fixed[i] ? 0 : z32[j * n + i] * scales[j];
+      return z;
+    });
+  }
+
+  /**
+   * Solve K u = f (normalized units, like VoxelFEA.solve): conjugate gradients preconditioned by
+   * the V-cycle on the GPU in float32, kept to float64 accuracy by reliable updates (Sleijpen &
+   * van der Vorst 1996): whenever the GPU residual has dropped tenfold since the last fold, its
+   * solution is added to the float64 one and the true residual f - K u replaces the GPU's.
    */
   async solve(f, { tol = 1e-6, maxIter = 500, x0 = null, onProgress = null } = {}) {
     const fea = this.fea, L = fea.levels[0], n = L.nDof, fixed = L.fixed;
@@ -599,45 +818,74 @@ export class GPUFEASolver {
     for (let i = 0; i < n; i++) if (!fixed[i]) bnorm += f[i] * f[i];
     bnorm = Math.sqrt(bnorm);
     if (bnorm === 0) return { u, iterations: 0, residual: 0, converged: true, engine: 'GPU' };
-    const dot = (a, c) => { let t = 0; for (let i = 0; i < n; i++) t += a[i] * c[i]; return t; };
-    const q = new Float64Array(n), r = new Float64Array(n), rOld = new Float64Array(n), p = new Float64Array(n);
-    fea.apply(L, u, q);
-    for (let i = 0; i < n; i++) r[i] = fixed[i] ? 0 : f[i] - q[i];
-    let rel = Math.sqrt(dot(r, r)) / bnorm;
-    let its = 0;
-    const precondition = async (res) => {
-      const inner = await this.pcg(res, {
-        tol: GPUFEASolver.innerTol,
-        maxIter: Math.max(1, Math.min(60, maxIter - its)),
-        onProgress: (it, rr) => onProgress?.(its + it, Math.min(rel, rr * rel)),
-      });
-      its += Math.max(1, inner.iterations);
-      return inner.x;
+    const r = new Float64Array(n), q = new Float64Array(n);
+    const trueResidual = () => {
+      fea.apply(L, u, q);
+      let s = 0;
+      for (let i = 0; i < n; i++) { r[i] = fixed[i] ? 0 : f[i] - q[i]; s += r[i] * r[i]; }
+      return Math.sqrt(s) / bnorm;
     };
-    if (rel <= tol) return { u, iterations: 0, residual: rel, converged: true, engine: 'GPU' };
-    let z = await precondition(r);
-    p.set(z);
-    let rz = dot(r, z);
-    for (let outer = 0; outer < 40 && its < maxIter; outer++) {
-      fea.apply(L, p, q);
-      const pq = dot(p, q);
-      if (!(pq > 0)) break;
-      const alpha = rz / pq;
-      rOld.set(r);
-      for (let i = 0; i < n; i++) { u[i] += alpha * p[i]; r[i] -= alpha * q[i]; }
-      rel = Math.sqrt(dot(r, r)) / bnorm;
-      onProgress?.(its, rel);
-      if (rel <= tol) break;
-      const zNew = await precondition(r);
-      // flexible (Polak-Ribiere) beta: the preconditioner changes from step to step
-      let num = 0;
-      for (let i = 0; i < n; i++) num += zNew[i] * (r[i] - rOld[i]);
-      const beta = Math.max(0, num / rz);
-      rz = dot(r, zNew);
-      for (let i = 0; i < n; i++) p[i] = zNew[i] + beta * p[i];
-      z = zNew;
+    let rel = trueResidual(), it = 0, cancelled = false;
+    if (rel > tol) {
+      // float32 units: the first residual scaled to order one
+      let rmax = 0;
+      for (let i = 0; i < n; i++) rmax = Math.max(rmax, Math.abs(r[i]));
+      const scale = 1 / rmax;
+      const L0 = this.L[0], P = this.p, z0 = L0.buf(L0.out);
+      this.upload(L0.r, r, scale);
+      this.clear(this.x, this.pv, this.qv, this.S); // beta = 0 on the first pass
+      const foldIn = async () => {
+        const x32 = await this.read(this.x, this.xRead, 4 * n);
+        for (let i = 0; i < n; i++) u[i] += x32[i] / scale;
+        this.clear(this.x);
+        return trueResidual();
+      };
+      let peak = rel, lastEst = rel, relUpdated = rel, batch = 1, dirty = false;
+      while (it < maxIter) {
+        const t0 = performance.now();
+        const enc = this.device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        const k = Math.min(batch, maxIter - it);
+        for (let s = 0; s < k; s++) {
+          // z = M r; beta = max(0, z.(r - r_old) / rz) with r - r_old = -alpha q; p = z + beta p
+          this.vcycle(pass, 0);
+          this.dot(pass, L0.r, z0, RZN);
+          this.dot(pass, z0, this.qv, ZQ);
+          this.run(pass, P.cg_beta, this.bg.beta, 1);
+          this.run(pass, P.update_p, this.bg.updP, n);
+          // q = K p; alpha = rz / p.q; x += alpha p; r -= alpha q
+          this.run(pass, P.matvec, this.bg.mvP, L.nNodes);
+          this.dot(pass, this.pv, this.qv, PQ);
+          this.run(pass, P.cg_alpha, this.bg.alpha, 1);
+          this.run(pass, P.update_xr, this.bg.updXR, n);
+        }
+        this.dot(pass, L0.r, L0.r, RR);
+        pass.end();
+        this.device.queue.submit([enc.finish()]);
+        const sc = await this.read(this.S, this.readBuf, 64);
+        it += k;
+        dirty = true;
+        if (!(sc[PQ] > 0) || !Number.isFinite(sc[RR]) || !Number.isFinite(sc[ALPHA])) break; // lost positive-definiteness
+        const est = Math.sqrt(sc[RR]) / scale / bnorm;
+        if (onProgress && onProgress(it, Math.min(est, relUpdated)) === true) { cancelled = true; break; }
+        peak = Math.max(peak, est);
+        // per-iteration reduction, for sizing the next batch
+        const rho = Math.min(0.95, Math.max(0.05, (est / lastEst) ** (1 / k)));
+        lastEst = est;
+        if (est <= tol || est <= 0.1 * peak) {
+          rel = relUpdated = peak = lastEst = await foldIn();
+          dirty = false;
+          if (rel <= tol) break;
+          this.upload(L0.r, r, scale);
+        }
+        // wait for the GPU about every 8 ms (rarely enough to keep it busy), and not past convergence
+        const per = (performance.now() - t0) / k;
+        const toGo = Math.ceil(Math.log(tol / lastEst) / Math.log(rho));
+        batch = Math.max(1, Math.min(8, Math.floor(8 / Math.max(per, 0.01)), toGo));
+      }
+      if (dirty) rel = await foldIn();
     }
-    return { u, iterations: its, residual: rel, converged: rel <= tol * 10, engine: 'GPU' };
+    return { u, iterations: it, residual: rel, converged: !cancelled && rel <= tol * 10, cancelled, engine: 'GPU' };
   }
 
   destroy() {

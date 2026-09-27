@@ -51,11 +51,8 @@ async function engineFor(m, fea) {
       const gpu = await GPUFEASolver.create(fea);
       return {
         name: 'GPU',
-        async precond(R) {
-          const out = [];
-          for (const r of R) out.push((await gpu.pcg(r, { tol: 0.15, maxIter: 25 })).x);
-          return out;
-        },
+        // a few multigrid-CG steps per vector on the GPU, the whole block in one round trip
+        precond: (R) => gpu.preconditionBlock(R, 4),
         async solve(f, o) {
           const sol = await gpu.solve(f, o);
           return sol.converged ? sol : fea.solve(f, o);
@@ -185,16 +182,23 @@ async function buckling(m, post) {
     const u = sol.u.map((v) => v / (m.E * m.h));
     const sigma = elementStresses(fea, u, m.h);
     const nev = Math.max(1, Math.min(8, m.nev || 3));
+    // Search up to 100 times the load that makes it yield (at least 1000 x the loads): a buckling
+    // load far beyond yielding is never reached, and near-zero eigenvalues are slow to resolve.
+    const nodeVM = nodalVM(fea, u, m.E, m.h);
+    let vmMax = 0;
+    for (const v of nodeVM) vmMax = Math.max(vmMax, v);
+    const yieldFactor = vmMax > 0 && m.strength > 0 ? m.strength / vmMax : Infinity;
+    const maxFactor = Number.isFinite(yieldFactor) ? Math.max(1000, 100 * yieldFactor) : Infinity;
     const r = await bucklingFactors(fea, sigma, {
-      nev, precondFull: (R) => engine.precond(R),
+      nev, maxFactor, precondFull: (R) => engine.precond(R),
       onProgress: (it, res, conv) => { post({ type: 'progress', stage: `Buckling modes on the ${engine.name} · ${conv}/${nev} converged`, it, res }); },
     });
     const L = fea.levels[0];
     const W = weights(m, L.activeNode);
-    const vm = interpolate(W, nodalVM(fea, u, m.E, m.h));
+    const vm = interpolate(W, nodeVM);
     const modes = r.factors.map((factor, i) => ({ factor, shape: unitShape(interpolate(W, r.modes[i], 3)) }));
     post({
-      type: 'done', study: 'buckling', engine: engine.name, gpuNote: engine.note, removed,
+      type: 'done', study: 'buckling', engine: engine.name, gpuNote: engine.note, removed, maxFactor,
       converged: r.converged, iterations: r.iterations, modes, vm, activeNode: L.activeNode,
     }, [vm.buffer, ...modes.map((md) => md.shape.buffer)]);
   } finally {

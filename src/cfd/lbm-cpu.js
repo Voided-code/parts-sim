@@ -41,6 +41,105 @@ export function inletVelocity(uLat, step) {
   return uLat * Math.min(1, (step + 1) / RAMP_STEPS);
 }
 
+// Cells away from walls and the domain boundary: the same pull-and-collide step without branches or
+// per-direction table lookups, unrolled over the directions. src[i] = i N - off[i], so f[src[i] + c]
+// is the population arriving at c.
+function collideRun(f, g, macro, N, src, c0, c1, tau0, smag, writeMacro) {
+  const [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18] = src;
+  const w0 = W[0], w1 = W[1], w2 = W[7];
+  for (let c = c0; c < c1; c++) {
+    const f0 = f[s0 + c];
+    const f1 = f[s1 + c];
+    const f2 = f[s2 + c];
+    const f3 = f[s3 + c];
+    const f4 = f[s4 + c];
+    const f5 = f[s5 + c];
+    const f6 = f[s6 + c];
+    const f7 = f[s7 + c];
+    const f8 = f[s8 + c];
+    const f9 = f[s9 + c];
+    const f10 = f[s10 + c];
+    const f11 = f[s11 + c];
+    const f12 = f[s12 + c];
+    const f13 = f[s13 + c];
+    const f14 = f[s14 + c];
+    const f15 = f[s15 + c];
+    const f16 = f[s16 + c];
+    const f17 = f[s17 + c];
+    const f18 = f[s18 + c];
+    const rho = f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 + f10 + f11 + f12 + f13 + f14 + f15 + f16 + f17 + f18;
+    const ux = (f1 - f2 + f7 - f8 + f9 - f10 + f11 - f12 + f13 - f14) / rho;
+    const uy = (f3 - f4 + f7 - f8 - f9 + f10 + f15 - f16 + f17 - f18) / rho;
+    const uz = (f5 - f6 + f11 - f12 - f13 + f14 + f15 - f16 - f17 + f18) / rho;
+    const usq = 1.5 * (ux * ux + uy * uy + uz * uz);
+    const d0 = f0 - w0 * rho * (1 - usq);
+    const cu1 = ux;
+    const d1 = f1 - w1 * rho * (1 + 3 * cu1 + 4.5 * cu1 * cu1 - usq);
+    const cu2 = -ux;
+    const d2 = f2 - w1 * rho * (1 + 3 * cu2 + 4.5 * cu2 * cu2 - usq);
+    const cu3 = uy;
+    const d3 = f3 - w1 * rho * (1 + 3 * cu3 + 4.5 * cu3 * cu3 - usq);
+    const cu4 = -uy;
+    const d4 = f4 - w1 * rho * (1 + 3 * cu4 + 4.5 * cu4 * cu4 - usq);
+    const cu5 = uz;
+    const d5 = f5 - w1 * rho * (1 + 3 * cu5 + 4.5 * cu5 * cu5 - usq);
+    const cu6 = -uz;
+    const d6 = f6 - w1 * rho * (1 + 3 * cu6 + 4.5 * cu6 * cu6 - usq);
+    const cu7 = ux + uy;
+    const d7 = f7 - w2 * rho * (1 + 3 * cu7 + 4.5 * cu7 * cu7 - usq);
+    const cu8 = -ux - uy;
+    const d8 = f8 - w2 * rho * (1 + 3 * cu8 + 4.5 * cu8 * cu8 - usq);
+    const cu9 = ux - uy;
+    const d9 = f9 - w2 * rho * (1 + 3 * cu9 + 4.5 * cu9 * cu9 - usq);
+    const cu10 = -ux + uy;
+    const d10 = f10 - w2 * rho * (1 + 3 * cu10 + 4.5 * cu10 * cu10 - usq);
+    const cu11 = ux + uz;
+    const d11 = f11 - w2 * rho * (1 + 3 * cu11 + 4.5 * cu11 * cu11 - usq);
+    const cu12 = -ux - uz;
+    const d12 = f12 - w2 * rho * (1 + 3 * cu12 + 4.5 * cu12 * cu12 - usq);
+    const cu13 = ux - uz;
+    const d13 = f13 - w2 * rho * (1 + 3 * cu13 + 4.5 * cu13 * cu13 - usq);
+    const cu14 = -ux + uz;
+    const d14 = f14 - w2 * rho * (1 + 3 * cu14 + 4.5 * cu14 * cu14 - usq);
+    const cu15 = uy + uz;
+    const d15 = f15 - w2 * rho * (1 + 3 * cu15 + 4.5 * cu15 * cu15 - usq);
+    const cu16 = -uy - uz;
+    const d16 = f16 - w2 * rho * (1 + 3 * cu16 + 4.5 * cu16 * cu16 - usq);
+    const cu17 = uy - uz;
+    const d17 = f17 - w2 * rho * (1 + 3 * cu17 + 4.5 * cu17 * cu17 - usq);
+    const cu18 = -uy + uz;
+    const d18 = f18 - w2 * rho * (1 + 3 * cu18 + 4.5 * cu18 * cu18 - usq);
+    const pxx = d1 + d2 + d7 + d8 + d9 + d10 + d11 + d12 + d13 + d14;
+    const pyy = d3 + d4 + d7 + d8 + d9 + d10 + d15 + d16 + d17 + d18;
+    const pzz = d5 + d6 + d11 + d12 + d13 + d14 + d15 + d16 + d17 + d18;
+    const pxy = d7 + d8 - d9 - d10;
+    const pxz = d11 + d12 - d13 - d14;
+    const pyz = d15 + d16 - d17 - d18;
+    const q = Math.sqrt(pxx * pxx + pyy * pyy + pzz * pzz + 2 * (pxy * pxy + pxz * pxz + pyz * pyz));
+    const om = 1 / (0.5 * (tau0 + Math.sqrt(tau0 * tau0 + (smag * q) / rho)));
+    g[0 * N + c] = f0 - om * d0;
+    g[1 * N + c] = f1 - om * d1;
+    g[2 * N + c] = f2 - om * d2;
+    g[3 * N + c] = f3 - om * d3;
+    g[4 * N + c] = f4 - om * d4;
+    g[5 * N + c] = f5 - om * d5;
+    g[6 * N + c] = f6 - om * d6;
+    g[7 * N + c] = f7 - om * d7;
+    g[8 * N + c] = f8 - om * d8;
+    g[9 * N + c] = f9 - om * d9;
+    g[10 * N + c] = f10 - om * d10;
+    g[11 * N + c] = f11 - om * d11;
+    g[12 * N + c] = f12 - om * d12;
+    g[13 * N + c] = f13 - om * d13;
+    g[14 * N + c] = f14 - om * d14;
+    g[15 * N + c] = f15 - om * d15;
+    g[16 * N + c] = f16 - om * d16;
+    g[17 * N + c] = f17 - om * d17;
+    g[18 * N + c] = f18 - om * d18;
+    if (writeMacro) { macro[4 * c] = rho; macro[4 * c + 1] = ux; macro[4 * c + 2] = uy; macro[4 * c + 3] = uz; }
+  }
+}
+
 export class LBMCPU {
   /**
    * @param {{dims: number[], solid: Uint8Array, uLat: number, nuLat: number, smagorinsky?: number, links?: Uint8Array}} o
@@ -58,6 +157,29 @@ export class LBMCPU {
     this.g = new Float32Array(19 * this.N);
     this.macro = new Float32Array(4 * this.N);
     this.off = CX.map((c, i) => CX[i] + nx * (CY[i] + ny * CZ[i]));
+    this.src = this.off.map((o, i) => i * this.N - o);
+    // per row (y + ny z), runs [x0, x1) of interior fluid cells with no solid neighbour (the fast path)
+    const runs = [];
+    this.runStart = new Int32Array(ny * nz + 1);
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        if (y > 0 && z > 0 && y < ny - 1 && z < nz - 1) {
+          let x0 = -1;
+          for (let x = 1; x <= nx - 1; x++) {
+            let simple = x < nx - 1;
+            if (simple) {
+              const c = x + nx * (y + ny * z);
+              simple = !o.solid[c];
+              for (let i = 1; i < 19 && simple; i++) simple = !o.solid[c - this.off[i]];
+            }
+            if (simple && x0 < 0) x0 = x;
+            if (!simple && x0 >= 0) { runs.push(x0, x); x0 = -1; }
+          }
+        }
+        this.runStart[y + ny * z + 1] = runs.length / 2;
+      }
+    }
+    this.runs = Int32Array.from(runs);
     this.reset();
   }
 
@@ -70,7 +192,7 @@ export class LBMCPU {
 
   step(writeMacro = false) {
     const [nx, ny, nz] = this.dims;
-    const { N, f, g, solid, off, tau0, smag, macro, links } = this;
+    const { N, f, g, solid, off, tau0, smag, macro, links, runs, runStart, src } = this;
     const uin = inletVelocity(this.uLat, this.steps);
     const feqIn = new Float64Array(19);
     for (let i = 0; i < 19; i++) {
@@ -82,7 +204,16 @@ export class LBMCPU {
     for (let z = 0; z < nz; z++) {
       for (let y = 0; y < ny; y++) {
         const edge = y === 0 || z === 0 || y === ny - 1 || z === nz - 1;
+        const row = y + ny * z;
+        let r = runStart[row];
+        const rEnd = runStart[row + 1];
         for (let x = 0; x < nx; x++) {
+          if (r < rEnd && x === runs[2 * r]) {
+            collideRun(f, g, macro, N, src, nx * row + x, nx * row + runs[2 * r + 1], tau0, smag, writeMacro);
+            x = runs[2 * r + 1] - 1;
+            r++;
+            continue;
+          }
           const c = x + nx * (y + ny * z);
           if (solid[c]) continue;
           if (x === 0) {

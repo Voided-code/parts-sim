@@ -476,7 +476,9 @@ class BucklingStudy extends Study {
   async run() {
     const prep = await this.prepareRun();
     if (!prep) return;
-    const res = await this.job({ type: 'buckling', ...prep.msg, nev: this.opts.nev }, 'Buckling analysis…');
+    const mat = completeMaterial(prep.material);
+    const strength = (mat.brittle ? mat.uts : mat.yield) * 1e6;
+    const res = await this.job({ type: 'buckling', ...prep.msg, nev: this.opts.nev, strength }, 'Buckling analysis…');
     if (!res) return;
     let maxVM = 0;
     for (const v of res.vm) if (!Number.isNaN(v)) maxVM = Math.max(maxVM, v);
@@ -488,7 +490,18 @@ class BucklingStudy extends Study {
     const bl = res.modes[0]?.factor;
     this.app.status(Number.isFinite(bl)
       ? `Lowest buckling load factor ${num(bl)} ${this.engineNote(res)}: it buckles at about ${force(bl * this.result.totalF)}.`
-      : `No buckling under these loads (they do not compress the part) ${this.engineNote(res)}.`, Number.isFinite(bl) && bl < 1 ? 'error' : '');
+      : `No buckling below ${this.beyond()} ${this.engineNote(res)}.`, Number.isFinite(bl) && bl < 1 ? 'error' : '');
+  }
+
+  // "no buckling" means none below the searched range (it yields long before)
+  beyond() {
+    const max = this.result?.maxFactor;
+    return Number.isFinite(max) ? `${num(max)} × the loads (it yields long before that)` : 'any load (nothing is compressed)';
+  }
+
+  factorText(f) {
+    const max = this.result?.maxFactor;
+    return Number.isFinite(f) ? num(f) : Number.isFinite(max) ? `> ${num(max)}` : '∞';
   }
 
   show() {
@@ -500,13 +513,13 @@ class BucklingStudy extends Study {
     const yieldLam = r.maxVM > 0 ? (mat.brittle ? mat.uts : mat.yield) * 1e6 / r.maxVM : Infinity;
     const status = !Number.isFinite(bl) ? ['good', 'no buckling'] : bl < 1 ? ['bad', 'buckles under the applied loads'] : bl < 3 ? ['warn', 'low margin'] : ['good', 'safe margin'];
     kpis.replaceChildren(
-      kpi('Buckling load factor', Number.isFinite(bl) ? num(bl) : '∞', null, status),
+      kpi('Buckling load factor', this.factorText(bl), null, status),
       kpi('Buckling load', Number.isFinite(bl) && r.totalF > 0 ? force(bl * r.totalF) : '–', 'loads × factor'),
       kpi('Yields first at', Number.isFinite(yieldLam) ? `× ${num(yieldLam)}` : '–', yieldLam < bl ? 'before it buckles' : 'after buckling'),
     );
     const list = h('ul.items');
     r.modes.forEach((m, i) => list.append(h('li', { className: i === this.view.mode ? 'selected' : '', onclick: () => { this.view.mode = i; this.show(); } },
-      h('span.name', {}, `Mode ${i + 1}`), h('span.meta', {}, Number.isFinite(m.factor) ? `factor ${num(m.factor)}` : 'no buckling'))));
+      h('span.name', {}, `Mode ${i + 1}`), h('span.meta', {}, Number.isFinite(m.factor) || Number.isFinite(r.maxFactor) ? `factor ${this.factorText(m.factor)}` : 'no buckling'))));
     const notes = [];
     if (Number.isFinite(bl) && yieldLam < bl) notes.push(`The material yields at ${num(yieldLam)} × the loads, before the buckling load: expect it to fail by yielding (see the nonlinear study).`);
     notes.push('Linear buckling assumes a perfect part. Real parts with small imperfections often buckle at 50–80% of this load, so aim for a factor of 3 or more.');
@@ -525,7 +538,7 @@ class BucklingStudy extends Study {
     const r = this.result, m = r?.modes[this.view.mode];
     if (!m) return;
     const values = magnitudes(m.shape);
-    this.paint(values, { min: 0, max: 1, title: 'Relative displacement', sub: `Buckling mode ${this.view.mode + 1} · factor ${Number.isFinite(m.factor) ? num(m.factor) : '∞'}`, format: (x) => num(x, 2) });
+    this.paint(values, { min: 0, max: 1, title: 'Relative displacement', sub: `Buckling mode ${this.view.mode + 1} · factor ${this.factorText(m.factor)}`, format: (x) => num(x, 2) });
     this.shown = { values, fmt: (x) => `${num(x * 100)} % of max` };
     const s = this.view.animate ? Math.sin(this.view.phase) : 1;
     this.app.viewer.setDeformation(Number.isFinite(m.factor) ? m.shape : null, s * this.view.amp * r.diag);

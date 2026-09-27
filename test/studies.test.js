@@ -78,10 +78,16 @@ test('buckling load of a clamped column matches Euler', async () => {
   const Pcr = (Math.PI ** 2 * E * (0.01 ** 4 / 12)) / (4 * 0.2 ** 2);
   console.log(`  load factor ${r.factors[0].toFixed(3)} vs ${(Pcr / F).toFixed(3)}`);
   assert.ok(Math.abs(r.factors[0] / (Pcr / F) - 1) < 0.03);
-  // pulling the column never buckles it
+  // the same search range as the app still finds it
+  const rr = await bucklingFactors(fea, elementStresses(fea, u, g.h), { nev: 1, maxFactor: 1e4 });
+  assert.ok(Math.abs(rr.factors[0] / r.factors[0] - 1) < 1e-3);
+  // pulling the column never buckles it: the clamp's small sideways compression only gives
+  // meaningless factors far beyond the range, and the search stops once that is clear
   const t = fea.solve(tipForce(g, F, 0), { tol: 1e-9 });
-  const r2 = await bucklingFactors(fea, elementStresses(fea, t.u.map((v) => v / (E * g.h)), g.h), { nev: 1 });
+  const r2 = await bucklingFactors(fea, elementStresses(fea, t.u.map((v) => v / (E * g.h)), g.h), { nev: 1, maxFactor: 1e4 });
+  console.log(`  pulled: no buckling in range after ${r2.iterations} iterations`);
   assert.equal(r2.factors[0], Infinity);
+  assert.ok(r2.iterations < 100, `${r2.iterations} iterations`);
 });
 
 test('nonlinear: large deflection of a cantilever follows the elastica', async () => {
