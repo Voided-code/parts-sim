@@ -1,9 +1,5 @@
 #include "lbm.hpp"
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <xmmintrin.h>
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -34,7 +30,7 @@ void validate(const LbmSetup& s) {
 
 
 // Cells away from walls and the domain boundary: the same pull-and-collide step without branches,
-// in 32-bit and unrolled over the directions, so the compiler vectorizes it along x.
+// in 32-bit and unrolled over the directions, so the compiler can vectorize it along x.
 // src[i] = f_i shifted so that src[i][c] is the population arriving at c; dst[i] = g_i.
 template <bool WriteMacro>
 void collideRun(const float* const* src, float* const* dst, float* __restrict macro, int64_t c0, int64_t c1, float tau0, float smag) {
@@ -77,8 +73,12 @@ void collideRun(const float* const* src, float* const* dst, float* __restrict ma
     float* __restrict t16 = dst[16];
     float* __restrict t17 = dst[17];
     float* __restrict t18 = dst[18];
-#if defined(__clang__)
+#if defined(__clang__) && defined(__aarch64__)
 #pragma clang loop vectorize(enable) interleave(disable)
+#elif defined(__clang__)
+    // x86 has 16 vector registers for the 19 populations: the vector code spills, and scalar code
+    // (what MSVC made of it) runs faster
+#pragma clang loop vectorize(disable)
 #endif
     for (int64_t c = c0; c < c1; c++) {
         const float f0 = s0[c];
@@ -267,10 +267,6 @@ void LbmCpu::stepOnce(bool writeMacro) {
         dst[i] = g + i * N;
     }
     parallelFor(int64_t(nz) * ny, [&](int64_t lo, int64_t hi) {
-#if defined(__x86_64__) || defined(_M_X64)
-        // tiny (denormal) floats cost x86 a hundred cycles each: flush them, on this thread for this step
-        struct Flush { unsigned saved = _mm_getcsr(); Flush() { _mm_setcsr(saved | 0x8040); } ~Flush() { _mm_setcsr(saved); } } flush;
-#endif
         double fi[19], fe[19];
         for (int64_t row = lo; row < hi; row++) {
             const int y = int(row % ny), z = int(row / ny);
