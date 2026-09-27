@@ -77,7 +77,7 @@ export class Viewer {
     this.drawn = [];
     this.next = [];
     this.dirty = true;
-    this.busy = false; // while a solver runs, animations draw at most MAX_BUSY_FPS
+    this.busy = false; // while a solver runs, animations pause and changes draw at most MAX_BUSY_FPS
     this.lastDraw = 0;
     for (const type of ['pointerdown', 'pointerup', 'wheel', 'keydown', 'input', 'change']) window.addEventListener(type, () => this.invalidate(), true);
     renderer.domElement.addEventListener('webglcontextrestored', () => this.invalidate());
@@ -559,10 +559,12 @@ export class Viewer {
     const dt = Math.min(0.1, (now - this.lastFrame) / 1000);
     this.lastFrame = now;
     this.controls.update();
-    for (const cb of this.frameCallbacks) cb(dt);
+    // animations (result playback, the marker's pulse) wait while a solver runs: they would only
+    // redraw a stale result, and where WebGL runs in software that takes the CPU from the solver
+    if (!this.busy) for (const cb of this.frameCallbacks) cb(dt);
     if (this.marker) {
       const s = 1 + 0.6 * (0.5 + 0.5 * Math.sin(performance.now() / 220));
-      this.marker.halo.scale.setScalar(s * 1.6);
+      if (!this.busy) this.marker.halo.scale.setScalar(s * 1.6);
       const p = this.project(this.marker.point);
       this.markerEl.style.transform = `translate(${p.x + 14}px, ${p.y - 14}px)`;
       this.markerEl.style.display = p.visible ? '' : 'none';

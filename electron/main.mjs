@@ -285,6 +285,9 @@ app.whenReady().then(() => {
     return net.fetch(pathToFileURL(file).toString()).then((res) => {
       const headers = new Headers(res.headers);
       headers.set('Content-Security-Policy', /[\\/]occt\.worker-[\w-]+\.js$/.test(file) ? CAD_WORKER_CSP : CSP);
+      // cross-origin isolation: lets the solvers share memory between threads (SharedArrayBuffer)
+      headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+      headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
       if (file.endsWith('.wasm')) headers.set('Content-Type', 'application/wasm');
       return new Response(res.body, { status: res.status, headers });
     });

@@ -162,6 +162,110 @@ function transferMap(nFineElems) {
   return { c0, c1 };
 }
 
+/**
+ * y = K x on the nodes n0 <= n < n1 of a level (held/inactive DOFs of y zeroed unless raw):
+ * VoxelFEA.apply, callable on a range so that threads can share the rows (threads.js).
+ */
+export function applyNodes(L, K0, x, y, raw, n0, n1) {
+  const { NX, NY, nx, ny, nz, off, emap, nodeScale, activeNode, fixed } = L;
+  const NXY = NX * NY, S0 = L.S, D = L.diagAdd;
+  const Kmat = L.K || K0, own = !!L.K;
+  let i = n0 % NX, j = ((n0 / NX) | 0) % NY, k = (n0 / NXY) | 0;
+  for (let n = n0; n < n1; n++) {
+    const o = 3 * n;
+    let a0 = 0, a1 = 0, a2 = 0;
+    if (activeNode[n]) {
+      const s0 = nodeScale[n];
+      if (s0 > 0) {
+        // 27-point stencil: nine rows of three neighbours, 9 contiguous DOFs each
+        const b = o - 3 * (1 + NX + NXY);
+        for (let r = 0; r < 9; r++) {
+          const xr = b + 3 * ((r % 3) * NX + ((r / 3) | 0) * NXY), sr = r * 27;
+          for (let c = 0; c < 9; c++) {
+            const u = x[xr + c];
+            a0 += S0[sr + c] * u;
+            a1 += S0[sr + 9 + c] * u;
+            a2 += S0[sr + 18 + c] * u;
+          }
+        }
+        a0 *= s0; a1 *= s0; a2 *= s0;
+      } else {
+        // the rows of this node's corner in each of its voxels
+        for (let v = 0; v < 8; v++) {
+          const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2;
+          const ei = i + di - 1, ej = j + dj - 1, ek = k + dk - 1;
+          if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+          const e = emap[ei + nx * (ej + ny * ek)];
+          if (e < 0) continue;
+          const nb = n - (1 - di) - NX * (1 - dj) - NXY * (1 - dk);
+          const kb = (own ? e * 576 : 0) + 72 * corner(1 - di, 1 - dj, 1 - dk);
+          let s0_ = 0, s1 = 0, s2 = 0;
+          for (let c = 0; c < 8; c++) {
+            const p = 3 * (nb + off[c]), kc = kb + 3 * c;
+            const u0 = x[p], u1 = x[p + 1], u2 = x[p + 2];
+            s0_ += Kmat[kc] * u0 + Kmat[kc + 1] * u1 + Kmat[kc + 2] * u2;
+            s1 += Kmat[kc + 24] * u0 + Kmat[kc + 25] * u1 + Kmat[kc + 26] * u2;
+            s2 += Kmat[kc + 48] * u0 + Kmat[kc + 49] * u1 + Kmat[kc + 50] * u2;
+          }
+          const s = own ? 1 : L.rho[e];
+          a0 += s * s0_; a1 += s * s1; a2 += s * s2;
+        }
+      }
+      if (D) { a0 += D[o] * x[o]; a1 += D[o + 1] * x[o + 1]; a2 += D[o + 2] * x[o + 2]; }
+    }
+    if (raw) { y[o] = a0; y[o + 1] = a1; y[o + 2] = a2; }
+    else {
+      y[o] = fixed[o] ? 0 : a0;
+      y[o + 1] = fixed[o + 1] ? 0 : a1;
+      y[o + 2] = fixed[o + 2] ? 0 : a2;
+    }
+    if (++i === NX) { i = 0; if (++j === NY) { j = 0; k++; } }
+  }
+}
+
+/**
+ * Nodal von Mises and principal stresses (vm, p1, p3) on the nodes n0 <= n < n1 of the finest
+ * level: the density-weighted average of the corner stresses of the voxels around each node. C[a]
+ * gives corner a's stresses (6 x 24) per unit displacement, times `scale`. Nodes without voxels
+ * are left untouched.
+ */
+export function stressNodes(L, C, scale, u, vm, p1, p3, n0, n1) {
+  const { NX, NY, nx, ny, nz, off, emap, activeNode, rho } = L;
+  const NXY = NX * NY, ue = new Float64Array(24), sig = new Float64Array(6), pr = [0, 0, 0];
+  let i = n0 % NX, j = ((n0 / NX) | 0) % NY, k = (n0 / NXY) | 0;
+  for (let n = n0; n < n1; n++) {
+    if (activeNode[n]) {
+      let sv = 0, s1 = 0, s3 = 0, w = 0;
+      for (let v = 0; v < 8; v++) {
+        const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2;
+        const ei = i + di - 1, ej = j + dj - 1, ek = k + dk - 1;
+        if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+        const e = emap[ei + nx * (ej + ny * ek)];
+        if (e < 0) continue;
+        const nb = n - (1 - di) - NX * (1 - dj) - NXY * (1 - dk);
+        for (let c = 0; c < 8; c++) {
+          const p = 3 * (nb + off[c]);
+          ue[3 * c] = u[p]; ue[3 * c + 1] = u[p + 1]; ue[3 * c + 2] = u[p + 2];
+        }
+        const Ca = C[corner(1 - di, 1 - dj, 1 - dk)];
+        for (let r = 0; r < 6; r++) {
+          let s = 0;
+          for (let q = 0; q < 24; q++) s += Ca[r * 24 + q] * ue[q];
+          sig[r] = s * scale;
+        }
+        const wt = rho[e];
+        sv += wt * vonMises(sig);
+        principalStresses(sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], pr);
+        s1 += wt * pr[0];
+        s3 += wt * pr[2];
+        w += wt;
+      }
+      if (w > 0) { vm[n] = sv / w; p1[n] = s1 / w; p3[n] = s3 / w; }
+    }
+    if (++i === NX) { i = 0; if (++j === NY) { j = 0; k++; } }
+  }
+}
+
 export class VoxelFEA {
   /**
    * @param {object} o
@@ -379,62 +483,8 @@ export class VoxelFEA {
 
   /** y = K x on free DOFs (held/inactive DOFs of y are zeroed unless raw). */
   apply(L, x, y, raw = false) {
-    const { NX, NY, NZ, nx, ny, nz, off, emap, nodeScale, activeNode, fixed } = L;
-    const NXY = NX * NY, S0 = L.S, D = L.diagAdd;
-    const Kmat = L.K || this.K0, own = !!L.K;
-    for (let k = 0; k < NZ; k++) {
-      for (let j = 0; j < NY; j++) {
-        for (let i = 0; i < NX; i++) {
-          const n = i + NX * (j + NY * k), o = 3 * n;
-          let a0 = 0, a1 = 0, a2 = 0;
-          if (activeNode[n]) {
-            const s0 = nodeScale[n];
-            if (s0 > 0) {
-              // 27-point stencil: nine rows of three neighbours, 9 contiguous DOFs each
-              const b = o - 3 * (1 + NX + NXY);
-              for (let r = 0; r < 9; r++) {
-                const xr = b + 3 * ((r % 3) * NX + ((r / 3) | 0) * NXY), sr = r * 27;
-                for (let c = 0; c < 9; c++) {
-                  const u = x[xr + c];
-                  a0 += S0[sr + c] * u;
-                  a1 += S0[sr + 9 + c] * u;
-                  a2 += S0[sr + 18 + c] * u;
-                }
-              }
-              a0 *= s0; a1 *= s0; a2 *= s0;
-            } else {
-              // the rows of this node's corner in each of its voxels
-              for (let v = 0; v < 8; v++) {
-                const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2;
-                const ei = i + di - 1, ej = j + dj - 1, ek = k + dk - 1;
-                if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
-                const e = emap[ei + nx * (ej + ny * ek)];
-                if (e < 0) continue;
-                const nb = n - (1 - di) - NX * (1 - dj) - NXY * (1 - dk);
-                const kb = (own ? e * 576 : 0) + 72 * corner(1 - di, 1 - dj, 1 - dk);
-                let s0_ = 0, s1 = 0, s2 = 0;
-                for (let c = 0; c < 8; c++) {
-                  const p = 3 * (nb + off[c]), kc = kb + 3 * c;
-                  const u0 = x[p], u1 = x[p + 1], u2 = x[p + 2];
-                  s0_ += Kmat[kc] * u0 + Kmat[kc + 1] * u1 + Kmat[kc + 2] * u2;
-                  s1 += Kmat[kc + 24] * u0 + Kmat[kc + 25] * u1 + Kmat[kc + 26] * u2;
-                  s2 += Kmat[kc + 48] * u0 + Kmat[kc + 49] * u1 + Kmat[kc + 50] * u2;
-                }
-                const s = own ? 1 : L.rho[e];
-                a0 += s * s0_; a1 += s * s1; a2 += s * s2;
-              }
-            }
-            if (D) { a0 += D[o] * x[o]; a1 += D[o + 1] * x[o + 1]; a2 += D[o + 2] * x[o + 2]; }
-          }
-          if (raw) { y[o] = a0; y[o + 1] = a1; y[o + 2] = a2; }
-          else {
-            y[o] = fixed[o] ? 0 : a0;
-            y[o + 1] = fixed[o + 1] ? 0 : a1;
-            y[o + 2] = fixed[o + 2] ? 0 : a2;
-          }
-        }
-      }
-    }
+    if (this.threads && L === this.levels[0]) this.threads.apply(x, y, raw);
+    else applyNodes(L, this.K0, x, y, raw, 0, L.nNodes);
   }
 
   /** Estimates the smoothers' eigenvalue ranges where they are not known yet. */
@@ -734,54 +784,14 @@ export class VoxelFEA {
   /**
    * Stresses from physical displacements u [m], modulus E [Pa] and voxel size h [m].
    * Nodal values average the corner stresses of the surrounding voxels (weighted by density),
-   * which recovers surface stresses much better than centroid values.
-   * Returns Pa. elemVM is each voxel's centroid von Mises stress.
+   * which recovers surface stresses much better than centroid values. Returns Pa.
    */
   stresses(u, E, h) {
     const L = this.levels[0];
-    const S = this.cornerStress.map((m) => m.map((v) => (v * E) / h));
-    const nE = L.elems.length;
-    const elemVM = new Float32Array(nE);
+    if (this.threads) return { ...this.threads.stresses(u, E / h), elems: L.elems };
     const nodeVM = new Float32Array(L.nNodes), nodeP1 = new Float32Array(L.nNodes), nodeP3 = new Float32Array(L.nNodes);
-    const nodeW = new Float32Array(L.nNodes);
-    const ue = this.ue, pr = [0, 0, 0];
-    const sig = new Float64Array(6);
-    for (let e = 0; e < nE; e++) {
-      const n0 = L.base[e];
-      for (let a = 0; a < 8; a++) {
-        const n = 3 * (n0 + L.off[a]);
-        ue[3 * a] = u[n];
-        ue[3 * a + 1] = u[n + 1];
-        ue[3 * a + 2] = u[n + 2];
-      }
-      const w = L.rho[e];
-      const c = [0, 0, 0, 0, 0, 0];
-      for (let a = 0; a < 8; a++) {
-        const Sa = S[a];
-        for (let i = 0; i < 6; i++) {
-          let s = 0;
-          for (let q = 0; q < 24; q++) s += Sa[i * 24 + q] * ue[q];
-          sig[i] = s;
-          c[i] += s / 8;
-        }
-        const vm = vonMises(sig);
-        principalStresses(sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], pr);
-        const n = n0 + L.off[a];
-        nodeVM[n] += w * vm;
-        nodeP1[n] += w * pr[0];
-        nodeP3[n] += w * pr[2];
-        nodeW[n] += w;
-      }
-      elemVM[e] = vonMises(c);
-    }
-    for (let n = 0; n < L.nNodes; n++) {
-      if (nodeW[n] > 0) {
-        nodeVM[n] /= nodeW[n];
-        nodeP1[n] /= nodeW[n];
-        nodeP3[n] /= nodeW[n];
-      }
-    }
-    return { elemVM, nodeVM, nodeP1, nodeP3, elems: L.elems };
+    stressNodes(L, this.cornerStress, E / h, u, nodeVM, nodeP1, nodeP3, 0, L.nNodes);
+    return { nodeVM, nodeP1, nodeP3, elems: L.elems };
   }
 
   /**

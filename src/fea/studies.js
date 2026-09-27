@@ -9,6 +9,7 @@ import { NonlinearModel, loadRamp, hardeningFor, equilibrate } from './nonlinear
 import { dropTestCPU, maxEigenvalue } from './explicit.js';
 import { GPUExplicit } from './gpu-explicit.js';
 import { BlockPool } from './pool.js';
+import { useThreads } from './threads.js';
 import { optimizeTopology } from './topology.js';
 import { solveHeat, heatFlux } from './thermal.js';
 import { vertexWeights, interpolate } from './mapping.js';
@@ -44,12 +45,18 @@ function buildModel(m, { free = false, diagAdd = null } = {}) {
   return { fea, density, removed };
 }
 
-/** Solver engine: GPU multigrid-CG (WebGPU) when allowed and working, otherwise the CPU multigrid. */
-async function engineFor(m, fea) {
+/**
+ * Solver engine: GPU multigrid-CG (WebGPU) when allowed and working, otherwise the CPU multigrid.
+ * Helper threads for the finest level's products and stresses start while the GPU sets up (a
+ * study that rebuilds its model every step passes threads: false).
+ */
+async function engineFor(m, fea, { threads = true } = {}) {
+  const started = threads ? useThreads(fea) : null;
   let note = null;
   if (m.engine !== 'cpu') {
     try {
       const gpu = await GPUFEASolver.create(fea);
+      await started;
       return {
         name: 'GPU',
         // a few multigrid-CG steps per vector on the GPU, the whole block in one round trip
@@ -64,6 +71,7 @@ async function engineFor(m, fea) {
       note = err?.message || String(err);
     }
   }
+  await started;
   const pre = cpuPreconditioner(fea);
   return { name: 'CPU', note, precond: async (R) => pre(R), solve: async (f, o) => fea.solve(f, o), destroy() {} };
 }
@@ -362,7 +370,7 @@ async function topology(m, post) {
     dims: m.dims, fill: m.density, keep: m.keep, volFrac: m.volFrac, maxIter: m.maxIter || 40, rmin: m.rmin || 1.5,
     solve: async (density, x0) => {
       const fea = new VoxelFEA({ dims: m.dims, density, nu: m.nu, bc: m.bc, ...(m.engine !== 'cpu' ? { coarsestMaxDof: GPU_COARSEST_DOF } : {}) });
-      const engine = await engineFor(m, fea);
+      const engine = await engineFor(m, fea, { threads: false });
       engineName = engine.name;
       note = engine.note;
       try {

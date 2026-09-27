@@ -10,6 +10,7 @@
 import { VoxelFEA, pruneFloating } from './solver.js';
 import { GPUFEASolver, GPU_COARSEST_DOF } from './gpu-solver.js';
 import { runStudy } from './studies.js';
+import { useThreads } from './threads.js';
 
 self.onmessage = async (ev) => {
   const m = ev.data;
@@ -30,9 +31,12 @@ let gpuFailure = null;
  * Build the multigrid hierarchy and solve, on the GPU when allowed and available (m.engine
  * 'auto'), otherwise - or if the GPU path fails - with the CPU solver on the same hierarchy.
  */
-async function buildAndSolve(m, density, f, x0, stage) {
+async function buildAndSolve(m, density, f, x0, stage, threads = false) {
   const useGPU = m.engine !== 'cpu' && !gpuFailure;
   const fea = new VoxelFEA({ dims: m.dims, density, nu: m.nu, bc: m.bc, ...(useGPU ? { coarsestMaxDof: GPU_COARSEST_DOF } : {}) });
+  // helper threads for the finest level (the CPU solve, the GPU solve's 64-bit residual checks and
+  // the stresses), starting while the GPU sets up
+  const started = threads ? useThreads(fea) : null;
   const opts = (label) => ({
     tol: 1e-6,
     maxIter: label === 'GPU' ? 3000 : 400,
@@ -45,6 +49,7 @@ async function buildAndSolve(m, density, f, x0, stage) {
     let gpu = null;
     try {
       gpu = await GPUFEASolver.create(fea);
+      await started;
       const sol = await gpu.solve(f, opts('GPU'));
       if (sol.converged) return { fea, sol, engine: 'GPU' };
       gpuFailure = 'the GPU solve did not converge';
@@ -54,6 +59,7 @@ async function buildAndSolve(m, density, f, x0, stage) {
       gpu?.destroy();
     }
   }
+  await started;
   const sol = fea.solve(f, opts('CPU'));
   return { fea, sol, engine: 'CPU' };
 }
@@ -95,7 +101,7 @@ async function solveOnce(m) {
   const held = heldNodes(m.bc);
   const { density, removed } = pruneFloating(m.dims, m.density, held);
   self.postMessage({ type: 'progress', stage: 'Building multigrid', it: 0, res: 1 });
-  const { fea, sol, engine } = await buildAndSolve(m, density, m.f, null, 'Solving');
+  const { fea, sol, engine } = await buildAndSolve(m, density, m.f, null, 'Solving', true);
   const lost = lostLoadFraction(fea, m.f);
   const { u, st } = analyze(fea, sol, m);
   if (!sol.converged) throw new Error('The structural solve did not converge. Enlarge the support area, check disconnected parts, or change the mesh resolution.');
