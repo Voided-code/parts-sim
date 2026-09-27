@@ -1,12 +1,35 @@
 # Writes a C++ file holding every WGSL shader as a string: wgslSource("fea") etc.
 # Invoked with -DOUT=<file> -DDIR=<shader folder>
+
+# MSVC takes at most 16380 bytes in one string literal: each shader becomes adjacent raw literals
+# (which the compiler joins) of at most 8000 bytes, cut at line ends.
+function(raw_literals text out)
+  set(parts "")
+  string(LENGTH "${text}" n)
+  while(n GREATER 8000)
+    string(SUBSTRING "${text}" 0 8000 head)
+    string(FIND "${head}" "\n" cut REVERSE)
+    if(cut LESS 0)
+      set(cut 7999)
+    endif()
+    math(EXPR cut "${cut} + 1")
+    string(SUBSTRING "${text}" 0 ${cut} head)
+    string(SUBSTRING "${text}" ${cut} -1 text)
+    string(APPEND parts "R\"WGSL(${head})WGSL\"\n        ")
+    string(LENGTH "${text}" n)
+  endwhile()
+  string(APPEND parts "R\"WGSL(${text})WGSL\"")
+  set(${out} "${parts}" PARENT_SCOPE)
+endfunction()
+
 file(GLOB SHADERS ${DIR}/*.wgsl)
 list(SORT SHADERS)
 set(body "#include <cstring>\n#include <string>\nnamespace ps {\nconst char* wgslSource(const std::string& name) {\n")
 foreach(f ${SHADERS})
   get_filename_component(stem ${f} NAME_WE)
   file(READ ${f} text)
-  string(APPEND body "    if (name == \"${stem}\") return R\"WGSL(${text})WGSL\";\n")
+  raw_literals("${text}" literals)
+  string(APPEND body "    if (name == \"${stem}\") return ${literals};\n")
 endforeach()
 string(APPEND body "    return nullptr;\n}\n}  // namespace ps\n")
 file(WRITE ${OUT} "${body}")
