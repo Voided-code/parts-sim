@@ -76,7 +76,7 @@ try {
   await idle();
   const kpis = (await page.textContent('#kpis')).replace(/\s+/g, ' ');
   assert.match(kpis, /Max von Mises\s*\d/);
-  await page.screenshot({ path: path.join(root, 'test-artifacts/desktop-bend.png') });
+  await shot('desktop-bend');
   console.log(`PASS: menu commands and bend test (${kpis.slice(0, 60)}…)`);
 
   // 3b. The GPU structural solver (when an adapter exists) must agree with the CPU solver
@@ -117,7 +117,7 @@ try {
   await idle();
   const th = await page.evaluate(() => window.partsSim.thermal.result.max);
   assert.ok(Math.abs(th - 90) < 1e-3, `hottest ${th}`);
-  await page.screenshot({ path: path.join(root, 'test-artifacts/desktop-thermal.png') });
+  await shot('desktop-thermal');
   await command('study:static');
   console.log(`PASS: frequency (${f1.toFixed(0)} Hz), drop test on the ${drop.engine} and heat transfer`);
 
@@ -155,7 +155,7 @@ try {
   const flow = await page.evaluate(() => ({ engine: window.partsSim.airflow.study.engine, cd: window.partsSim.airflow.study.results.cd, cells: window.partsSim.airflow.study.N }));
   assert.ok(flow.cells <= target.cells * 1.001 && flow.cells > 0.7 * target.cells, `grid ${flow.cells} for ${target.cells}`);
   assert.ok(Number.isFinite(flow.cd) && flow.cd > 0, JSON.stringify(flow));
-  await page.screenshot({ path: path.join(root, 'test-artifacts/desktop-airflow.png') });
+  await shot('desktop-airflow');
   await command('run:airflow');
   console.log(`PASS: airflow on ${flow.engine}, ${(flow.cells / 1e6).toFixed(2)} M cells from the grid-size slider (Cd ${flow.cd.toFixed(2)}, smoke check only)`);
 
@@ -168,6 +168,18 @@ try {
   const proc = app.process();
   const closed = await Promise.race([app.close().then(() => true, () => false), new Promise((r) => setTimeout(r, 10000, false))]);
   if (!closed) proc.kill();
+}
+
+/**
+ * Saves a screenshot for looking at later. It is not a check: on the 2-core CI runners Electron's
+ * software rendering sometimes takes over half a minute for a frame, so a slow one only warns.
+ */
+async function shot(name) {
+  try {
+    await page.screenshot({ path: path.join(root, `test-artifacts/${name}.png`), timeout: 90000 });
+  } catch (err) {
+    console.log(`WARN: no ${name} screenshot (${err.message.split('\n')[0]})`);
+  }
 }
 
 /** Prints what the app was doing when a step failed, and saves a screenshot next to the others. */
