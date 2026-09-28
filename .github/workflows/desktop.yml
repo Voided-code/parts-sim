@@ -11,6 +11,10 @@ on:
     paths-ignore: ['native/**', '.github/workflows/native.yml']
   workflow_dispatch:
 
+# the release step creates the tag's GitHub release (the repository's default token is read-only)
+permissions:
+  contents: write
+
 jobs:
   build:
     name: ${{ matrix.name }}
