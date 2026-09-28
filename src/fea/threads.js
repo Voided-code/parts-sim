@@ -93,11 +93,11 @@ export function onShare(s, extra) {
 
 export class Threads {
   /**
-   * Helper threads for fea, or null when memory cannot be shared, the machine has one core or the
-   * model is too small to be worth it.
+   * Helper threads for fea, or null when memory cannot be shared, the machine has too few cores
+   * (availableThreads) or the model is too small to be worth it. `helpers` sets their number.
    */
-  static async start(fea, { minDof = 20000, maxThreads = 15 } = {}) {
-    const count = availableThreads(maxThreads);
+  static async start(fea, { minDof = 20000, maxThreads = 15, helpers = null } = {}) {
+    const count = availableThreads(maxThreads, helpers);
     const L0 = fea.levels[0];
     if (count < 1 || L0.nDof < minDof) return null;
     const vec = (Type, len) => new Type(new SharedArrayBuffer(len * Type.BYTES_PER_ELEMENT));

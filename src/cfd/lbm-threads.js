@@ -22,11 +22,11 @@ export function work(s, gen) {
 export class LBMThreads {
   /**
    * Helper threads for an LBMCPU (set as sim.threads), or null when memory cannot be shared, the
-   * machine has one core or the grid is too small to be worth it. Moves its arrays into shared
-   * memory.
+   * machine has too few cores (availableThreads) or the grid is too small to be worth it. Moves its
+   * arrays into shared memory. `helpers` sets their number.
    */
-  static async start(sim, { minCells = 20000, maxThreads = 15 } = {}) {
-    const count = availableThreads(maxThreads);
+  static async start(sim, { minCells = 20000, maxThreads = 15, helpers = null } = {}) {
+    const count = availableThreads(maxThreads, helpers);
     if (count < 1 || sim.N < minCells) return null;
     const share = (a) => {
       if (!a || a.buffer instanceof SharedArrayBuffer) return a;

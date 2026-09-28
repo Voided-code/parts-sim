@@ -30,7 +30,7 @@ function bar(nx = 64, n = 12, fx = 0, fy = -1) {
 
 async function withThreads(model) {
   const fea = new VoxelFEA({ dims: model.dims, density: model.density, nu, bc: model.bc });
-  const threads = await useThreads(fea, { minDof: 0 });
+  const threads = await useThreads(fea, { minDof: 0, helpers: 2 });
   assert.ok(threads, 'helper threads started');
   return fea;
 }
@@ -93,7 +93,7 @@ test('flow solver: the same on helper threads', async () => {
   const solid = new Uint8Array(N);
   for (let z = 9; z < 15; z++) for (let y = 9; y < 15; y++) for (let x = 14; x < 20; x++) solid[x + dims[0] * (y + dims[1] * z)] = 1;
   const one = new LBMCPU({ dims, solid, uLat: 0.08, nuLat: 0.002 }), many = new LBMCPU({ dims, solid, uLat: 0.08, nuLat: 0.002 });
-  assert.ok(await LBMThreads.start(many, { minCells: 0 }), 'helper threads started');
+  assert.ok(await LBMThreads.start(many, { minCells: 0, helpers: 2 }), 'helper threads started');
   for (let s = 0; s < 20; s++) { one.step(s === 19); many.step(s === 19); }
   assert.deepStrictEqual(Float32Array.from(many.macro), Float32Array.from(one.macro));
   many.threads.stop();
@@ -104,7 +104,7 @@ test('threads need shared memory: none without cross-origin isolation', async ()
   globalThis.crossOriginIsolated = false;
   try {
     const m = bar(16, 4);
-    assert.equal(await Threads.start(new VoxelFEA({ dims: m.dims, density: m.density, nu, bc: m.bc }), { minDof: 0 }), null);
+    assert.equal(await Threads.start(new VoxelFEA({ dims: m.dims, density: m.density, nu, bc: m.bc }), { minDof: 0, helpers: 2 }), null);
   } finally {
     globalThis.crossOriginIsolated = isolated;
   }

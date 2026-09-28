@@ -19,10 +19,19 @@ const tagOf = (gen) => gen << CHUNK_BITS;
 // sends the helpers back to their event loop to receive more shared state (share())
 const LISTEN = -1;
 
-/** How many helper threads this context can run (0 without shared memory or with one core). */
-export function availableThreads(maxThreads) {
-  if (typeof SharedArrayBuffer === 'undefined' || !globalThis.crossOriginIsolated || typeof Worker === 'undefined') return 0;
-  return Math.max(0, Math.min(maxThreads, (globalThis.navigator?.hardwareConcurrency || 1) - 1));
+/** Whether this context can share memory with helper threads (cross-origin isolated, with workers). */
+export function sharedMemory() {
+  return typeof SharedArrayBuffer !== 'undefined' && !!globalThis.crossOriginIsolated && typeof Worker !== 'undefined';
+}
+
+/**
+ * How many helper threads to start: all cores but two, one for the calling worker and one for the
+ * page and the GPU process (with every core busy they starve: the window freezes during a solve on
+ * a small machine), or none without shared memory. `helpers` overrides the count.
+ */
+export function availableThreads(maxThreads, helpers = null) {
+  if (!sharedMemory()) return 0;
+  return helpers ?? Math.max(0, Math.min(maxThreads, (globalThis.navigator?.hardwareConcurrency || 1) - 2));
 }
 
 /**
