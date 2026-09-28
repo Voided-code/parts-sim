@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 
@@ -34,17 +35,50 @@ namespace {
 
 struct Solved {
     std::unique_ptr<VoxelFEA> fea;
+    std::unique_ptr<GpuFeaSolver> gpu;
+    int64_t coarsest = 0;
     SolveResult sol;
     std::string engine, gpuNote;
 };
 
-// build the multigrid hierarchy and solve: GPU when allowed and working, else all CPU cores
+// The last linear static model (multigrid hierarchy and GPU solver), which the next run takes over
+// when it solves the same mesh again (only the loads or the modulus changed): building them is a
+// tenth to a fifth of such a run on large parts. Never destroyed (its GPU buffers must not outlive
+// the GPU context at exit); dropKeptModel() frees it.
+struct KeptModel {
+    std::mutex lock;
+    std::array<int, 3> dims{};
+    std::vector<float> density;
+    std::vector<uint8_t> bc;
+    double nu = 0;
+    int64_t coarsest = 0;
+    std::unique_ptr<VoxelFEA> fea;
+    std::unique_ptr<GpuFeaSolver> gpu;
+};
+KeptModel& kept() {
+    static KeptModel* k = new KeptModel;
+    return *k;
+}
+
+// build the multigrid hierarchy (or take the kept one when `reuse`) and solve: GPU when allowed and
+// working, else all CPU cores
 Solved buildAndSolve(const StructuralInput& in, const std::vector<float>& density, const std::vector<double>* x0, const std::string& stage,
-                     const ProgressFn& progress, bool& gpuFailed, std::string& gpuNote) {
+                     const ProgressFn& progress, bool& gpuFailed, std::string& gpuNote, bool reuse = false) {
     Solved s;
     const bool gpu = in.useGPU && !gpuFailed && gpuAvailable();
+    const int64_t coarsest = gpu ? GPU_COARSEST_DOF : 1100;
     TraceTimer trace("multigrid build");
-    s.fea = std::make_unique<VoxelFEA>(in.dims, density, in.nu, in.bc, gpu ? GPU_COARSEST_DOF : 1100);
+    if (reuse) {
+        KeptModel& k = kept();
+        std::lock_guard<std::mutex> g(k.lock);
+        if (k.fea && k.dims == in.dims && k.nu == in.nu && k.coarsest == coarsest && k.density == density && k.bc == in.bc) {
+            s.fea = std::move(k.fea);
+            s.gpu = std::move(k.gpu);
+            trace.lap("  kept from the last run");
+        }
+    }
+    if (!s.fea) s.fea = std::make_unique<VoxelFEA>(in.dims, density, in.nu, in.bc, coarsest);
+    s.coarsest = coarsest;
     trace.lap("GPU setup");
     SolveOptions o;
     o.tol = 1e-6;
@@ -59,12 +93,12 @@ Solved buildAndSolve(const StructuralInput& in, const std::vector<float>& densit
     };
     if (gpu) {
         try {
-            GpuFeaSolver g(*s.fea);
-            if (std::getenv("PARTS_SIM_PROFILE")) std::fputs(g.profile(50).c_str(), stderr);
+            if (!s.gpu) s.gpu = std::make_unique<GpuFeaSolver>(*s.fea);
+            if (std::getenv("PARTS_SIM_PROFILE")) std::fputs(s.gpu->profile(50).c_str(), stderr);
             trace.lap("GPU solve");
             o.maxIter = 3000;
             o.onProgress = report("GPU");
-            s.sol = g.solve(in.f, o);
+            s.sol = s.gpu->solve(in.f, o);
             if (s.sol.cancelled) throw std::runtime_error("Cancelled");
             if (s.sol.converged) {
                 s.engine = "GPU";
@@ -76,6 +110,7 @@ Solved buildAndSolve(const StructuralInput& in, const std::vector<float>& densit
             if (cancelled) throw;
             gpuFailed = true;
             gpuNote = e.what();
+            s.gpu.reset();
         }
     }
     if (std::getenv("PARTS_SIM_PROFILE")) std::fputs(s.fea->profile().c_str(), stderr);
@@ -96,6 +131,19 @@ double maxDisp(const std::vector<double>& u) {
 
 }  // namespace
 
+void dropKeptModel() {
+    KeptModel& k = kept();
+    std::unique_ptr<GpuFeaSolver> gpu;
+    std::unique_ptr<VoxelFEA> fea;
+    {
+        std::lock_guard<std::mutex> g(k.lock);
+        gpu = std::move(k.gpu);
+        fea = std::move(k.fea);
+        k.density = {};
+        k.bc = {};
+    }
+}
+
 StaticResult solveStatic(const StructuralInput& in, const ProgressFn& progress) {
     TraceTimer trace("prune");
     const auto held = heldNodes(in.bc);
@@ -104,8 +152,8 @@ StaticResult solveStatic(const StructuralInput& in, const ProgressFn& progress) 
     bool gpuFailed = false;
     std::string gpuNote;
     trace.lap("build + solve");
-    Solved s = buildAndSolve(in, pruned.density, nullptr, "Solving", progress, gpuFailed, gpuNote);
-    trace.lap("stresses + result");
+    Solved s = buildAndSolve(in, pruned.density, nullptr, "Solving", progress, gpuFailed, gpuNote, true);
+    trace.lap("stresses");
     if (s.sol.cancelled) throw std::runtime_error("Cancelled");
     const double lost = lostLoadFraction(*s.fea, in.f);
     if (!s.sol.converged)
@@ -116,6 +164,7 @@ StaticResult solveStatic(const StructuralInput& in, const ProgressFn& progress) 
     const double scale = 1 / (in.E * in.h);
     for (size_t i = 0; i < u.size(); i++) u[i] = s.sol.u[i] * scale;
     auto st = s.fea->stresses(u, in.E, in.h);
+    trace.lap("result");
     r.u.assign(u.begin(), u.end());
     r.nodeVM = std::move(st.nodeVM);
     r.nodeP1 = std::move(st.nodeP1);
@@ -132,6 +181,18 @@ StaticResult solveStatic(const StructuralInput& in, const ProgressFn& progress) 
     r.voxels = int(s.fea->levels[0].elems.size());
     r.engine = s.engine;
     r.gpuNote = s.engine == "CPU" && in.useGPU ? s.gpuNote : "";
+    // kept for the next run (replacing the last kept model, which is freed outside the lock)
+    {
+        KeptModel& k = kept();
+        std::lock_guard<std::mutex> g(k.lock);
+        std::swap(k.fea, s.fea);
+        std::swap(k.gpu, s.gpu);
+        k.dims = in.dims;
+        k.nu = in.nu;
+        k.coarsest = s.coarsest;
+        k.density = r.density;
+        k.bc = in.bc;
+    }
     return r;
 }
 

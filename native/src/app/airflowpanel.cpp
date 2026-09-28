@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 
+#include "fea/static_study.hpp"
 #include "gpu/gpu.hpp"
 #include "mainwindow.hpp"
 #include "structuralpanel.hpp"
@@ -414,6 +415,7 @@ void AirflowPanel::run() {
         });
         job_ = runJob<bool>(this,
             [building, part, o](JobControl& ctl) {
+                dropKeptModel();  // the last bend test's model: the flow needs the memory more
                 building->setup(part, o, [&ctl](const std::string& msg) {
                     ctl.progress(-1, msg);
                     return ctl.cancelled();

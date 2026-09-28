@@ -50,7 +50,6 @@ uint16_t toHalf(float f) {
 
 struct GpuFeaSolver::Impl {
     GpuContext& ctx;
-    std::unique_ptr<std::lock_guard<std::mutex>> guard;
     std::unique_ptr<GpuProgram> prog;
     struct Lvl {
         const Level* lv;
@@ -74,7 +73,7 @@ struct GpuFeaSolver::Impl {
     int64_t n = 0;
     int64_t coarseM = 0;
 
-    explicit Impl(GpuContext& c) : ctx(c), guard(std::make_unique<std::lock_guard<std::mutex>>(c.lock)) {}
+    explicit Impl(GpuContext& c) : ctx(c) {}
 
     void run(WGPUComputePassEncoder pass, const char* entry, WGPUBindGroup group, uint64_t count) {
         const auto d = gpuDispatchSize(ctx, count);
@@ -254,6 +253,7 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
     GpuContext* ctx = GpuContext::get();
     if (!ctx) throw std::runtime_error("no usable GPU adapter was found");
     if (fea.coarse.A.empty() || fea.coarse.m == 0) throw std::runtime_error("the coarsest level has no direct solver");
+    std::lock_guard<std::mutex> lock(ctx->lock);  // (each call takes the GPU for its own work)
     impl_ = std::make_unique<Impl>(*ctx);
     Impl& I = *impl_;
     TraceTimer trace("  GPU shaders");
@@ -422,10 +422,15 @@ GpuFeaSolver::GpuFeaSolver(VoxelFEA& fea) : fea_(fea) {
     gpuPopErrors(*ctx, "GPU solver setup failed");
 }
 
-GpuFeaSolver::~GpuFeaSolver() = default;
+GpuFeaSolver::~GpuFeaSolver() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->ctx.lock);
+    impl_.reset();
+}
 
 void GpuFeaSolver::precondition(const double* r, double* z) {
     Impl& I = *impl_;
+    std::lock_guard<std::mutex> lock(I.ctx.lock);
     const Level& lv = fea_.levels[0];
     const int64_t n = I.n;
     // the V-cycle is linear: scale r to order one so float32 neither underflows nor loses digits
@@ -451,6 +456,7 @@ SolveResult GpuFeaSolver::solve(const std::vector<double>& f, const SolveOptions
     // time the GPU's residual has dropped tenfold, its solution is added to the 64-bit one on the
     // CPU and the true residual f - K u, computed there in 64-bit, replaces the GPU's.
     Impl& I = *impl_;
+    std::lock_guard<std::mutex> lock(I.ctx.lock);
     const Level& L = fea_.levels[0];
     const int64_t n = L.nDof;
     if (int64_t(f.size()) != n || (opts.x0 && int64_t(opts.x0->size()) != n)) throw std::invalid_argument("Force or displacement vector has the wrong size.");
@@ -569,6 +575,7 @@ SolveResult GpuFeaSolver::solve(const std::vector<double>& f, const SolveOptions
 
 std::string GpuFeaSolver::profile(int reps) {
     Impl& I = *impl_;
+    std::unique_lock<std::mutex> lock(I.ctx.lock);
     auto time = [&](const std::function<void(WGPUComputePassEncoder)>& record) {
         auto enc = I.encoder();
         auto pass = I.begin(enc);
@@ -635,6 +642,7 @@ std::string GpuFeaSolver::profile(int reps) {
         std::snprintf(line, sizeof line, "read 64 B %.3f ms, write vector %.3f ms, read vector %.3f ms\n", tRead, tWrite, tDown);
         out += line;
     }
+    lock.unlock();  // precondition() takes it
     std::vector<double> r(I.n, 1.0), z(I.n);
     precondition(r.data(), z.data());
     const auto t0 = std::chrono::steady_clock::now();

@@ -41,8 +41,13 @@ struct StaticResult {
     std::string engine = "CPU", gpuNote;
 };
 
-/** One linear static solve (multigrid CG on the GPU when available, else all CPU cores). */
+/**
+ * One linear static solve (multigrid CG on the GPU when available, else all CPU cores). Its model
+ * is kept for the next solve of the same mesh (dropKeptModel() frees it).
+ */
 StaticResult solveStatic(const StructuralInput& in, const ProgressFn& progress);
+/** Frees the model the last solveStatic kept (its memory and GPU buffers). */
+void dropKeptModel();
 
 struct BreakStep {
     int step;
