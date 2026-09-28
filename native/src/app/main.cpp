@@ -9,7 +9,9 @@
 #include <QStyleHints>
 #include <QTimer>
 #include <cstdio>
+#include <cstdlib>
 
+#include "jobs.hpp"
 #include "mainwindow.hpp"
 #include "structuralpanel.hpp"
 #include "thermalpanel.hpp"
@@ -186,20 +188,32 @@ int main(int argc, char** argv) {
     app.setWindowIcon(QIcon(QStringLiteral(":/icon.png")));
     const bool dark = app.styleHints()->colorScheme() == Qt::ColorScheme::Dark;
     app.setStyleSheet(styleSheet(dark));
-    ps::MainWindow w;
-    app.window = &w;
-    w.show();
-    QStringList files = app.pending;
-    const QStringList args = app.arguments();
-    for (int i = 1; i < args.size(); i++)
-        if (!args[i].startsWith('-')) files << args[i];
-    if (qEnvironmentVariableIsSet("PARTS_SIM_SCRIPT")) {
-        const QStringList steps = qEnvironmentVariable("PARTS_SIM_SCRIPT").split(';', Qt::SkipEmptyParts);
-        QTimer::singleShot(500, &w, [&w, steps] { runScript(&w, steps); });
-    } else if (!files.isEmpty()) QTimer::singleShot(0, &w, [&w, files] { w.openFiles(files); });
-    else if (qEnvironmentVariableIsSet("PARTS_SIM_SAMPLE")) {
-        const QString id = qEnvironmentVariable("PARTS_SIM_SAMPLE");
-        QTimer::singleShot(0, &w, [&w, id] { w.loadSample(id); });
+    int code = 0;
+    {
+        ps::MainWindow w;
+        app.window = &w;
+        w.show();
+        QStringList files = app.pending;
+        const QStringList args = app.arguments();
+        for (int i = 1; i < args.size(); i++)
+            if (!args[i].startsWith('-')) files << args[i];
+        if (qEnvironmentVariableIsSet("PARTS_SIM_SCRIPT")) {
+            const QStringList steps = qEnvironmentVariable("PARTS_SIM_SCRIPT").split(';', Qt::SkipEmptyParts);
+            QTimer::singleShot(500, &w, [&w, steps] { runScript(&w, steps); });
+        } else if (!files.isEmpty()) QTimer::singleShot(0, &w, [&w, files] { w.openFiles(files); });
+        else if (qEnvironmentVariableIsSet("PARTS_SIM_SAMPLE")) {
+            const QString id = qEnvironmentVariable("PARTS_SIM_SAMPLE");
+            QTimer::singleShot(0, &w, [&w, id] { w.loadSample(id); });
+        }
+        code = app.exec();
     }
-    return app.exec();
+    app.window = nullptr;
+    // A job still running on its detached thread (such as the start-up speed calibration, inside a
+    // slow software GPU driver's shader compiler) must not run into the libraries' exit-time
+    // teardown: leave without it.
+    if (ps::runningJobs() > 0) {
+        std::fflush(nullptr);
+        std::_Exit(code);
+    }
+    return code;
 }

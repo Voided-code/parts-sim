@@ -40,6 +40,9 @@ private:
     std::atomic<int64_t> lastProgress_{0};
 };
 
+/** Jobs whose threads are still running (they are detached: nothing waits for them at exit). */
+std::atomic<int>& runningJobs();
+
 /**
  * Start work on a new thread. done(result) or fail(message, cancelled) run on the UI thread in
  * `context`'s thread, and are dropped if `context` was destroyed or the job was cancelled.
@@ -63,7 +66,9 @@ std::shared_ptr<JobControl> runJob(QObject* context, std::function<R(JobControl&
     ctl->onProgress_ = [progress](double f, std::string t) {
         if (progress) progress(f, QString::fromStdString(t));
     };
+    runningJobs()++;
     std::thread([ctl, context, work = std::move(work), done = std::move(done), fail = std::move(fail)]() mutable {
+        struct Running { ~Running() { runningJobs()--; } } running;
         QPointer<QObject> ctx(context);
         try {
             auto result = std::make_shared<R>(work(*ctl));

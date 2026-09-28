@@ -7,6 +7,11 @@
 
 namespace ps {
 
+std::atomic<int>& runningJobs() {
+    static std::atomic<int> n{0};
+    return n;
+}
+
 void JobControl::progress(double frac, const std::string& text) {
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     int64_t last = lastProgress_.load();
