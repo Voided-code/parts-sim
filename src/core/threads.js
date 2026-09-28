@@ -40,7 +40,7 @@ export function availableThreads(maxThreads, helpers = null) {
  */
 export function takeChunks(s, gen, fn) {
   const { ctrl } = s;
-  const tag = tagOf(gen), chunks = ctrl[CHUNKS];
+  const tag = tagOf(gen), chunks = Atomics.load(ctrl, CHUNKS);
   for (;;) {
     const w = Atomics.load(ctrl, NEXT);
     if ((w & ~CHUNK_MASK) !== tag || (w & CHUNK_MASK) >= chunks) return;
@@ -87,11 +87,13 @@ export class SharedThreads {
     const { ctrl } = this.s;
     chunks = this.chunks = Math.max(1, Math.min(CHUNK_MASK, chunks));
     const gen = (this.gen = (this.gen + 1) | 0);
-    ctrl[OP] = op;
-    ctrl[COUNT] = count;
-    ctrl[CHUNKS] = chunks;
+    // the new tag before the call's chunk count: a helper still looking for work from the last call
+    // that reads this count then also sees the new tag, so it cannot take a chunk with it
     Atomics.store(ctrl, DONE, 0);
     Atomics.store(ctrl, NEXT, tagOf(gen));
+    Atomics.store(ctrl, OP, op);
+    Atomics.store(ctrl, COUNT, count);
+    Atomics.store(ctrl, CHUNKS, chunks);
     Atomics.store(ctrl, GEN, gen);
     Atomics.notify(ctrl, GEN);
     this.work(this.s, gen);
@@ -105,7 +107,7 @@ export class SharedThreads {
   async share(extra) {
     const { ctrl } = this.s;
     Atomics.store(ctrl, LISTENED, 0);
-    ctrl[OP] = LISTEN;
+    Atomics.store(ctrl, OP, LISTEN);
     Atomics.store(ctrl, GEN, (this.gen = (this.gen + 1) | 0));
     Atomics.notify(ctrl, GEN);
     for (let d; (d = Atomics.load(ctrl, LISTENED)) < this.workers.length;) Atomics.wait(ctrl, LISTENED, d);
@@ -138,7 +140,7 @@ export function serve(work, onShare = null) {
     for (;;) {
       Atomics.wait(ctrl, GEN, gen);
       gen = Atomics.load(ctrl, GEN);
-      if (ctrl[OP] === LISTEN) {
+      if (Atomics.load(ctrl, OP) === LISTEN) {
         Atomics.add(ctrl, LISTENED, 1);
         Atomics.notify(ctrl, LISTENED);
         return;

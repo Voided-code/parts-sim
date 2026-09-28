@@ -1,5 +1,6 @@
 // The solvers give exactly the same results on helper threads (core/threads.js) as on one thread.
-// (Each test stops its helpers: under the test runner they would keep the process alive.)
+// Two helpers even on two cores: preempted helpers are part of what this checks. (Each test stops
+// its helpers, also when it fails: under the test runner they would keep the process alive.)
 import './helpers/webworker.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -28,17 +29,18 @@ function bar(nx = 64, n = 12, fx = 0, fy = -1) {
   return { dims, density, bc, f };
 }
 
-async function withThreads(model) {
+async function withThreads(t, model) {
   const fea = new VoxelFEA({ dims: model.dims, density: model.density, nu, bc: model.bc });
   const threads = await useThreads(fea, { minDof: 0, helpers: 2 });
   assert.ok(threads, 'helper threads started');
+  t.after(() => threads.stop());
   return fea;
 }
 
-test('static solve, stresses and reactions: the same on helper threads', async () => {
+test('static solve, stresses and reactions: the same on helper threads', async (t) => {
   const m = bar();
   const one = new VoxelFEA({ dims: m.dims, density: m.density, nu, bc: m.bc });
-  const many = await withThreads(m);
+  const many = await withThreads(t, m);
   const a = one.solve(m.f), b = many.solve(m.f);
   assert.equal(b.iterations, a.iterations);
   assert.deepStrictEqual(b.u, a.u);
@@ -47,16 +49,15 @@ test('static solve, stresses and reactions: the same on helper threads', async (
   // the next model takes the helpers over
   many.threads.release();
   const m2 = bar(48, 12);
-  const next = await withThreads(m2);
+  const next = await withThreads(t, m2);
   const c = next.solve(m2.f), d = new VoxelFEA({ dims: m2.dims, density: m2.density, nu, bc: m2.bc }).solve(m2.f);
   assert.deepStrictEqual(c.u, d.u);
-  next.threads.stop();
 });
 
-test('frequencies and buckling (LOBPCG in a shared arena): the same on helper threads', async () => {
+test('frequencies and buckling (LOBPCG in a shared arena): the same on helper threads', async (t) => {
   const m = bar(64, 12, -1, 0);
   const one = new VoxelFEA({ dims: m.dims, density: m.density, nu, bc: m.bc });
-  const many = await withThreads(m);
+  const many = await withThreads(t, m);
   const opts = { nev: 3, E: 2e11, density: 7850, h: 1e-3 };
   const fa = await naturalFrequencies(one, opts), fb = await naturalFrequencies(many, opts);
   assert.equal(fb.iterations, fa.iterations);
@@ -67,10 +68,9 @@ test('frequencies and buckling (LOBPCG in a shared arena): the same on helper th
   const ba = await bucklingFactors(one, sigma, { nev: 1 }), bb = await bucklingFactors(many, sigma, { nev: 1 });
   assert.deepStrictEqual(bb.factors, ba.factors);
   assert.deepStrictEqual(bb.modes, ba.modes);
-  many.threads.stop();
 });
 
-test('nonlinear static with plasticity: the same on helper threads', async () => {
+test('nonlinear static with plasticity: the same on helper threads', async (t) => {
   const m = bar(48, 10, 0, -40);
   const plastic = hardeningFor({ E: 200, yield: 250, uts: 400, elongation: 0.2 });
   const f = m.f.map((v) => v / (2e11 * 1e-6));
@@ -81,22 +81,21 @@ test('nonlinear static with plasticity: the same on helper threads', async () =>
     return loadRamp(model, f, async (r) => pre([r])[0], { target: 1, steps: 3, maxSteps: 6 });
   };
   const a = await run(new VoxelFEA({ dims: m.dims, density: m.density, nu, bc: m.bc }));
-  const many = await withThreads(m);
+  const many = await withThreads(t, m);
   const b = await run(many);
   assert.equal(b.lam, a.lam);
   assert.deepStrictEqual(b.u, a.u);
-  many.threads.stop();
 });
 
-test('flow solver: the same on helper threads', async () => {
+test('flow solver: the same on helper threads', async (t) => {
   const dims = [48, 24, 24], N = dims[0] * dims[1] * dims[2];
   const solid = new Uint8Array(N);
   for (let z = 9; z < 15; z++) for (let y = 9; y < 15; y++) for (let x = 14; x < 20; x++) solid[x + dims[0] * (y + dims[1] * z)] = 1;
   const one = new LBMCPU({ dims, solid, uLat: 0.08, nuLat: 0.002 }), many = new LBMCPU({ dims, solid, uLat: 0.08, nuLat: 0.002 });
   assert.ok(await LBMThreads.start(many, { minCells: 0, helpers: 2 }), 'helper threads started');
+  t.after(() => many.threads.stop());
   for (let s = 0; s < 20; s++) { one.step(s === 19); many.step(s === 19); }
   assert.deepStrictEqual(Float32Array.from(many.macro), Float32Array.from(one.macro));
-  many.threads.stop();
 });
 
 test('threads need shared memory: none without cross-origin isolation', async () => {
