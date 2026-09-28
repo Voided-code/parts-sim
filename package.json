@@ -1,6 +1,6 @@
 {
   "name": "parts-sim",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Open-source desktop app for structural (static, nonlinear, frequency, buckling, fatigue, drop, dynamic, optimization), thermal and airflow simulation of STEP, SolidWorks, IGES, STL and OBJ parts.",
   "license": "MIT",
   "type": "module",
