@@ -10,7 +10,8 @@
 // (typically 10-50) even for long slender parts in bending, where plain Jacobi-CG would need
 // thousands. Matrix products gather each node's rows from its 8 voxels; inside a uniform region
 // (the 8 voxels the same s * Kb, the level's uniform element) they use the assembled 27-point
-// stencil, 243 multiply-adds instead of 576 (the native app's scheme).
+// stencil, 243 multiply-adds instead of 576 (the native app's scheme). Only the coarse elements
+// that are not s * Kb keep their own matrix, in 32 bits (like the native app and the GPU solver).
 //
 // Units: the solver works in a normalized system (E = 1, voxel size = 1). With
 // physical E [Pa] and voxel size h [m], u_physical = u_normalized / (E * h) for forces in N.
@@ -18,13 +19,16 @@
 import { HEX_NODES, hexElement } from './hex8.js';
 
 const COARSEST_MAX_DOF = 1100;
+// levels with fewer nodes than this run their steps on the calling thread alone (threads.js)
+const THREAD_MIN_NODES = 4096;
+const NO_SCALARS = [];
 
 // corner index of the element node at unit offset (x, y, z)
-const corner = (x, y, z) => (y ? (x ? 2 : 3) : (x ? 1 : 0)) + 4 * z;
+export const corner = (x, y, z) => (y ? (x ? 2 : 3) : (x ? 1 : 0)) + 4 * z;
 
 /** The smoother estimate's Lanczos start vector on a level: pseudo-random, unit length, 0 where held. */
-export function lanczosStart(L) {
-  const n = L.nDof, v = new Float64Array(n);
+export function lanczosStart(L, v = new Float64Array(L.nDof)) {
+  const n = L.nDof;
   let seed = 12345, nv = 0;
   for (let i = 0; i < n; i++) {
     seed = (seed * 1103515245 + 12345) & 0x7fffffff;
@@ -146,7 +150,7 @@ function makeLevel(nx, ny, nz) {
   return {
     nx, ny, nz, NX, NY, NZ, nNodes, nDof: 3 * nNodes,
     off: Int32Array.of(0, 1, 1 + NX, NX, NXY, 1 + NXY, 1 + NX + NXY, NX + NXY),
-    elems: null, base: null, rho: null, K: null,
+    elems: null, base: null, rho: null, scale: null, kIdx: null, Kown: null, K64: null,
     fixed: null, bc: null, invDiag: null, omega: 0.5,
     r: null, z: null, t: null,
   };
@@ -162,14 +166,174 @@ function transferMap(nFineElems) {
   return { c0, c1 };
 }
 
+// ---------- range kernels ----------
+// Every step of the solver works on a range of a level's nodes, so that helper threads (threads.js)
+// can share it: kernel(levels, l, v, sc, part, n0, n1) on the nodes n0 <= n < n1 of level l (the
+// coarse nodes of level l + 1 for restrict), with vectors v and scalars sc. Dot products write one
+// partial sum per block of BLOCK nodes into part (ranges start at block boundaries), which makes
+// them come out the same on any number of threads.
+
+export const BLOCK = 512;
+export const OP = {
+  apply: 1, smoothFirst: 2, smoothRes: 3, smoothNext: 4, restrict: 5, prolong: 6,
+  dot: 7, cgStep: 8, cgDirection: 9, lanczosScale: 10, lanczosOrtho: 11, lanczosNorm: 12, lanczosNext: 13,
+};
+/** Kernels that write partial sums (their ranges must start at block boundaries). */
+export const REDUCES = new Set([OP.dot, OP.cgStep, OP.lanczosOrtho, OP.lanczosNorm]);
+
+export const KERNELS = [];
+KERNELS[OP.apply] = (Ls, l, v, sc, part, n0, n1) => applyNodes(Ls[l], v[0], v[1], sc[0] === 1, n0, n1);
+// Chebyshev smoothing steps on the level's own vectors: from zero, from the current z, and the second step
+KERNELS[OP.smoothFirst] = (Ls, l, v, sc, part, n0, n1) => {
+  const { r, z, d, invDiag: Di } = Ls[l], first = sc[0];
+  for (let i = 3 * n0; i < 3 * n1; i++) { d[i] = first * Di[i] * r[i]; z[i] = d[i]; }
+};
+KERNELS[OP.smoothRes] = (Ls, l, v, sc, part, n0, n1) => {
+  const { r, z, t, d, invDiag: Di } = Ls[l], first = sc[0];
+  for (let i = 3 * n0; i < 3 * n1; i++) { d[i] = first * Di[i] * (r[i] - t[i]); z[i] += d[i]; }
+};
+KERNELS[OP.smoothNext] = (Ls, l, v, sc, part, n0, n1) => {
+  const { r, z, t, d, invDiag: Di } = Ls[l], c1 = sc[0], c2 = sc[1];
+  for (let i = 3 * n0; i < 3 * n1; i++) { d[i] = c1 * d[i] + c2 * Di[i] * (r[i] - t[i]); z[i] += d[i]; }
+};
+KERNELS[OP.restrict] = (Ls, l, v, sc, part, n0, n1) => restrictNodes(Ls[l], Ls[l + 1], v[0], v[1], v[2], sc[0] === 1, n0, n1);
+KERNELS[OP.prolong] = (Ls, l, v, sc, part, n0, n1) => prolongNodes(Ls[l], v[0], v[1], n0, n1);
+KERNELS[OP.dot] = (Ls, l, v, sc, part, n0, n1) => {
+  const a = v[0], b = v[1];
+  for (let b0 = n0; b0 < n1; b0 += BLOCK) {
+    let s = 0;
+    for (let i = 3 * b0, e = 3 * Math.min(n1, b0 + BLOCK); i < e; i++) s += a[i] * b[i];
+    part[b0 / BLOCK] = s;
+  }
+};
+// conjugate gradients: x += alpha p, r -= alpha q with the partial sums of r.r; p = z + beta p
+KERNELS[OP.cgStep] = (Ls, l, v, sc, part, n0, n1) => {
+  const [x, r, p, q] = v, alpha = sc[0];
+  for (let b0 = n0; b0 < n1; b0 += BLOCK) {
+    let s = 0;
+    for (let i = 3 * b0, e = 3 * Math.min(n1, b0 + BLOCK); i < e; i++) {
+      x[i] += alpha * p[i];
+      r[i] -= alpha * q[i];
+      s += r[i] * r[i];
+    }
+    part[b0 / BLOCK] = s;
+  }
+};
+KERNELS[OP.cgDirection] = (Ls, l, v, sc, part, n0, n1) => {
+  const [p, z] = v, beta = sc[0];
+  for (let i = 3 * n0; i < 3 * n1; i++) p[i] = z[i] + beta * p[i];
+};
+// Lanczos on D^-1/2 K D^-1/2 (VoxelFEA.estimateOmega)
+KERNELS[OP.lanczosScale] = (Ls, l, v, sc, part, n0, n1) => {
+  const [x, u] = v, Di = Ls[l].invDiag;
+  for (let i = 3 * n0; i < 3 * n1; i++) x[i] = Math.sqrt(Di[i]) * u[i];
+};
+KERNELS[OP.lanczosOrtho] = (Ls, l, v, sc, part, n0, n1) => {
+  const [w, u, uPrev] = v, Di = Ls[l].invDiag, b = sc[0];
+  for (let b0 = n0; b0 < n1; b0 += BLOCK) {
+    let s = 0;
+    for (let i = 3 * b0, e = 3 * Math.min(n1, b0 + BLOCK); i < e; i++) {
+      w[i] = Math.sqrt(Di[i]) * w[i] - b * uPrev[i];
+      s += w[i] * u[i];
+    }
+    part[b0 / BLOCK] = s;
+  }
+};
+KERNELS[OP.lanczosNorm] = (Ls, l, v, sc, part, n0, n1) => {
+  const [w, u] = v, a = sc[0];
+  for (let b0 = n0; b0 < n1; b0 += BLOCK) {
+    let s = 0;
+    for (let i = 3 * b0, e = 3 * Math.min(n1, b0 + BLOCK); i < e; i++) {
+      w[i] -= a * u[i];
+      s += w[i] * w[i];
+    }
+    part[b0 / BLOCK] = s;
+  }
+};
+KERNELS[OP.lanczosNext] = (Ls, l, v, sc, part, n0, n1) => {
+  const [u, w, x] = v, Di = Ls[l].invDiag, b = sc[0];
+  for (let i = 3 * n0; i < 3 * n1; i++) { u[i] = w[i] / b; x[i] = Math.sqrt(Di[i]) * u[i]; }
+};
+
+/**
+ * rc = P^T (a - b) on the coarse nodes N0 <= n < N1 of C (b may be null; held DOFs of rc zeroed if
+ * zeroFixed): each coarse node gathers its fine neighbours in fine-node order, as a scatter over the
+ * fine nodes would add them.
+ */
+export function restrictNodes(F, C, a, b, rc, zeroFixed, N0, N1) {
+  const { NX, NY, NZ } = F, CNX = C.NX, CNY = C.NY, fixed = C.fixed;
+  let I = N0 % CNX, J = ((N0 / CNX) | 0) % CNY, K = (N0 / (CNX * CNY)) | 0;
+  for (let cn = N0; cn < N1; cn++) {
+    let sx = 0, sy = 0, sz = 0;
+    const k1 = Math.min(NZ - 1, 2 * K + 1), j1 = Math.min(NY - 1, 2 * J + 1), i1 = Math.min(NX - 1, 2 * I + 1);
+    for (let k = Math.max(0, 2 * K - 1); k <= k1; k++) {
+      const wk = k === 2 * K ? 1 : 0.5;
+      for (let j = Math.max(0, 2 * J - 1); j <= j1; j++) {
+        const wj = j === 2 * J ? 1 : 0.5;
+        for (let i = Math.max(0, 2 * I - 1); i <= i1; i++) {
+          const w = (i === 2 * I ? 1 : 0.5) * wj * wk;
+          const fn = 3 * (i + NX * (j + NY * k));
+          if (b) {
+            sx += w * (a[fn] - b[fn]); sy += w * (a[fn + 1] - b[fn + 1]); sz += w * (a[fn + 2] - b[fn + 2]);
+          } else {
+            sx += w * a[fn]; sy += w * a[fn + 1]; sz += w * a[fn + 2];
+          }
+        }
+      }
+    }
+    const o = 3 * cn;
+    rc[o] = zeroFixed && fixed[o] ? 0 : sx;
+    rc[o + 1] = zeroFixed && fixed[o + 1] ? 0 : sy;
+    rc[o + 2] = zeroFixed && fixed[o + 2] ? 0 : sz;
+    if (++I === CNX) { I = 0; if (++J === CNY) { J = 0; K++; } }
+  }
+}
+
+/** zf += P zc on the fine nodes n0 <= n < n1 of F (free DOFs only). */
+export function prolongNodes(F, zc, zf, n0, n1) {
+  const { NX, NY, fixed } = F, CNX = (NX >> 1) + 1, CNY = (NY >> 1) + 1;
+  const NXY = NX * NY;
+  let i = n0 % NX, j = ((n0 / NX) | 0) % NY, k = (n0 / NXY) | 0;
+  for (let n = n0; n < n1; n++) {
+    const fn = 3 * n;
+    if (!(fixed[fn] && fixed[fn + 1] && fixed[fn + 2])) {
+      // coarse neighbours: i / 2 for even i, (i - 1) / 2 and (i + 1) / 2 with half weights for odd i
+      const i0 = i >> 1, i1 = i & 1 ? i0 + 1 : -1, wi = i & 1 ? 0.5 : 1;
+      const j0 = j >> 1, j1 = j & 1 ? j0 + 1 : -1, wj = j & 1 ? 0.5 : 1;
+      const k0 = k >> 1, k1 = k & 1 ? k0 + 1 : -1, wk = k & 1 ? 0.5 : 1;
+      const w = wi * wj * wk;
+      let sx = 0, sy = 0, sz = 0;
+      for (let kk = 0; kk < 2; kk++) {
+        const K = kk ? k1 : k0;
+        if (K < 0) continue;
+        for (let jj = 0; jj < 2; jj++) {
+          const J = jj ? j1 : j0;
+          if (J < 0) continue;
+          for (let ii = 0; ii < 2; ii++) {
+            const I = ii ? i1 : i0;
+            if (I < 0) continue;
+            const cn = 3 * (I + CNX * (J + CNY * K));
+            sx += w * zc[cn];
+            sy += w * zc[cn + 1];
+            sz += w * zc[cn + 2];
+          }
+        }
+      }
+      if (!fixed[fn]) zf[fn] += sx;
+      if (!fixed[fn + 1]) zf[fn + 1] += sy;
+      if (!fixed[fn + 2]) zf[fn + 2] += sz;
+    }
+    if (++i === NX) { i = 0; if (++j === NY) { j = 0; k++; } }
+  }
+}
+
 /**
  * y = K x on the nodes n0 <= n < n1 of a level (held/inactive DOFs of y zeroed unless raw):
  * VoxelFEA.apply, callable on a range so that threads can share the rows (threads.js).
  */
-export function applyNodes(L, K0, x, y, raw, n0, n1) {
-  const { NX, NY, nx, ny, nz, off, emap, nodeScale, activeNode, fixed } = L;
+export function applyNodes(L, x, y, raw, n0, n1) {
+  const { NX, NY, nx, ny, nz, off, emap, nodeScale, activeNode, fixed, scale, kIdx, Kown, Kb } = L;
   const NXY = NX * NY, S0 = L.S, D = L.diagAdd;
-  const Kmat = L.K || K0, own = !!L.K;
   let i = n0 % NX, j = ((n0 / NX) | 0) % NY, k = (n0 / NXY) | 0;
   for (let n = n0; n < n1; n++) {
     const o = 3 * n;
@@ -198,17 +362,30 @@ export function applyNodes(L, K0, x, y, raw, n0, n1) {
           const e = emap[ei + nx * (ej + ny * ek)];
           if (e < 0) continue;
           const nb = n - (1 - di) - NX * (1 - dj) - NXY * (1 - dk);
-          const kb = (own ? e * 576 : 0) + 72 * corner(1 - di, 1 - dj, 1 - dk);
+          const row = 72 * corner(1 - di, 1 - dj, 1 - dk), own = kIdx === null ? -1 : kIdx[e];
           let s0_ = 0, s1 = 0, s2 = 0;
-          for (let c = 0; c < 8; c++) {
-            const p = 3 * (nb + off[c]), kc = kb + 3 * c;
-            const u0 = x[p], u1 = x[p + 1], u2 = x[p + 2];
-            s0_ += Kmat[kc] * u0 + Kmat[kc + 1] * u1 + Kmat[kc + 2] * u2;
-            s1 += Kmat[kc + 24] * u0 + Kmat[kc + 25] * u1 + Kmat[kc + 26] * u2;
-            s2 += Kmat[kc + 48] * u0 + Kmat[kc + 49] * u1 + Kmat[kc + 50] * u2;
+          if (own < 0) {
+            // s * Kb (separate loops keep each array's loads monomorphic)
+            for (let c = 0; c < 8; c++) {
+              const p = 3 * (nb + off[c]), kc = row + 3 * c;
+              const u0 = x[p], u1 = x[p + 1], u2 = x[p + 2];
+              s0_ += Kb[kc] * u0 + Kb[kc + 1] * u1 + Kb[kc + 2] * u2;
+              s1 += Kb[kc + 24] * u0 + Kb[kc + 25] * u1 + Kb[kc + 26] * u2;
+              s2 += Kb[kc + 48] * u0 + Kb[kc + 49] * u1 + Kb[kc + 50] * u2;
+            }
+            const s = scale[e];
+            a0 += s * s0_; a1 += s * s1; a2 += s * s2;
+          } else {
+            const kb = 576 * own + row;
+            for (let c = 0; c < 8; c++) {
+              const p = 3 * (nb + off[c]), kc = kb + 3 * c;
+              const u0 = x[p], u1 = x[p + 1], u2 = x[p + 2];
+              s0_ += Kown[kc] * u0 + Kown[kc + 1] * u1 + Kown[kc + 2] * u2;
+              s1 += Kown[kc + 24] * u0 + Kown[kc + 25] * u1 + Kown[kc + 26] * u2;
+              s2 += Kown[kc + 48] * u0 + Kown[kc + 49] * u1 + Kown[kc + 50] * u2;
+            }
+            a0 += s0_; a1 += s1; a2 += s2;
           }
-          const s = own ? 1 : L.rho[e];
-          a0 += s * s0_; a1 += s * s1; a2 += s * s2;
         }
       }
       if (D) { a0 += D[o] * x[o]; a1 += D[o + 1] * x[o + 1]; a2 += D[o + 2] * x[o + 2]; }
@@ -327,14 +504,19 @@ export class VoxelFEA {
       L0.diagAdd = diagAdd;
     }
     this.finishLevel(L0);
+    L0.index = 0;
     this.levels = [L0];
 
     while (true) {
       const L = this.levels[this.levels.length - 1];
       if (L.freeDof <= coarsestMaxDof || this.levels.length >= 12) break;
       if (L.nx <= 1 && L.ny <= 1 && L.nz <= 1) break;
-      this.levels.push(this.coarsen(L));
+      const C = this.coarsen(L);
+      C.index = this.levels.length;
+      this.levels.push(C);
     }
+    // partial sums of the dot products (range kernels)
+    this.part = new Float64Array(Math.ceil(L0.nNodes / BLOCK));
     // the smoothers' eigenvalue estimates come later: prepareSmoothers() before a CPU V-cycle, or the
     // GPU solver, which makes them on the GPU (they are most of the setup time for large models)
     this.buildCoarseSolver(this.levels[this.levels.length - 1]);
@@ -348,9 +530,8 @@ export class VoxelFEA {
     const nE = L.elems.length;
     for (let e = 0; e < nE; e++) {
       const n0 = L.base[e];
-      const K = L.K ? L.K : this.K0;
-      const kb = L.K ? e * 576 : 0;
-      const s = L.K ? 1 : L.rho[e];
+      const k = L.kIdx ? L.kIdx[e] : -1;
+      const K = k < 0 ? L.Kb : L.K64, kb = k < 0 ? 0 : 576 * k, s = k < 0 ? L.scale[e] : 1;
       for (let a = 0; a < 8; a++) {
         const n = n0 + L.off[a];
         active[n] = 1;
@@ -420,7 +601,6 @@ export class VoxelFEA {
       const I = ce % C.nx, J = ((ce / C.nx) | 0) % C.ny, K = (ce / (C.nx * C.ny)) | 0;
       C.base[q] = I + C.NX * (J + C.NY * K);
     }
-    C.K = new Float64Array(nE * 576);
     // Galerkin products of the fine level's uniform element per child position; a coarse element
     // whose 8 children are s * Kb is s times their sum, the coarse level's own uniform element
     const M = [], Kc = new Float64Array(576);
@@ -432,21 +612,36 @@ export class VoxelFEA {
     }
     setBase(C, Kc);
     const kids = new Int32Array(nE), first = new Float64Array(nE).fill(NaN);
-    C.scale = new Float64Array(nE);
     for (let q = 0; q < F.elems.length; q++) {
-      const cq = fineCoarse[q], out = cq * 576, c = fineChild[q];
+      const cq = fineCoarse[q];
       kids[cq]++;
       const sq = F.scale[q] > 0 ? F.scale[q] : -1;
       if (Number.isNaN(first[cq])) first[cq] = sq;
       else if (first[cq] !== sq) first[cq] = -1;
+    }
+    C.scale = new Float64Array(nE);
+    C.kIdx = new Int32Array(nE);
+    let nOwn = 0;
+    for (let q = 0; q < nE; q++) {
+      C.scale[q] = kids[q] === 8 && first[q] > 0 ? first[q] : -1;
+      C.kIdx[q] = C.scale[q] > 0 ? -1 : nOwn++;
+    }
+    // the other coarse elements get their own exact products P^T K P of their children: in 64 bits
+    // while the next level is built from them, in 32 bits for the products
+    C.K64 = new Float64Array(nOwn * 576);
+    for (let q = 0; q < F.elems.length; q++) {
+      const k = C.kIdx[fineCoarse[q]];
+      if (k < 0) continue;
+      const out = k * 576, c = fineChild[q];
       if (F.scale[q] > 0) {
         const Mc = M[c], s = F.scale[q];
-        for (let t = 0; t < 576; t++) C.K[out + t] += s * Mc[t];
+        for (let t = 0; t < 576; t++) C.K64[out + t] += s * Mc[t];
       } else {
-        galerkinAdd(C.K, out, F.K, q * 576, 1, CHILD_P[c], this.T);
+        galerkinAdd(C.K64, out, F.K64, F.kIdx[q] * 576, 1, CHILD_P[c], this.T);
       }
     }
-    for (let q = 0; q < nE; q++) C.scale[q] = kids[q] === 8 && first[q] > 0 ? first[q] : -1;
+    C.Kown = Float32Array.from(C.K64);
+    F.K64 = null;
     // A coarse DOF is held if it interpolates onto any held fine DOF.
     const mx = transferMap(F.nx), my = transferMap(F.ny), mz = transferMap(F.nz);
     C.bc = new Uint8Array(C.nDof);
@@ -471,11 +666,10 @@ export class VoxelFEA {
         }
       }
     }
-    F.maps = { mx, my, mz };
     if (F.diagAdd) {
       // lumped Galerkin product of a diagonal: row sums of P^T D P = P^T (D 1)
       C.diagAdd = new Float64Array(C.nDof);
-      this.restrict(F, C, F.diagAdd, C.diagAdd, false);
+      restrictNodes(F, C, F.diagAdd, null, C.diagAdd, false, 0, C.nNodes);
     }
     this.finishLevel(C);
     return C;
@@ -483,8 +677,26 @@ export class VoxelFEA {
 
   /** y = K x on free DOFs (held/inactive DOFs of y are zeroed unless raw). */
   apply(L, x, y, raw = false) {
-    if (this.threads && L === this.levels[0]) this.threads.apply(x, y, raw);
-    else applyNodes(L, this.K0, x, y, raw, 0, L.nNodes);
+    if (this.threads && L.nNodes >= THREAD_MIN_NODES) this.threads.apply(L.index, x, y, raw);
+    else applyNodes(L, x, y, raw, 0, L.nNodes);
+  }
+
+  /**
+   * Runs range kernel op on the nodes of level l (or count of them), on the helper threads when
+   * there are any and the level is large enough. Returns the partial sums of a reducing kernel.
+   */
+  each(op, l, v, sc = NO_SCALARS, count = this.levels[l].nNodes) {
+    if (this.threads && count >= THREAD_MIN_NODES) return this.threads.each(op, l, v, sc, count);
+    KERNELS[op](this.levels, l, v, sc, this.part, 0, count);
+    return this.part;
+  }
+
+  /** The sum of a reducing kernel over level l (the same on any number of threads). */
+  sum(op, l, v, sc = NO_SCALARS) {
+    const count = this.levels[l].nNodes, part = this.each(op, l, v, sc, count);
+    let s = 0;
+    for (let b = 0, nb = Math.ceil(count / BLOCK); b < nb; b++) s += part[b];
+    return s;
   }
 
   /** Estimates the smoothers' eigenvalue ranges where they are not known yet. */
@@ -492,26 +704,23 @@ export class VoxelFEA {
     for (let l = 0; l < this.levels.length - 1; l++) if (!(this.levels[l].lmax > 0)) this.estimateOmega(this.levels[l]);
   }
 
-  /** Largest eigenvalue of D^-1 K on a level: 10 Lanczos steps on D^-1/2 K D^-1/2. */
+  /** Largest eigenvalue of D^-1 K on a level: 10 Lanczos steps on D^-1/2 K D^-1/2 (in the level's work vectors). */
   estimateOmega(L) {
-    const n = L.nDof, sq = new Float64Array(n);
-    for (let i = 0; i < n; i++) sq[i] = Math.sqrt(L.invDiag[i]);
-    let v = lanczosStart(L), vPrev = new Float64Array(n);
-    const w = new Float64Array(n), x = new Float64Array(n);
+    const l = L.index;
+    let v = lanczosStart(L, L.r), vPrev = L.z.fill(0);
+    const w = L.t, x = L.d;
     const alpha = [], beta = [];
     let b = 0;
+    this.each(OP.lanczosScale, l, [x, v]); // x = D^-1/2 v
     for (let j = 0; j < 10; j++) {
-      for (let i = 0; i < n; i++) x[i] = sq[i] * v[i];
       this.apply(L, x, w);
-      for (let i = 0; i < n; i++) w[i] = sq[i] * w[i] - b * vPrev[i];
-      const a = dot(w, v);
-      for (let i = 0; i < n; i++) w[i] -= a * v[i];
+      const a = this.sum(OP.lanczosOrtho, l, [w, v, vPrev], [b]); // w = D^-1/2 w - b vPrev; w.v
       alpha.push(a);
-      b = Math.sqrt(dot(w, w));
+      b = Math.sqrt(this.sum(OP.lanczosNorm, l, [w, v], [a])); // w -= a v; w.w
       if (!(b > 1e-12 * Math.abs(a))) break;
       beta.push(b);
       [vPrev, v] = [v, vPrev];
-      for (let i = 0; i < n; i++) v[i] = w[i] / b;
+      this.each(OP.lanczosNext, l, [v, w, x], [b]); // v = w / b, x = D^-1/2 v
     }
     beta.length = alpha.length - 1;
     L.lmax = tridiagonalMax(alpha, beta);
@@ -523,15 +732,19 @@ export class VoxelFEA {
     let m = 0;
     for (let i = 0; i < L.nDof; i++) if (!L.fixed[i]) map[i] = m++;
     this.coarse = { map, m, A: null };
-    if (m === 0 || m > 3000) return; // falls back to Jacobi sweeps
+    if (m > 0 && m <= 3000) this.factorCoarse(L); // otherwise falls back to Jacobi sweeps
+    L.K64 = null;
+  }
+
+  factorCoarse(L) {
+    const { map, m } = this.coarse;
     const A = new Float64Array(m * m);
     const dofs = new Int32Array(24);
     for (let e = 0; e < L.elems.length; e++) {
       const n0 = L.base[e];
       for (let a = 0; a < 8; a++) for (let d = 0; d < 3; d++) dofs[3 * a + d] = map[3 * (n0 + L.off[a]) + d];
-      const K = L.K ? L.K : this.K0;
-      const kb = L.K ? e * 576 : 0;
-      const s = L.K ? 1 : L.rho[e];
+      const k = L.kIdx ? L.kIdx[e] : -1;
+      const K = k < 0 ? L.Kb : L.K64, kb = k < 0 ? 0 : 576 * k, s = k < 0 ? L.scale[e] : 1;
       for (let r = 0; r < 24; r++) {
         const gr = dofs[r];
         if (gr < 0) continue;
@@ -590,16 +803,14 @@ export class VoxelFEA {
 
   /** Degree-2 Chebyshev smoothing of L.z (from zero, or from its current value). */
   chebyshev(L, fromZero) {
-    const { r, z, t, d, invDiag: Di } = L;
-    const c = chebyshevCoefficients(L.lmax), n = z.length;
-    if (fromZero) {
-      for (let i = 0; i < n; i++) { d[i] = c.first * Di[i] * r[i]; z[i] = d[i]; }
-    } else {
-      this.apply(L, z, t);
-      for (let i = 0; i < n; i++) { d[i] = c.first * Di[i] * (r[i] - t[i]); z[i] += d[i]; }
+    const c = chebyshevCoefficients(L.lmax), l = L.index;
+    if (fromZero) this.each(OP.smoothFirst, l, NO_SCALARS, [c.first]);
+    else {
+      this.apply(L, L.z, L.t);
+      this.each(OP.smoothRes, l, NO_SCALARS, [c.first]);
     }
-    this.apply(L, z, t);
-    for (let i = 0; i < n; i++) { d[i] = c.c1 * d[i] + c.c2 * Di[i] * (r[i] - t[i]); z[i] += d[i]; }
+    this.apply(L, L.z, L.t);
+    this.each(OP.smoothNext, l, NO_SCALARS, [c.c1, c.c2]);
   }
 
   jacobiSweep(L, z, fromZero) {
@@ -610,77 +821,6 @@ export class VoxelFEA {
     }
     this.apply(L, z, t);
     for (let i = 0; i < z.length; i++) z[i] += omega * invDiag[i] * (r[i] - t[i]);
-  }
-
-  restrict(F, C, rf, rc, zeroFixed = true) {
-    rc.fill(0);
-    const { mx, my, mz } = F.maps;
-    for (let k = 0; k < F.NZ; k++) {
-      const k0 = mz.c0[k], k1 = mz.c1[k], wk = k1 < 0 ? 1 : 0.5;
-      for (let j = 0; j < F.NY; j++) {
-        const j0 = my.c0[j], j1 = my.c1[j], wj = j1 < 0 ? 1 : 0.5;
-        for (let i = 0; i < F.NX; i++) {
-          const fn = 3 * (i + F.NX * (j + F.NY * k));
-          const vx = rf[fn], vy = rf[fn + 1], vz = rf[fn + 2];
-          if (vx === 0 && vy === 0 && vz === 0) continue;
-          const i0 = mx.c0[i], i1 = mx.c1[i], wi = i1 < 0 ? 1 : 0.5;
-          for (let kk = 0; kk < 2; kk++) {
-            const K = kk ? k1 : k0;
-            if (K < 0) continue;
-            for (let jj = 0; jj < 2; jj++) {
-              const J = jj ? j1 : j0;
-              if (J < 0) continue;
-              for (let ii = 0; ii < 2; ii++) {
-                const I = ii ? i1 : i0;
-                if (I < 0) continue;
-                const w = wi * wj * wk;
-                const cn = 3 * (I + C.NX * (J + C.NY * K));
-                rc[cn] += w * vx;
-                rc[cn + 1] += w * vy;
-                rc[cn + 2] += w * vz;
-              }
-            }
-          }
-        }
-      }
-    }
-    if (zeroFixed) for (let i = 0; i < rc.length; i++) if (C.fixed[i]) rc[i] = 0;
-  }
-
-  prolongAdd(F, C, zc, zf) {
-    const { mx, my, mz } = F.maps;
-    for (let k = 0; k < F.NZ; k++) {
-      const k0 = mz.c0[k], k1 = mz.c1[k], wk = k1 < 0 ? 1 : 0.5;
-      for (let j = 0; j < F.NY; j++) {
-        const j0 = my.c0[j], j1 = my.c1[j], wj = j1 < 0 ? 1 : 0.5;
-        for (let i = 0; i < F.NX; i++) {
-          const fn = 3 * (i + F.NX * (j + F.NY * k));
-          if (F.fixed[fn] && F.fixed[fn + 1] && F.fixed[fn + 2]) continue;
-          const i0 = mx.c0[i], i1 = mx.c1[i], wi = i1 < 0 ? 1 : 0.5;
-          let sx = 0, sy = 0, sz = 0;
-          for (let kk = 0; kk < 2; kk++) {
-            const K = kk ? k1 : k0;
-            if (K < 0) continue;
-            for (let jj = 0; jj < 2; jj++) {
-              const J = jj ? j1 : j0;
-              if (J < 0) continue;
-              for (let ii = 0; ii < 2; ii++) {
-                const I = ii ? i1 : i0;
-                if (I < 0) continue;
-                const w = wi * wj * wk;
-                const cn = 3 * (I + C.NX * (J + C.NY * K));
-                sx += w * zc[cn];
-                sy += w * zc[cn + 1];
-                sz += w * zc[cn + 2];
-              }
-            }
-          }
-          if (!F.fixed[fn]) zf[fn] += sx;
-          if (!F.fixed[fn + 1]) zf[fn + 1] += sy;
-          if (!F.fixed[fn + 2]) zf[fn + 2] += sz;
-        }
-      }
-    }
   }
 
   /** z = one multigrid V-cycle applied to the full-length vector r (its held DOFs are ignored). */
@@ -698,13 +838,11 @@ export class VoxelFEA {
     const L = this.levels[l];
     if (l === this.levels.length - 1) { this.coarseSolve(L); return; }
     const C = this.levels[l + 1];
-    const { r, z, t } = L;
     this.chebyshev(L, true);
-    this.apply(L, z, t);
-    for (let i = 0; i < t.length; i++) t[i] = r[i] - t[i];
-    this.restrict(L, C, t, C.r);
+    this.apply(L, L.z, L.t);
+    this.each(OP.restrict, l, [L.r, L.t, C.r], [1], C.nNodes); // C.r = P^T (r - K z)
     this.vcycle(l + 1);
-    this.prolongAdd(L, C, C.z, z);
+    this.each(OP.prolong, l, [C.z, L.z]); // z += P zc
     this.chebyshev(L, false);
   }
 
@@ -722,48 +860,46 @@ export class VoxelFEA {
     for (let i = 0; i < n; i++) {
       if (!Number.isFinite(f[i]) || (x0 && !Number.isFinite(x0[i]))) throw new Error('Forces and displacements must be finite numbers.');
     }
-    const x = x0 ? Float64Array.from(x0) : new Float64Array(n);
-    const r = new Float64Array(n), p = new Float64Array(n), q = new Float64Array(n);
-    for (let i = 0; i < n; i++) if (fixed[i]) x[i] = 0;
     let bnorm = 0;
     for (let i = 0; i < n; i++) if (!fixed[i]) bnorm += f[i] * f[i];
     bnorm = Math.sqrt(bnorm);
-    if (bnorm === 0) return { u: x.fill(0), iterations: 0, residual: 0, converged: true };
+    if (bnorm === 0) return { u: new Float64Array(n), iterations: 0, residual: 0, converged: true };
+    // work vectors on the finest level (shared with the helper threads if there are any): the
+    // residual is the V-cycle's input L.r and the preconditioned residual its output L.z
+    this.prepareSmoothers(); // (uses the work vectors)
+    const r = L.r, z = L.z;
+    const x = (L.x ??= new Float64Array(n)), p = (L.p ??= new Float64Array(n)), q = (L.q ??= new Float64Array(n));
+    if (x0) x.set(x0);
+    else x.fill(0);
+    for (let i = 0; i < n; i++) if (fixed[i]) x[i] = 0;
     this.apply(L, x, q);
     for (let i = 0; i < n; i++) r[i] = fixed[i] ? 0 : f[i] - q[i];
-    this.prepareSmoothers();
-    const precond = () => {
-      L.r.set(r);
-      this.vcycle(0);
-      return L.z;
-    };
-    let z = precond();
+    this.vcycle(0);
     p.set(z);
-    let rz = dot(r, z);
-    let res = Math.sqrt(dot(r, r)) / bnorm;
+    let rz = this.sum(OP.dot, 0, [r, z]);
+    let res = Math.sqrt(this.sum(OP.dot, 0, [r, r])) / bnorm;
     let it = 0;
     let cancelled = false;
     for (; it < maxIter && res > tol; it++) {
       this.apply(L, p, q);
-      const pq = dot(p, q);
+      const pq = this.sum(OP.dot, 0, [p, q]);
       if (!(pq > 0)) break; // loss of positive-definiteness (mechanism)
       const alpha = rz / pq;
-      for (let i = 0; i < n; i++) { x[i] += alpha * p[i]; r[i] -= alpha * q[i]; }
-      res = Math.sqrt(dot(r, r)) / bnorm;
+      res = Math.sqrt(this.sum(OP.cgStep, 0, [x, r, p, q], [alpha])) / bnorm; // x += alpha p, r -= alpha q
       if (onProgress && onProgress(it + 1, res) === true) { cancelled = true; it++; break; }
       if (res <= tol) { it++; break; }
-      z = precond();
-      const rzNew = dot(r, z);
+      this.vcycle(0);
+      const rzNew = this.sum(OP.dot, 0, [r, z]);
       const beta = rzNew / rz;
       rz = rzNew;
-      for (let i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
+      this.each(OP.cgDirection, 0, [p, z], [beta]); // p = z + beta p
     }
     // The recursively updated residual can drift, especially near a mechanism.
     // Report convergence against the actual equilibrium equations.
     this.apply(L, x, q);
     for (let i = 0; i < n; i++) r[i] = fixed[i] ? 0 : f[i] - q[i];
-    res = Math.sqrt(dot(r, r)) / bnorm;
-    return { u: x, iterations: it, residual: res, converged: !cancelled && Number.isFinite(res) && res <= tol * 10, cancelled };
+    res = Math.sqrt(this.sum(OP.dot, 0, [r, r])) / bnorm;
+    return { u: Float64Array.from(x), iterations: it, residual: res, converged: !cancelled && Number.isFinite(res) && res <= tol * 10, cancelled };
   }
 
   /** Reaction forces (normalized system, equals Newtons when f was in Newtons) summed over held DOFs. */
@@ -838,12 +974,6 @@ export function vonMisesAt(s, o = 0) {
 function vonMises(s) {
   const [sx, sy, sz, txy, tyz, tzx] = s;
   return Math.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2) + 3 * (txy * txy + tyz * tyz + tzx * tzx));
-}
-
-function dot(a, b) {
-  let s = 0;
-  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
-  return s;
 }
 
 /** Principal stresses of a symmetric 3x3 tensor, sorted descending into out[0..2]. */

@@ -17,6 +17,7 @@
 // stress s~ = s / E. These make K u~ = f~ exactly the linear solver's system.
 import { elasticityMatrix, hexElement, HEX_NODES } from './hex8.js';
 import { CENTROID_B as B0, GEO_T } from './eigen.js';
+import { corner } from './solver.js';
 
 const REF = HEX_NODES.map(([x, y, z]) => [x - 0.5, y - 0.5, z - 0.5]);
 
@@ -97,6 +98,239 @@ export function hardeningFor(material) {
   return { yield: material.yield / E, H: Math.max(H / E, 1e-5), eu, uts: material.uts / E };
 }
 
+// One thread's scratch vectors for the element loops below (each helper thread has its own module).
+const W = {
+  ue: new Float64Array(24), ul: new Float64Array(24), fl: new Float64Array(24),
+  eps: new Float64Array(6), sig: new Float64Array(6), mean: new Float64Array(6),
+};
+
+/**
+ * Local (rotation-free) displacements ul of element e from global u~; stores the element rotation.
+ * M is a NonlinearModel or a helper thread's shared copy of its state (threads.js), L its level.
+ */
+function localDisplacement(M, L, e, u, ue, ul) {
+  const n0 = L.base[e];
+  for (let a = 0; a < 8; a++) {
+    const n = 3 * (n0 + L.off[a]);
+    ue[3 * a] = u[n]; ue[3 * a + 1] = u[n + 1]; ue[3 * a + 2] = u[n + 2];
+  }
+  if (!M.large) { ul.set(ue); return; }
+  // mean deformation gradient F = I + sum_a u_a (x) grad N_a(centre)
+  const F = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  for (let a = 0; a < 8; a++) {
+    const gx = B0[3 * a], gy = B0[24 + 3 * a + 1], gz = B0[48 + 3 * a + 2];
+    for (let i = 0; i < 3; i++) {
+      const v = ue[3 * a + i];
+      F[3 * i] += v * gx; F[3 * i + 1] += v * gy; F[3 * i + 2] += v * gz;
+    }
+  }
+  const R = M.R.subarray(9 * e, 9 * e + 9);
+  polarRotation(F, R);
+  let cx = 0, cy = 0, cz = 0;
+  for (let a = 0; a < 8; a++) { cx += ue[3 * a]; cy += ue[3 * a + 1]; cz += ue[3 * a + 2]; }
+  cx /= 8; cy /= 8; cz /= 8;
+  for (let a = 0; a < 8; a++) {
+    const X = REF[a];
+    const dx = X[0] + ue[3 * a] - cx, dy = X[1] + ue[3 * a + 1] - cy, dz = X[2] + ue[3 * a + 2] - cz;
+    // R^T d - X
+    ul[3 * a] = R[0] * dx + R[3] * dy + R[6] * dz - X[0];
+    ul[3 * a + 1] = R[1] * dx + R[4] * dy + R[7] * dz - X[1];
+    ul[3 * a + 2] = R[2] * dx + R[5] * dy + R[8] * dz - X[2];
+  }
+}
+
+/** Local element forces fl rotated to global and times rho, into element e's 24 entries of fe. */
+function globalForces(M, e, fl, rho, fe) {
+  const o = 24 * e;
+  if (!M.large) {
+    for (let c = 0; c < 24; c++) fe[o + c] = rho * fl[c];
+    return;
+  }
+  const R = M.R, r = 9 * e;
+  for (let a = 0; a < 8; a++) {
+    const x = fl[3 * a], y = fl[3 * a + 1], z = fl[3 * a + 2], f = o + 3 * a;
+    fe[f] = rho * (R[r] * x + R[r + 1] * y + R[r + 2] * z);
+    fe[f + 1] = rho * (R[r + 3] * x + R[r + 4] * y + R[r + 5] * z);
+    fe[f + 2] = rho * (R[r + 6] * x + R[r + 7] * y + R[r + 8] * z);
+  }
+}
+
+/**
+ * Internal forces of the elements e0 <= e < e1 at u~ into fe (24 per element, global), updating
+ * each Gauss point's trial plastic state from the committed one. Returns their largest equivalent
+ * plastic strain.
+ */
+export function forceElements(M, L, u, fe, e0, e1) {
+  const K = M.K0, D = M.D, G = M.G, pl = M.plastic;
+  const { fl, ul, eps, sig, mean } = W;
+  let maxAlpha = 0;
+  for (let e = e0; e < e1; e++) {
+    localDisplacement(M, L, e, u, W.ue, ul);
+    mean.fill(0);
+    if (!pl) {
+      for (let r = 0; r < 24; r++) {
+        let s = 0;
+        const row = r * 24;
+        for (let c = 0; c < 24; c++) s += K[row + c] * ul[c];
+        fl[r] = s;
+      }
+      if (M.geo) {
+        // mean stress D B0 u for the stress stiffness
+        eps.fill(0);
+        for (let c = 0; c < 24; c++) { const v = ul[c]; if (v !== 0) for (let i = 0; i < 6; i++) eps[i] += B0[i * 24 + c] * v; }
+        for (let i = 0; i < 6; i++) { let s = 0; for (let j = 0; j < 6; j++) s += D[i * 6 + j] * eps[j]; mean[i] = s; }
+      }
+    } else {
+      fl.fill(0);
+      let bits = 0;
+      for (let g = 0; g < 8; g++) {
+        const B = M.gaussB[g], o = 48 * e + 6 * g, oa = 8 * e + g;
+        eps.fill(0);
+        for (let c = 0; c < 24; c++) { const v = ul[c]; if (v !== 0) for (let i = 0; i < 6; i++) eps[i] += B[i * 24 + c] * v; }
+        for (let i = 0; i < 6; i++) eps[i] -= M.ep[o + i];
+        for (let i = 0; i < 6; i++) { let s = 0; for (let j = 0; j < 6; j++) s += D[i * 6 + j] * eps[j]; sig[i] = s; }
+        let alpha = M.alpha[oa];
+        for (let i = 0; i < 6; i++) M.epTrial[o + i] = M.ep[o + i];
+        const p = (sig[0] + sig[1] + sig[2]) / 3;
+        const s0 = sig[0] - p, s1 = sig[1] - p, s2 = sig[2] - p;
+        const q = Math.sqrt(1.5 * (s0 * s0 + s1 * s1 + s2 * s2 + 2 * (sig[3] ** 2 + sig[4] ** 2 + sig[5] ** 2)));
+        const fy = q - (pl.yield + pl.H * alpha);
+        if (fy > 0 && q > 0) {
+          // radial return
+          const dg = fy / (3 * G + pl.H);
+          const k = (1.5 / q) * dg;
+          // consistent (algorithmic) tangent of the radial return:
+          // D_ep = D - 2G(1 - th) I_dev - 2G thb n (x) n, n = s / |s|
+          const th = 1 - (3 * G * dg) / q, thb = 1 / (1 + pl.H / (3 * G)) - (1 - th);
+          const f = M.flow, of = 64 * e + 8 * g, ns = 1 / (Math.sqrt(2 / 3) * q);
+          f[of] = s0 * ns; f[of + 1] = s1 * ns; f[of + 2] = s2 * ns; f[of + 3] = sig[3] * ns; f[of + 4] = sig[4] * ns; f[of + 5] = sig[5] * ns;
+          f[of + 6] = 2 * G * (1 - th); f[of + 7] = 2 * G * thb;
+          M.epTrial[o] += k * s0; M.epTrial[o + 1] += k * s1; M.epTrial[o + 2] += k * s2;
+          M.epTrial[o + 3] += 2 * k * sig[3]; M.epTrial[o + 4] += 2 * k * sig[4]; M.epTrial[o + 5] += 2 * k * sig[5];
+          const shrink = 1 - (3 * G * dg) / q;
+          sig[0] = p + s0 * shrink; sig[1] = p + s1 * shrink; sig[2] = p + s2 * shrink;
+          sig[3] *= shrink; sig[4] *= shrink; sig[5] *= shrink;
+          alpha += dg;
+          bits |= 1 << g;
+        }
+        M.alphaTrial[oa] = alpha;
+        if (alpha > maxAlpha) maxAlpha = alpha;
+        for (let i = 0; i < 6; i++) { M.gpStress[o + i] = sig[i]; mean[i] += sig[i] / 8; }
+        // f += Bbar^T sigma / 8
+        for (let c = 0; c < 24; c++) {
+          let v = 0;
+          for (let i = 0; i < 6; i++) v += B[i * 24 + c] * sig[i];
+          fl[c] += v / 8;
+        }
+      }
+      M.yielding[e] = bits;
+    }
+    if (M.geo) {
+      const gm = M.geo.subarray(64 * e, 64 * e + 64);
+      gm.fill(0);
+      for (let c = 0; c < 6; c++) {
+        const sc = mean[c];
+        if (sc === 0) continue;
+        const T = GEO_T[c];
+        for (let i = 0; i < 64; i++) gm[i] += sc * T[i];
+      }
+    }
+    globalForces(M, e, fl, L.rho[e], fe);
+  }
+  return maxAlpha;
+}
+
+/**
+ * Tangent forces J_e x of the elements e0 <= e < e1 into fe, with the rotations, stresses and
+ * plastic state of the last forceElements call: rotated elastic stiffness + stress stiffness -
+ * plastic stiffness loss.
+ */
+export function tangentElements(M, L, x, fe, e0, e1) {
+  const K = M.K0, R = M.R;
+  const { ue, ul, fl, eps } = W;
+  for (let e = e0; e < e1; e++) {
+    const n0 = L.base[e], o = 9 * e;
+    for (let a = 0; a < 8; a++) {
+      const n = 3 * (n0 + L.off[a]);
+      ue[3 * a] = x[n]; ue[3 * a + 1] = x[n + 1]; ue[3 * a + 2] = x[n + 2];
+    }
+    if (M.large) {
+      for (let a = 0; a < 8; a++) {
+        const vx = ue[3 * a], vy = ue[3 * a + 1], vz = ue[3 * a + 2];
+        ul[3 * a] = R[o] * vx + R[o + 3] * vy + R[o + 6] * vz;
+        ul[3 * a + 1] = R[o + 1] * vx + R[o + 4] * vy + R[o + 7] * vz;
+        ul[3 * a + 2] = R[o + 2] * vx + R[o + 5] * vy + R[o + 8] * vz;
+      }
+    } else ul.set(ue);
+    for (let r = 0; r < 24; r++) {
+      let s = 0;
+      const row = r * 24;
+      for (let c = 0; c < 24; c++) s += K[row + c] * ul[c];
+      fl[r] = s;
+    }
+    if (M.geo) {
+      const g = M.geo, o64 = 64 * e;
+      for (let a = 0; a < 8; a++) {
+        let sx = 0, sy = 0, sz = 0;
+        for (let b = 0; b < 8; b++) {
+          const v = g[o64 + a * 8 + b];
+          sx += v * ul[3 * b]; sy += v * ul[3 * b + 1]; sz += v * ul[3 * b + 2];
+        }
+        fl[3 * a] += sx; fl[3 * a + 1] += sy; fl[3 * a + 2] += sz;
+      }
+    }
+    const bits = M.plastic ? M.yielding[e] : 0;
+    if (bits) {
+      for (let gp = 0; gp < 8; gp++) {
+        if (!(bits & (1 << gp))) continue;
+        const B = M.gaussB[gp], f = M.flow, of = 64 * e + 8 * gp;
+        eps.fill(0);
+        for (let c = 0; c < 24; c++) { const v = ul[c]; if (v !== 0) for (let i = 0; i < 6; i++) eps[i] += B[i * 24 + c] * v; }
+        const em = (eps[0] + eps[1] + eps[2]) / 3;
+        const ne = f[of] * eps[0] + f[of + 1] * eps[1] + f[of + 2] * eps[2] + f[of + 3] * eps[3] + f[of + 4] * eps[4] + f[of + 5] * eps[5];
+        const c1 = f[of + 6], c2 = f[of + 7] * ne;
+        // stress-like loss t = c1 dev(eps) + c2 n (tensor shear = engineering / 2)
+        const t = W.sig;
+        t[0] = c1 * (eps[0] - em) + c2 * f[of]; t[1] = c1 * (eps[1] - em) + c2 * f[of + 1]; t[2] = c1 * (eps[2] - em) + c2 * f[of + 2];
+        t[3] = c1 * 0.5 * eps[3] + c2 * f[of + 3]; t[4] = c1 * 0.5 * eps[4] + c2 * f[of + 4]; t[5] = c1 * 0.5 * eps[5] + c2 * f[of + 5];
+        for (let c = 0; c < 24; c++) {
+          let v = 0;
+          for (let i = 0; i < 6; i++) v += B[i * 24 + c] * t[i];
+          fl[c] -= v / 8;
+        }
+      }
+    }
+    globalForces(M, e, fl, L.rho[e], fe);
+  }
+}
+
+/**
+ * out = the element vectors fe summed at the nodes n0 <= n < n1 (0 on held DOFs). Each node adds
+ * its voxels in element order, as a scatter over the elements would.
+ */
+export function gatherNodes(L, fe, out, n0, n1) {
+  const { NX, NY, nx, ny, nz, emap, fixed } = L;
+  const NXY = NX * NY;
+  let i = n0 % NX, j = ((n0 / NX) | 0) % NY, k = (n0 / NXY) | 0;
+  for (let n = n0; n < n1; n++) {
+    let a0 = 0, a1 = 0, a2 = 0;
+    for (let v = 0; v < 8; v++) {
+      const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2;
+      const ei = i + di - 1, ej = j + dj - 1, ek = k + dk - 1;
+      if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+      const e = emap[ei + nx * (ej + ny * ek)];
+      if (e < 0) continue;
+      const f = 24 * e + 3 * corner(1 - di, 1 - dj, 1 - dk);
+      a0 += fe[f]; a1 += fe[f + 1]; a2 += fe[f + 2];
+    }
+    const o = 3 * n;
+    out[o] = fixed[o] ? 0 : a0;
+    out[o + 1] = fixed[o + 1] ? 0 : a1;
+    out[o + 2] = fixed[o + 2] ? 0 : a2;
+    if (++i === NX) { i = 0; if (++j === NY) { j = 0; k++; } }
+  }
+}
+
 export class NonlinearModel {
   /**
    * @param {import('./solver.js').VoxelFEA} fea  elastic model (its levels[0] carries the mesh and held DOFs)
@@ -117,59 +351,43 @@ export class NonlinearModel {
     this.K0 = fea.K0;
     this.gaussB = el.gaussB;
     this.cornerS = el.cornerStress;
+    // the element state lives in shared memory when fea has helper threads (share())
+    const shared = !!fea.threads;
+    const arr = (Type, n) => new Type(shared ? new SharedArrayBuffer(n * Type.BYTES_PER_ELEMENT) : n);
     // plastic state at the 8 Gauss points of each voxel: committed (converged) and trial
     if (plastic) {
-      this.ep = new Float64Array(48 * nE);
-      this.alpha = new Float64Array(8 * nE);
-      this.epTrial = new Float64Array(48 * nE);
-      this.alphaTrial = new Float64Array(8 * nE);
-      this.gpStress = new Float64Array(48 * nE);
-      this.flow = new Float64Array(64 * nE); // consistent tangent data per yielding point: n (6), c1, c2
-      this.yielding = new Uint8Array(nE); // bit g set = Gauss point g is yielding in this iteration
+      this.ep = arr(Float64Array, 48 * nE);
+      this.alpha = arr(Float64Array, 8 * nE);
+      this.epTrial = arr(Float64Array, 48 * nE);
+      this.alphaTrial = arr(Float64Array, 8 * nE);
+      this.gpStress = arr(Float64Array, 48 * nE);
+      this.flow = arr(Float64Array, 64 * nE); // consistent tangent data per yielding point: n (6), c1, c2
+      this.yielding = arr(Uint8Array, nE); // bit g set = Gauss point g is yielding in this iteration
       this.everPlastic = new Uint8Array(nE);
     }
-    this.R = new Float64Array(9 * nE);
+    this.R = arr(Float64Array, 9 * nE);
     for (let e = 0; e < nE; e++) { this.R[9 * e] = this.R[9 * e + 4] = this.R[9 * e + 8] = 1; }
     // stress stiffness of each voxel (8 x 8, from its current mean stress) for the Newton tangent
-    this.geo = largeDisplacement ? new Float64Array(64 * nE) : null;
-    this.ue = new Float64Array(24);
+    this.geo = largeDisplacement ? arr(Float64Array, 64 * nE) : null;
+    // each element's forces (global, 24 per voxel) before they are summed at the nodes
+    this.fe = arr(Float64Array, 24 * nE);
     this.ul = new Float64Array(24);
-    this.fl = new Float64Array(24);
-    this.eps = new Float64Array(6);
     this.sig = new Float64Array(6);
-    this.mean = new Float64Array(6);
+    this.threads = null;
   }
 
-  /** Local (rotation-free) element displacements from global u~; stores the element rotation. */
+  /** Hands the element state to fea's helper threads, which then share the element loops. */
+  async share() {
+    const t = this.fea.threads;
+    if (!t) return;
+    const { K0, D, G, gaussB, large, plastic, R, geo, ep, alpha, epTrial, alphaTrial, gpStress, flow, yielding, fe } = this;
+    await t.share({ nl: { K0, D, G, gaussB, large, plastic, R, geo, ep, alpha, epTrial, alphaTrial, gpStress, flow, yielding }, fe });
+    this.threads = t;
+  }
+
+  /** Local (rotation-free) element displacements from global u~ into this.ul; stores the element rotation. */
   localDisplacement(e, u) {
-    const L = this.L, n0 = L.base[e], ue = this.ue, ul = this.ul;
-    for (let a = 0; a < 8; a++) {
-      const n = 3 * (n0 + L.off[a]);
-      ue[3 * a] = u[n]; ue[3 * a + 1] = u[n + 1]; ue[3 * a + 2] = u[n + 2];
-    }
-    if (!this.large) { ul.set(ue); return; }
-    // mean deformation gradient F = I + sum_a u_a (x) grad N_a(centre)
-    const F = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-    for (let a = 0; a < 8; a++) {
-      const gx = B0[3 * a], gy = B0[24 + 3 * a + 1], gz = B0[48 + 3 * a + 2];
-      for (let i = 0; i < 3; i++) {
-        const v = ue[3 * a + i];
-        F[3 * i] += v * gx; F[3 * i + 1] += v * gy; F[3 * i + 2] += v * gz;
-      }
-    }
-    const R = this.R.subarray(9 * e, 9 * e + 9);
-    polarRotation(F, R);
-    let cx = 0, cy = 0, cz = 0;
-    for (let a = 0; a < 8; a++) { cx += ue[3 * a]; cy += ue[3 * a + 1]; cz += ue[3 * a + 2]; }
-    cx /= 8; cy /= 8; cz /= 8;
-    for (let a = 0; a < 8; a++) {
-      const X = REF[a];
-      const dx = X[0] + ue[3 * a] - cx, dy = X[1] + ue[3 * a + 1] - cy, dz = X[2] + ue[3 * a + 2] - cz;
-      // R^T d - X
-      ul[3 * a] = R[0] * dx + R[3] * dy + R[6] * dz - X[0];
-      ul[3 * a + 1] = R[1] * dx + R[4] * dy + R[7] * dz - X[1];
-      ul[3 * a + 2] = R[2] * dx + R[5] * dy + R[8] * dz - X[2];
-    }
+    localDisplacement(this, this.L, e, u, W.ue, this.ul);
   }
 
   /**
@@ -177,105 +395,10 @@ export class NonlinearModel {
    * committed one. Returns the largest equivalent plastic strain.
    */
   internalForce(u, out) {
-    const L = this.L, K = this.K0, D = this.D, G = this.G, fl = this.fl, ul = this.ul;
-    const pl = this.plastic, eps = this.eps, sig = this.sig, mean = this.mean;
-    out.fill(0);
-    let maxAlpha = 0;
-    for (let e = 0; e < this.nE; e++) {
-      this.localDisplacement(e, u);
-      mean.fill(0);
-      if (!pl) {
-        for (let r = 0; r < 24; r++) {
-          let s = 0;
-          const row = r * 24;
-          for (let c = 0; c < 24; c++) s += K[row + c] * ul[c];
-          fl[r] = s;
-        }
-        if (this.geo) {
-          // mean stress D B0 u for the stress stiffness
-          eps.fill(0);
-          for (let c = 0; c < 24; c++) { const v = ul[c]; if (v !== 0) for (let i = 0; i < 6; i++) eps[i] += B0[i * 24 + c] * v; }
-          for (let i = 0; i < 6; i++) { let s = 0; for (let j = 0; j < 6; j++) s += D[i * 6 + j] * eps[j]; mean[i] = s; }
-        }
-      } else {
-        fl.fill(0);
-        let bits = 0;
-        for (let g = 0; g < 8; g++) {
-          const B = this.gaussB[g], o = 48 * e + 6 * g, oa = 8 * e + g;
-          eps.fill(0);
-          for (let c = 0; c < 24; c++) { const v = ul[c]; if (v !== 0) for (let i = 0; i < 6; i++) eps[i] += B[i * 24 + c] * v; }
-          for (let i = 0; i < 6; i++) eps[i] -= this.ep[o + i];
-          for (let i = 0; i < 6; i++) { let s = 0; for (let j = 0; j < 6; j++) s += D[i * 6 + j] * eps[j]; sig[i] = s; }
-          let alpha = this.alpha[oa];
-          for (let i = 0; i < 6; i++) this.epTrial[o + i] = this.ep[o + i];
-          const p = (sig[0] + sig[1] + sig[2]) / 3;
-          const s0 = sig[0] - p, s1 = sig[1] - p, s2 = sig[2] - p;
-          const q = Math.sqrt(1.5 * (s0 * s0 + s1 * s1 + s2 * s2 + 2 * (sig[3] ** 2 + sig[4] ** 2 + sig[5] ** 2)));
-          const fy = q - (pl.yield + pl.H * alpha);
-          if (fy > 0 && q > 0) {
-            // radial return
-            const dg = fy / (3 * G + pl.H);
-            const k = (1.5 / q) * dg;
-            // consistent (algorithmic) tangent of the radial return:
-            // D_ep = D - 2G(1 - th) I_dev - 2G thb n (x) n, n = s / |s|
-            const th = 1 - (3 * G * dg) / q, thb = 1 / (1 + pl.H / (3 * G)) - (1 - th);
-            const f = this.flow, of = 64 * e + 8 * g, ns = 1 / (Math.sqrt(2 / 3) * q);
-            f[of] = s0 * ns; f[of + 1] = s1 * ns; f[of + 2] = s2 * ns; f[of + 3] = sig[3] * ns; f[of + 4] = sig[4] * ns; f[of + 5] = sig[5] * ns;
-            f[of + 6] = 2 * G * (1 - th); f[of + 7] = 2 * G * thb;
-            this.epTrial[o] += k * s0; this.epTrial[o + 1] += k * s1; this.epTrial[o + 2] += k * s2;
-            this.epTrial[o + 3] += 2 * k * sig[3]; this.epTrial[o + 4] += 2 * k * sig[4]; this.epTrial[o + 5] += 2 * k * sig[5];
-            const shrink = 1 - (3 * G * dg) / q;
-            sig[0] = p + s0 * shrink; sig[1] = p + s1 * shrink; sig[2] = p + s2 * shrink;
-            sig[3] *= shrink; sig[4] *= shrink; sig[5] *= shrink;
-            alpha += dg;
-            bits |= 1 << g;
-          }
-          this.alphaTrial[oa] = alpha;
-          if (alpha > maxAlpha) maxAlpha = alpha;
-          for (let i = 0; i < 6; i++) { this.gpStress[o + i] = sig[i]; mean[i] += sig[i] / 8; }
-          // f += Bbar^T sigma / 8
-          for (let c = 0; c < 24; c++) {
-            let v = 0;
-            for (let i = 0; i < 6; i++) v += B[i * 24 + c] * sig[i];
-            fl[c] += v / 8;
-          }
-        }
-        this.yielding[e] = bits;
-      }
-      if (this.geo) {
-        const gm = this.geo.subarray(64 * e, 64 * e + 64);
-        gm.fill(0);
-        for (let c = 0; c < 6; c++) {
-          const sc = mean[c];
-          if (sc === 0) continue;
-          const T = GEO_T[c];
-          for (let i = 0; i < 64; i++) gm[i] += sc * T[i];
-        }
-      }
-      this.scatter(e, fl, L.rho[e], out);
-    }
-    for (let i = 0; i < out.length; i++) if (L.fixed[i]) out[i] = 0;
+    if (this.threads) return this.threads.internalForce(u, out);
+    const maxAlpha = forceElements(this, this.L, u, this.fe, 0, this.nE);
+    gatherNodes(this.L, this.fe, out, 0, this.L.nNodes);
     return maxAlpha;
-  }
-
-  /** Rotate local element forces to global and add them (times rho) into out. */
-  scatter(e, fl, rho, out) {
-    const L = this.L, n0 = L.base[e];
-    if (!this.large) {
-      for (let a = 0; a < 8; a++) {
-        const n = 3 * (n0 + L.off[a]);
-        out[n] += rho * fl[3 * a]; out[n + 1] += rho * fl[3 * a + 1]; out[n + 2] += rho * fl[3 * a + 2];
-      }
-      return;
-    }
-    const R = this.R, o = 9 * e;
-    for (let a = 0; a < 8; a++) {
-      const x = fl[3 * a], y = fl[3 * a + 1], z = fl[3 * a + 2];
-      const n = 3 * (n0 + L.off[a]);
-      out[n] += rho * (R[o] * x + R[o + 1] * y + R[o + 2] * z);
-      out[n + 1] += rho * (R[o + 3] * x + R[o + 4] * y + R[o + 5] * z);
-      out[n + 2] += rho * (R[o + 6] * x + R[o + 7] * y + R[o + 8] * z);
-    }
   }
 
   /**
@@ -283,63 +406,9 @@ export class NonlinearModel {
    * internalForce call: rotated elastic stiffness + stress stiffness - plastic stiffness loss.
    */
   applyTangent(x, y) {
-    const L = this.L, K = this.K0, ue = this.ue, ul = this.ul, fl = this.fl, R = this.R, eps = this.eps;
-    y.fill(0);
-    for (let e = 0; e < this.nE; e++) {
-      const n0 = L.base[e], o = 9 * e;
-      for (let a = 0; a < 8; a++) {
-        const n = 3 * (n0 + L.off[a]);
-        ue[3 * a] = x[n]; ue[3 * a + 1] = x[n + 1]; ue[3 * a + 2] = x[n + 2];
-      }
-      if (this.large) {
-        for (let a = 0; a < 8; a++) {
-          const vx = ue[3 * a], vy = ue[3 * a + 1], vz = ue[3 * a + 2];
-          ul[3 * a] = R[o] * vx + R[o + 3] * vy + R[o + 6] * vz;
-          ul[3 * a + 1] = R[o + 1] * vx + R[o + 4] * vy + R[o + 7] * vz;
-          ul[3 * a + 2] = R[o + 2] * vx + R[o + 5] * vy + R[o + 8] * vz;
-        }
-      } else ul.set(ue);
-      for (let r = 0; r < 24; r++) {
-        let s = 0;
-        const row = r * 24;
-        for (let c = 0; c < 24; c++) s += K[row + c] * ul[c];
-        fl[r] = s;
-      }
-      if (this.geo) {
-        const g = this.geo, o64 = 64 * e;
-        for (let a = 0; a < 8; a++) {
-          let sx = 0, sy = 0, sz = 0;
-          for (let b = 0; b < 8; b++) {
-            const v = g[o64 + a * 8 + b];
-            sx += v * ul[3 * b]; sy += v * ul[3 * b + 1]; sz += v * ul[3 * b + 2];
-          }
-          fl[3 * a] += sx; fl[3 * a + 1] += sy; fl[3 * a + 2] += sz;
-        }
-      }
-      const bits = this.plastic ? this.yielding[e] : 0;
-      if (bits) {
-        for (let gp = 0; gp < 8; gp++) {
-          if (!(bits & (1 << gp))) continue;
-          const B = this.gaussB[gp], f = this.flow, of = 64 * e + 8 * gp;
-          eps.fill(0);
-          for (let c = 0; c < 24; c++) { const v = ul[c]; if (v !== 0) for (let i = 0; i < 6; i++) eps[i] += B[i * 24 + c] * v; }
-          const em = (eps[0] + eps[1] + eps[2]) / 3;
-          const ne = f[of] * eps[0] + f[of + 1] * eps[1] + f[of + 2] * eps[2] + f[of + 3] * eps[3] + f[of + 4] * eps[4] + f[of + 5] * eps[5];
-          const c1 = f[of + 6], c2 = f[of + 7] * ne;
-          // stress-like loss t = c1 dev(eps) + c2 n (tensor shear = engineering / 2)
-          const t = this.sig;
-          t[0] = c1 * (eps[0] - em) + c2 * f[of]; t[1] = c1 * (eps[1] - em) + c2 * f[of + 1]; t[2] = c1 * (eps[2] - em) + c2 * f[of + 2];
-          t[3] = c1 * 0.5 * eps[3] + c2 * f[of + 3]; t[4] = c1 * 0.5 * eps[4] + c2 * f[of + 4]; t[5] = c1 * 0.5 * eps[5] + c2 * f[of + 5];
-          for (let c = 0; c < 24; c++) {
-            let v = 0;
-            for (let i = 0; i < 6; i++) v += B[i * 24 + c] * t[i];
-            fl[c] -= v / 8;
-          }
-        }
-      }
-      this.scatter(e, fl, L.rho[e], y);
-    }
-    for (let i = 0; i < y.length; i++) if (L.fixed[i]) y[i] = 0;
+    if (this.threads) { this.threads.applyTangent(x, y); return; }
+    tangentElements(this, this.L, x, this.fe, 0, this.nE);
+    gatherNodes(this.L, this.fe, y, 0, this.L.nNodes);
   }
 
   commit() {

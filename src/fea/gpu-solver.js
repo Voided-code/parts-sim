@@ -595,7 +595,7 @@ export class GPUFEASolver {
       // the level's own element matrices in 16-bit halves (their products are bandwidth-bound), with
       // a power-of-two scale that keeps the largest entries near 2^14, well inside the half range
       let kmax = 0;
-      for (const e of own) for (let i = 576 * e; i < 576 * (e + 1); i++) kmax = Math.max(kmax, Math.abs(lv.K[i]));
+      for (const e of own) for (let i = 576 * lv.kIdx[e]; i < 576 * (lv.kIdx[e] + 1); i++) kmax = Math.max(kmax, Math.abs(lv.Kown[i]));
       const hs = kmax > 0 ? 2 ** Math.ceil(Math.log2(kmax / 16384)) : 1;
       f[15] = hs;
       // the level's uniform element (rows as 6 vec4) and its 27-point stencil: neighbour
@@ -616,7 +616,7 @@ export class GPUFEASolver {
         Ke: upload((() => {
           const ke = new Uint16Array(576 * (2 + own.length));
           new Float32Array(ke.buffer, 0, 576).set(lv.Kb.subarray(0, 576));
-          own.forEach((e, q) => { for (let i = 0; i < 576; i++) ke[576 * (2 + q) + i] = toHalf(lv.K[576 * e + i] / hs); });
+          own.forEach((e, q) => { for (let i = 0, k = 576 * lv.kIdx[e]; i < 576; i++) ke[576 * (2 + q) + i] = toHalf(lv.Kown[k + i] / hs); });
           return ke;
         })()),
         stencil: upload(st, U),

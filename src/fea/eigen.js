@@ -6,7 +6,7 @@
 // that already solves K u = f makes a very good preconditioner here, so a handful of modes
 // converge in a few dozen iterations even on large, slender models.
 import { elasticityMatrix, HEX_NODES } from './hex8.js';
-import { principalStresses } from './solver.js';
+import { principalStresses, corner } from './solver.js';
 
 /** Lumped mass per DOF in normalized units (voxel side 1, density 1): fill fraction / 8 per node. */
 export function lumpedMass(fea) {
@@ -107,7 +107,11 @@ export class GeometricStiffness {
   constructor(fea, sigma) {
     const L = fea.levels[0];
     this.L = L;
-    this.G = new Float64Array(64 * L.elems.length);
+    this.fea = fea;
+    this.threads = null;
+    // in shared memory when fea has helper threads (share())
+    const len = 64 * L.elems.length;
+    this.G = fea.threads ? new Float64Array(new SharedArrayBuffer(8 * len)) : new Float64Array(len);
     for (let e = 0; e < L.elems.length; e++) {
       const o = 64 * e, rho = L.rho[e];
       for (let c = 0; c < 6; c++) {
@@ -119,28 +123,50 @@ export class GeometricStiffness {
     }
   }
 
+  /** Hands the stress stiffness to fea's helper threads, which then share its products. */
+  async share() {
+    const t = this.fea.threads;
+    if (!t) return;
+    await t.share({ kg: this.G });
+    this.threads = t;
+  }
+
   /** y = K_G x; held DOFs of y are zeroed. */
   apply(x, y) {
-    const L = this.L, G = this.G, off = L.off;
-    y.fill(0);
-    const ue = new Float64Array(24);
-    for (let e = 0; e < L.elems.length; e++) {
-      const n0 = L.base[e], o = 64 * e;
-      for (let a = 0; a < 8; a++) {
-        const n = 3 * (n0 + off[a]);
-        ue[3 * a] = x[n]; ue[3 * a + 1] = x[n + 1]; ue[3 * a + 2] = x[n + 2];
+    if (this.threads) this.threads.geometric(x, y);
+    else geometricNodes(this.L, this.G, x, y, 0, this.L.nNodes);
+  }
+}
+
+/**
+ * y = K_G x on the nodes n0 <= n < n1 (0 on held DOFs), with G the 8 x 8 stress stiffness of each
+ * voxel: each node adds its voxels' rows in element order, as a scatter over the voxels would.
+ */
+export function geometricNodes(L, G, x, y, n0, n1) {
+  const { NX, NY, nx, ny, nz, emap, fixed, off } = L;
+  const NXY = NX * NY;
+  let i = n0 % NX, j = ((n0 / NX) | 0) % NY, k = (n0 / NXY) | 0;
+  for (let n = n0; n < n1; n++) {
+    let ax = 0, ay = 0, az = 0;
+    for (let v = 0; v < 8; v++) {
+      const di = v & 1, dj = (v >> 1) & 1, dk = v >> 2;
+      const ei = i + di - 1, ej = j + dj - 1, ek = k + dk - 1;
+      if (ei < 0 || ej < 0 || ek < 0 || ei >= nx || ej >= ny || ek >= nz) continue;
+      const e = emap[ei + nx * (ej + ny * ek)];
+      if (e < 0) continue;
+      const nb = n - (1 - di) - NX * (1 - dj) - NXY * (1 - dk), o = 64 * e + 8 * corner(1 - di, 1 - dj, 1 - dk);
+      let sx = 0, sy = 0, sz = 0;
+      for (let b = 0; b < 8; b++) {
+        const g = G[o + b], p = 3 * (nb + off[b]);
+        sx += g * x[p]; sy += g * x[p + 1]; sz += g * x[p + 2];
       }
-      for (let a = 0; a < 8; a++) {
-        let sx = 0, sy = 0, sz = 0;
-        for (let b = 0; b < 8; b++) {
-          const g = G[o + a * 8 + b];
-          sx += g * ue[3 * b]; sy += g * ue[3 * b + 1]; sz += g * ue[3 * b + 2];
-        }
-        const n = 3 * (n0 + off[a]);
-        y[n] += sx; y[n + 1] += sy; y[n + 2] += sz;
-      }
+      ax += sx; ay += sy; az += sz;
     }
-    for (let i = 0; i < y.length; i++) if (L.fixed[i]) y[i] = 0;
+    const q = 3 * n;
+    y[q] = fixed[q] ? 0 : ax;
+    y[q + 1] = fixed[q + 1] ? 0 : ay;
+    y[q + 2] = fixed[q + 2] ? 0 : az;
+    if (++i === NX) { i = 0; if (++j === NY) { j = 0; k++; } }
   }
 }
 
@@ -249,67 +275,244 @@ function generalizedEigen(gA, gB, k) {
 
 // ---------- LOBPCG ----------
 
-// The block operations below walk the vectors in cache-sized chunks, so a block of a few dozen
-// long vectors is read from memory once per operation rather than once per pair of vectors.
-const CHUNK = 2048;
+// The block operations walk the vectors in cache-sized chunks, so a block of a few dozen long
+// vectors is read from memory once per operation rather than once per pair of vectors. Each works
+// on a range of chunks, so that helper threads (threads.js) can share it, and sums over the vectors
+// are taken chunk by chunk and added up in chunk order: the same on any number of threads.
+export const CHUNK = 2048;
 
-/** G[(r0 + i) * ld + c0 + j] = U[i] . V[j] for every pair (only j <= i when `lower`). */
-function gram(U, V, G, ld, r0, c0, lower = false) {
-  const n = U.length ? U[0].length : 0;
-  for (let i = 0; i < U.length; i++) for (let j = 0; j < (lower ? i + 1 : V.length); j++) G[(r0 + i) * ld + c0 + j] = 0;
-  for (let t0 = 0; t0 < n; t0 += CHUNK) {
-    const t1 = Math.min(n, t0 + CHUNK);
-    for (let i = 0; i < U.length; i++) {
+/** Dense block kernels on the chunks c0 <= c < c1 of vectors of length n: kernel(V, coef, ints, part, n, c0, c1). */
+export const DENSE_OP = { gram: 0, combine: 1, subtract: 2, triangular: 3, residual: 4, diagonal: 5 };
+export const DENSE = [];
+// part[c nU nV + i nV + j] = U[i] . V[j] on chunk c (only j <= i when ints[0] = 1)
+DENSE[DENSE_OP.gram] = ([U, V], coef, ints, part, n, c0, c1) => {
+  const lower = ints[0] === 1, nU = U.length, nV = V.length;
+  for (let c = c0; c < c1; c++) {
+    const t0 = c * CHUNK, t1 = Math.min(n, t0 + CHUNK), o = c * nU * nV;
+    for (let i = 0; i < nU; i++) {
       const u = U[i];
-      for (let j = 0; j < (lower ? i + 1 : V.length); j++) {
+      for (let j = 0; j < (lower ? i + 1 : nV); j++) {
         const v = V[j];
         let s0 = 0, s1 = 0, t = t0;
         for (; t + 1 < t1; t += 2) { s0 += u[t] * v[t]; s1 += u[t + 1] * v[t + 1]; }
         if (t < t1) s0 += u[t] * v[t];
-        G[(r0 + i) * ld + c0 + j] += s0 + s1;
+        part[o + i * nV + j] = s0 + s1;
       }
     }
   }
-}
-
-/**
- * New vectors out[j] = sum over the parts [V, row] of sum_i V[i] * C[(row + i) * k + j], j < cols.
- * With `plus`, out[j] also gets plus[j] added.
- */
-function combine(parts, C, k, cols, n, plus = null) {
-  const out = Array.from({ length: cols }, () => new Float64Array(n));
-  for (let t0 = 0; t0 < n; t0 += CHUNK) {
-    const t1 = Math.min(n, t0 + CHUNK);
-    for (let j = 0; j < cols; j++) {
+};
+// out[j] = plus[j] (or 0) + sum over the parts V_q of sum_i V_q[i] C[(row_q + i) k + j], with
+// V = [out, plus (may be empty), V_0, V_1, ...] and ints = [k, row_0, row_1, ...]
+DENSE[DENSE_OP.combine] = (V, C, ints, part, n, c0, c1) => {
+  const out = V[0], plus = V[1].length ? V[1] : null, k = ints[0];
+  for (let c = c0; c < c1; c++) {
+    const t0 = c * CHUNK, t1 = Math.min(n, t0 + CHUNK);
+    for (let j = 0; j < out.length; j++) {
       const o = out[j];
       if (plus) { const p = plus[j]; for (let t = t0; t < t1; t++) o[t] = p[t]; }
-      for (const [V, row] of parts) {
-        for (let i = 0; i < V.length; i++) {
-          const c = C[(row + i) * k + j];
-          if (c === 0) continue;
-          const v = V[i];
-          for (let t = t0; t < t1; t++) o[t] += c * v[t];
+      else for (let t = t0; t < t1; t++) o[t] = 0;
+      for (let q = 2; q < V.length; q++) {
+        const Vq = V[q], row = ints[q - 1];
+        for (let i = 0; i < Vq.length; i++) {
+          const cc = C[(row + i) * k + j];
+          if (cc === 0) continue;
+          const v = Vq[i];
+          for (let t = t0; t < t1; t++) o[t] += cc * v[t];
         }
       }
     }
   }
-  return out;
-}
-
-/** W[j] -= sum_i X[i] * C[i * ld + j], in place. */
-function subtractCombination(W, X, C, ld) {
-  const n = W.length ? W[0].length : 0;
-  for (let t0 = 0; t0 < n; t0 += CHUNK) {
-    const t1 = Math.min(n, t0 + CHUNK);
+};
+// W[j] -= sum_i X[i] C[i ld + j], in place (ints = [ld])
+DENSE[DENSE_OP.subtract] = ([W, X], C, ints, part, n, c0, c1) => {
+  const ld = ints[0];
+  for (let c = c0; c < c1; c++) {
+    const t0 = c * CHUNK, t1 = Math.min(n, t0 + CHUNK);
     for (let j = 0; j < W.length; j++) {
       const w = W[j];
       for (let i = 0; i < X.length; i++) {
-        const c = C[i * ld + j];
-        if (c === 0) continue;
+        const cc = C[i * ld + j];
+        if (cc === 0) continue;
         const x = X[i];
-        for (let t = t0; t < t1; t++) w[t] -= c * x[t];
+        for (let t = t0; t < t1; t++) w[t] -= cc * x[t];
       }
     }
+  }
+};
+// M <- M L^-T for each block M, with the lower Cholesky factor L in G (ints = [k]): column j only
+// needs the finished columns before it
+DENSE[DENSE_OP.triangular] = (Ms, G, ints, part, n, c0, c1) => {
+  const k = ints[0];
+  for (const M of Ms) {
+    for (let c = c0; c < c1; c++) {
+      const t0 = c * CHUNK, t1 = Math.min(n, t0 + CHUNK);
+      for (let j = 0; j < k; j++) {
+        const v = M[j];
+        for (let q = 0; q < j; q++) {
+          const g = G[j * k + q], w = M[q];
+          for (let t = t0; t < t1; t++) v[t] -= g * w[t];
+        }
+        const inv = 1 / G[j * k + j];
+        for (let t = t0; t < t1; t++) v[t] *= inv;
+      }
+    }
+  }
+};
+// R[j] = AX[j] - theta_j BX[j], with each chunk's r.r, ax.ax and bx.bx in part[3 (c m + j) + 0..2]
+DENSE[DENSE_OP.residual] = ([AX, BX, R], theta, ints, part, n, c0, c1) => {
+  const m = R.length;
+  for (let c = c0; c < c1; c++) {
+    const t0 = c * CHUNK, t1 = Math.min(n, t0 + CHUNK);
+    for (let j = 0; j < m; j++) {
+      const ax = AX[j], bx = BX[j], r = R[j], th = theta[j];
+      let rr = 0, na = 0, nb = 0;
+      for (let t = t0; t < t1; t++) {
+        const v = ax[t] - th * bx[t];
+        r[t] = v;
+        rr += v * v; na += ax[t] * ax[t]; nb += bx[t] * bx[t];
+      }
+      const o = 3 * (c * m + j);
+      part[o] = rr; part[o + 1] = na; part[o + 2] = nb;
+    }
+  }
+};
+// Y[j] = D[0] * X[j] entry by entry (a diagonal B)
+DENSE[DENSE_OP.diagonal] = ([Y, X, D], coef, ints, part, n, c0, c1) => {
+  const d = D[0];
+  for (let c = c0; c < c1; c++) {
+    const t0 = c * CHUNK, t1 = Math.min(n, t0 + CHUNK);
+    for (let j = 0; j < Y.length; j++) {
+      const y = Y[j], x = X[j];
+      for (let t = t0; t < t1; t++) y[t] = d[t] * x[t];
+    }
+  }
+};
+
+const NONE = [];
+
+/**
+ * LOBPCG's vectors and block operations. With helper threads the vectors come from an arena of
+ * shared memory (released explicitly: release()), and operations whose vectors all live there run
+ * on all threads; any others run on this thread with the same results.
+ */
+class Dense {
+  static async create(n, m, threads) {
+    const d = new Dense(n, m);
+    // the most vectors alive at once: X, W, P and the new X and P, with their A and B images
+    const slots = Math.min(16 * m + 2, Math.floor(1.5e9 / (8 * Math.max(1, n))));
+    if (threads && d.chunks > 1 && slots >= 4 * m) {
+      try {
+        const shared = (Type, len) => new Type(new SharedArrayBuffer(len * Type.BYTES_PER_ELEMENT));
+        const arena = shared(Float64Array, slots * n);
+        const extra = {
+          arena, arenaN: n,
+          dlist: shared(Int32Array, 8 + 6 * m), dcoef: shared(Float64Array, 9 * m * m + 3 * m),
+          dint: shared(Int32Array, 8), dpart: shared(Float64Array, d.part.length),
+        };
+        await threads.share(extra);
+        d.threads = threads;
+        d.buf = arena.buffer;
+        d.views = Array.from({ length: slots }, (_, i) => arena.subarray(i * n, (i + 1) * n));
+        d.live = new Uint8Array(slots);
+        d.free = Array.from({ length: slots }, (_, i) => slots - 1 - i);
+      } catch {
+        d.threads = null; // not enough memory to share: this thread alone
+      }
+    }
+    return d;
+  }
+
+  constructor(n, m) {
+    this.n = n;
+    this.chunks = Math.ceil(n / CHUNK);
+    this.part = new Float64Array(this.chunks * Math.max(m * m, 3 * m));
+    this.threads = null;
+    this.buf = null;
+    this.free = [];
+  }
+
+  /** A vector of length n (from the arena while it lasts; contents undefined). */
+  vec() {
+    if (!this.free.length) return new Float64Array(this.n);
+    const i = this.free.pop();
+    this.live[i] = 1;
+    return this.views[i];
+  }
+
+  slot(v) {
+    return v.buffer === this.buf ? v.byteOffset / (8 * this.n) : -1;
+  }
+
+  /** Returns the vectors of the given blocks to the arena, except those in `keep`. */
+  release(blocks, keep = null) {
+    if (!this.buf) return;
+    for (const V of blocks) {
+      if (!V) continue;
+      for (const v of V) {
+        const i = this.slot(v);
+        if (i < 0 || !this.live[i] || keep?.includes(v)) continue;
+        this.live[i] = 0;
+        this.free.push(i);
+      }
+    }
+  }
+
+  run(op, lists, coef, ints) {
+    if (this.threads && lists.every((V) => V.every((v) => this.slot(v) >= 0))) {
+      return this.threads.dense(op, lists.map((V) => V.map((v) => this.slot(v))), coef, ints, this.chunks);
+    }
+    DENSE[op](lists, coef, ints, this.part, this.n, 0, this.chunks);
+    return this.part;
+  }
+
+  /** G[(r0 + i) * ld + c0 + j] = U[i] . V[j] for every pair (only j <= i when `lower`). */
+  gram(U, V, G, ld, r0, c0, lower = false) {
+    const nU = U.length, nV = V.length;
+    const part = this.run(DENSE_OP.gram, [U, V], NONE, [lower ? 1 : 0]);
+    for (let i = 0; i < nU; i++) {
+      for (let j = 0; j < (lower ? i + 1 : nV); j++) {
+        let s = 0;
+        for (let c = 0, o = i * nV + j; c < this.chunks; c++, o += nU * nV) s += part[o];
+        G[(r0 + i) * ld + c0 + j] = s;
+      }
+    }
+  }
+
+  /**
+   * New vectors out[j] = sum over the parts [V, row] of sum_i V[i] * C[(row + i) * k + j], j < cols.
+   * With `plus`, out[j] also gets plus[j] added.
+   */
+  combine(parts, C, k, cols, plus = null) {
+    const out = Array.from({ length: cols }, () => this.vec());
+    this.run(DENSE_OP.combine, [out, plus || NONE, ...parts.map(([V]) => V)], C, [k, ...parts.map(([, row]) => row)]);
+    return out;
+  }
+
+  /** W[j] -= sum_i X[i] * C[i * ld + j], in place. */
+  subtract(W, X, C, ld) {
+    this.run(DENSE_OP.subtract, [W, X], C, [ld]);
+  }
+
+  /** New vectors d * X[j] (d a vector: a diagonal matrix). */
+  diagonal(X, d) {
+    const out = X.map(() => this.vec());
+    this.run(DENSE_OP.diagonal, [out, X, [d]], NONE, NONE);
+    return out;
+  }
+
+  /** R[j] = AX[j] - theta[j] BX[j] (R given); returns r.r, ax.ax and bx.bx of each (3 per vector). */
+  residual(AX, BX, R, theta) {
+    const m = R.length, part = this.run(DENSE_OP.residual, [AX, BX, R], theta, NONE), sums = new Float64Array(3 * m);
+    for (let c = 0; c < this.chunks; c++) for (let q = 0; q < 3 * m; q++) sums[q] += part[3 * c * m + q];
+    return sums;
+  }
+
+  /** Drops the arena (the helpers hold it until then). */
+  async close() {
+    if (this.threads) await this.threads.share({ arena: null, dlist: null, dcoef: null, dint: null, dpart: null });
+    this.threads = null;
+    this.buf = null;
+    this.views = null;
   }
 }
 
@@ -317,33 +520,17 @@ function subtractCombination(W, X, C, ld) {
  * B-orthonormalize a block in place (with its A and B images) by Cholesky of its Gram matrix.
  * Returns false when the block is numerically rank-deficient.
  */
-function bOrthonormalize(V, AV, BV) {
+function bOrthonormalize(dense, V, AV, BV) {
   const k = V.length;
   const G = new Float64Array(k * k);
-  gram(V, BV, G, k, 0, 0, true);
+  dense.gram(V, BV, G, k, 0, 0, true);
   for (let i = 0; i < k; i++) for (let j = 0; j < i; j++) G[j * k + i] = G[i * k + j];
   let scale = 0;
   for (let i = 0; i < k; i++) scale = Math.max(scale, G[i * k + i]);
   if (!(scale > 0)) return false;
   if (!cholesky(G, k)) return false;
   for (let i = 0; i < k; i++) if (!(G[i * k + i] > 1e-7 * Math.sqrt(scale))) return false;
-  // V <- V L^-T: column j only needs the finished columns before it, chunk by chunk
-  const n = V[0].length;
-  for (const M of [V, AV, BV]) {
-    if (!M) continue;
-    for (let t0 = 0; t0 < n; t0 += CHUNK) {
-      const t1 = Math.min(n, t0 + CHUNK);
-      for (let j = 0; j < k; j++) {
-        const v = M[j];
-        for (let q = 0; q < j; q++) {
-          const c = G[j * k + q], w = M[q];
-          for (let t = t0; t < t1; t++) v[t] -= c * w[t];
-        }
-        const inv = 1 / G[j * k + j];
-        for (let t = t0; t < t1; t++) v[t] *= inv;
-      }
-    }
-  }
+  dense.run(DENSE_OP.triangular, [V, AV, BV].filter(Boolean), G, [k]);
   return true;
 }
 
@@ -353,22 +540,36 @@ function bOrthonormalize(V, AV, BV) {
  * @param {number} o.n                vector length
  * @param {(x: Float64Array, y: Float64Array) => void} o.applyA
  * @param {(x: Float64Array, y: Float64Array) => void} o.applyB
- * @param {(V: Float64Array[]) => Promise<Float64Array[]>} [o.blockA]  A times a block, e.g. on
- *                                    several threads (instead of applyA per vector)
- * @param {(V: Float64Array[]) => Promise<Float64Array[]>} [o.blockB]  likewise for B
+ * @param {(V: Float64Array[], vec: () => Float64Array) => Promise<Float64Array[]>} [o.blockA]  A times
+ *                                    a block, e.g. on several threads (instead of applyA per vector),
+ *                                    into new vectors from vec()
+ * @param {(V: Float64Array[], vec: () => Float64Array) => Promise<Float64Array[]>} [o.blockB]  likewise for B
+ * @param {Float64Array} [o.diagB]    B is this diagonal (instead of applyB)
  * @param {boolean} [o.cheapB]        B is cheap to apply (a diagonal): its images are recomputed
  *                                    rather than carried along as combinations
- * @param {(r: Float64Array[]) => Promise<Float64Array[]>|Float64Array[]} o.precond  ~ A^-1 (or a shifted inverse)
+ * @param {(r: Float64Array[], vec: () => Float64Array) => Promise<Float64Array[]>|Float64Array[]} o.precond
+ *                                    ~ A^-1 (or a shifted inverse), into new vectors (from vec())
  * @param {number} o.nev              eigenpairs wanted
  * @param {number} [o.block]          block size (extra "guard" vectors speed up convergence)
  * @param {Float64Array} [o.mask]     1 on DOFs that take part (0 = held)
+ * @param {import('./threads.js').Threads} [o.threads]  helper threads for the block operations
  * @param {(it: number, res: number, conv: number) => boolean|void} [o.onProgress] return true to cancel
  */
-export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, cheapB = false, precond, nev, block = nev + Math.min(4, Math.max(2, nev)), tol = 1e-5, maxIter = 300, mask = null, onProgress = null, seed = 12345, settleAbove = Infinity }) {
+export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, diagB = null, cheapB = false, precond, nev, block = nev + Math.min(4, Math.max(2, nev)), tol = 1e-5, maxIter = 300, mask = null, threads = null, onProgress = null, seed = 12345, settleAbove = Infinity }) {
   const m = Math.max(nev, block);
-  const vec = () => new Float64Array(n);
-  const imageA = blockA || ((V) => V.map((v) => { const y = vec(); applyA(v, y); return y; }));
-  const imageB = blockB || ((V) => V.map((v) => { const y = vec(); applyB(v, y); return y; }));
+  const dense = await Dense.create(n, m, threads);
+  try {
+    return await iterate();
+  } finally {
+    await dense.close();
+  }
+
+  async function iterate() {
+  const vec = () => dense.vec();
+  const D = diagB ? vec() : null;
+  if (D) D.set(diagB);
+  const imageA = blockA ? (V) => blockA(V, vec) : (V) => V.map((v) => { const y = vec(); applyA(v, y); return y; });
+  const imageB = D ? (V) => dense.diagonal(V, D) : blockB ? (V) => blockB(V, vec) : (V) => V.map((v) => { const y = vec(); applyB(v, y); return y; });
   let s = seed;
   const rand = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff - 0.5; };
   // start from preconditioned random vectors (smooth, low-energy shapes)
@@ -378,22 +579,28 @@ export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, 
     for (let t = 0; t < n; t++) v[t] = mask && !mask[t] ? 0 : rand();
     X.push(v);
   }
-  X = await precond(X);
+  const X0 = X;
+  X = await precond(X0, vec);
+  dense.release([X0], X);
   let BX = await imageB(X);
-  if (!bOrthonormalize(X, null, BX)) throw new Error('Could not start the eigenvalue solver (model has too few free nodes).');
+  if (!bOrthonormalize(dense, X, null, BX)) throw new Error('Could not start the eigenvalue solver (model has too few free nodes).');
   let AX = await imageA(X);
   let theta;
   // initial Rayleigh-Ritz on X
   {
     const gA = new Float64Array(m * m), gB = new Float64Array(m * m);
-    gram(X, AX, gA, m, 0, 0, true);
-    gram(X, BX, gB, m, 0, 0, true);
+    dense.gram(X, AX, gA, m, 0, 0, true);
+    dense.gram(X, BX, gB, m, 0, 0, true);
     for (let i = 0; i < m; i++) for (let j = 0; j < i; j++) { gA[j * m + i] = gA[i * m + j]; gB[j * m + i] = gB[i * m + j]; }
     const ev = generalizedEigen(gA, gB, m);
     if (!ev) throw new Error('Eigenvalue solver failed to start.');
-    X = combine([[X, 0]], ev.vectors, m, m, n);
-    AX = combine([[AX, 0]], ev.vectors, m, m, n);
-    BX = cheapB ? await imageB(X) : combine([[BX, 0]], ev.vectors, m, m, n);
+    const X1 = dense.combine([[X, 0]], ev.vectors, m, m);
+    const AX1 = dense.combine([[AX, 0]], ev.vectors, m, m);
+    const BX1 = cheapB ? null : dense.combine([[BX, 0]], ev.vectors, m, m);
+    dense.release([X, AX, BX]);
+    X = X1;
+    AX = AX1;
+    BX = cheapB ? await imageB(X) : BX1;
     theta = ev.values.slice(0, m);
   }
   let P = null, AP = null, BP = null;
@@ -403,49 +610,51 @@ export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, 
   let it = 0;
   for (; it < maxIter; it++) {
     // residuals
+    const Rall = X.map(() => vec());
+    const sums = dense.residual(AX, BX, Rall, theta);
     const R = [], active = [];
     for (let j = 0; j < m; j++) {
-      const r = vec(), ax = AX[j], bx = BX[j], th = theta[j];
-      let rr = 0, na = 0, nb = 0;
-      for (let t = 0; t < n; t++) {
-        const v = ax[t] - th * bx[t];
-        r[t] = v;
-        rr += v * v; na += ax[t] * ax[t]; nb += bx[t] * bx[t];
-      }
-      res[j] = Math.sqrt(rr) / (Math.sqrt(na) + Math.abs(th) * Math.sqrt(nb) || 1);
+      const th = theta[j];
+      res[j] = Math.sqrt(sums[3 * j]) / (Math.sqrt(sums[3 * j + 1]) + Math.abs(th) * Math.sqrt(sums[3 * j + 2]) || 1);
       // settled above the bound: its eigenvalue lies outside the searched range (Ritz values only
       // decrease towards the eigenvalues), so it needs no more accuracy
       settled[j] = it >= 10 && th > settleAbove && Math.abs(th - history[it % 10][j]) <= 0.01 * Math.abs(settleAbove);
-      if (res[j] > tol && !settled[j]) { active.push(j); R.push(r); }
+      if (res[j] > tol && !settled[j]) { active.push(j); R.push(Rall[j]); }
     }
+    dense.release([Rall], R);
     history[it % 10] = theta.slice();
     const conv = res.slice(0, nev).filter((r, j) => r <= tol || settled[j]).length;
     const worst = Math.max(0, ...res.slice(0, nev).filter((_, j) => !settled[j]));
     if (onProgress && onProgress(it, worst, conv) === true) throw Object.assign(new Error('Cancelled'), { cancelled: true });
     if (conv === nev) break;
     // preconditioned residuals, B-orthogonal to X
-    let W = await precond(R);
+    let W = await precond(R, vec);
+    dense.release([R], W);
     if (mask) for (const w of W) for (let t = 0; t < n; t++) if (!mask[t]) w[t] = 0;
     const nW = W.length;
     const XBW = new Float64Array(m * nW);
-    gram(BX, W, XBW, nW, 0, 0);
-    subtractCombination(W, X, XBW, nW);
+    dense.gram(BX, W, XBW, nW, 0, 0);
+    dense.subtract(W, X, XBW, nW);
     let BW = await imageB(W);
-    if (!bOrthonormalize(W, null, BW)) {
+    if (!bOrthonormalize(dense, W, null, BW)) {
       // dependent search directions: restart the momentum and try once more with a jitter
+      dense.release([P, AP, BP]);
       P = AP = BP = null;
       for (const w of W) for (let t = 0; t < n; t++) if (!mask || mask[t]) w[t] += 1e-8 * rand();
+      dense.release([BW]);
       BW = await imageB(W);
-      if (!bOrthonormalize(W, null, BW)) break;
+      if (!bOrthonormalize(dense, W, null, BW)) break;
     }
     const AW = await imageA(W);
     let usedP = false;
     if (P) {
-      const keep = active.map((j) => j); // P columns follow the active set
-      P = keep.map((j) => P[j]).filter(Boolean);
-      AP = keep.map((j) => AP[j]).filter(Boolean);
-      BP = keep.map((j) => BP[j]).filter(Boolean);
-      usedP = P.length > 0 && bOrthonormalize(P, AP, BP);
+      // P columns follow the active set
+      const P1 = active.map((j) => P[j]).filter(Boolean), AP1 = active.map((j) => AP[j]).filter(Boolean), BP1 = active.map((j) => BP[j]).filter(Boolean);
+      dense.release([P], P1);
+      dense.release([AP], AP1);
+      dense.release([BP], BP1);
+      P = P1; AP = AP1; BP = BP1;
+      usedP = P.length > 0 && bOrthonormalize(dense, P, AP, BP);
     }
     // Rayleigh-Ritz on [X W P]. X, W and P are each B-orthonormal and X^T A X = diag(theta), so
     // only the other blocks of the projected matrices need products.
@@ -454,15 +663,15 @@ export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, 
     const gA = new Float64Array(k * k), gB = new Float64Array(k * k);
     for (let i = 0; i < m; i++) gA[i * k + i] = theta[i];
     for (let i = 0; i < k; i++) gB[i * k + i] = 1;
-    gram(X, AW, gA, k, 0, m);
-    gram(W, AW, gA, k, m, m, true);
-    gram(X, BW, gB, k, 0, m);
+    dense.gram(X, AW, gA, k, 0, m);
+    dense.gram(W, AW, gA, k, m, m, true);
+    dense.gram(X, BW, gB, k, 0, m);
     if (usedP) {
-      gram(X, AP, gA, k, 0, m + nW);
-      gram(W, AP, gA, k, m, m + nW);
-      gram(P, AP, gA, k, m + nW, m + nW, true);
-      gram(X, BP, gB, k, 0, m + nW);
-      gram(W, BP, gB, k, m, m + nW);
+      dense.gram(X, AP, gA, k, 0, m + nW);
+      dense.gram(W, AP, gA, k, m, m + nW);
+      dense.gram(P, AP, gA, k, m + nW, m + nW, true);
+      dense.gram(X, BP, gB, k, 0, m + nW);
+      dense.gram(W, BP, gB, k, m, m + nW);
     }
     // mirror: blocks above the diagonal were filled, and the lower triangles of the diagonal blocks
     const blockOf = (i) => (i < m ? 0 : i < m + nW ? 1 : 2);
@@ -484,21 +693,26 @@ export async function lobpcg({ n, applyA, applyB, blockA = null, blockB = null, 
     const C = ev.vectors;
     // new momentum: the W and P parts of the Ritz vectors; new X adds its X part
     const step = (Xb, Wb, Pb) => {
-      const p = combine(usedP ? [[Wb, m], [Pb, m + nW]] : [[Wb, m]], C, kk, m, n);
-      return [combine([[Xb, 0]], C, kk, m, n, p), p];
+      const p = dense.combine(usedP ? [[Wb, m], [Pb, m + nW]] : [[Wb, m]], C, kk, m);
+      return [dense.combine([[Xb, 0]], C, kk, m, p), p];
     };
-    [X, P] = step(X, W, P);
-    [AX, AP] = step(AX, AW, AP);
+    const [X1, P1] = step(X, W, P);
+    const [AX1, AP1] = step(AX, AW, AP);
+    const [BX1, BP1] = cheapB ? [null, null] : step(BX, BW, BP);
+    dense.release([X, W, P, AX, AW, AP, BX, BW, BP]);
+    [X, P, AX, AP] = [X1, P1, AX1, AP1];
     if (cheapB) { BX = await imageB(X); BP = await imageB(P); }
-    else [BX, BP] = step(BX, BW, BP);
+    else [BX, BP] = [BX1, BP1];
   }
   return {
     values: theta.slice(0, nev),
-    vectors: X.slice(0, nev),
+    // copied out of the arena, which goes with the solver
+    vectors: X.slice(0, nev).map((v) => Float64Array.from(v)),
     residuals: res.slice(0, nev),
     iterations: it,
     converged: res.slice(0, nev).every((r, j) => r <= tol * 10 || settled[j]),
   };
+  }
 }
 
 // ---------- studies ----------
@@ -529,13 +743,13 @@ function compactOps(fea, precondFull, applyFull) {
   const map = freeDofs(fea);
   const full = new Float64Array(L.nDof), out = new Float64Array(L.nDof);
   const pre = precondFull || cpuPreconditioner(fea);
-  const onFull = async (op, V) => (await op(V.map((v) => map.scatter(v, new Float64Array(L.nDof))))).map((y) => map.gather(y, new Float64Array(map.n)));
+  const onFull = async (op, V, vec) => (await op(V.map((v) => map.scatter(v, new Float64Array(L.nDof))))).map((y) => map.gather(y, vec ? vec() : new Float64Array(map.n)));
   return {
     map,
     applyK(x, y) { fea.apply(L, map.scatter(x, full), out); map.gather(out, y); },
     /** K times a block on the given (e.g. multi-threaded) full-length product, if any. */
-    blockK: applyFull ? (V) => onFull(applyFull, V) : null,
-    precond: (R) => onFull(pre, R),
+    blockK: applyFull ? (V, vec) => onFull(applyFull, V, vec) : null,
+    precond: (R, vec) => onFull(pre, R, vec),
     expand(x) { return map.scatter(x, new Float64Array(L.nDof)); },
   };
 }
@@ -551,12 +765,12 @@ export async function naturalFrequencies(fea, { nev, E, density, h, shift = 0, p
   const ops = compactOps(fea, precondFull, applyFull);
   const mc = ops.map.gather(mass, new Float64Array(ops.map.n));
   const r = await lobpcg({
-    n: ops.map.n, nev, tol, onProgress,
+    n: ops.map.n, nev, tol, onProgress, threads: fea.threads,
     applyA: ops.applyK,
     blockA: ops.blockK,
-    applyB: (x, y) => { for (let t = 0; t < x.length; t++) y[t] = mc[t] * x[t]; },
+    diagB: mc,
     cheapB: true,
-    precond: (R) => ops.precond(R),
+    precond: ops.precond,
   });
   // normalized eigenvalue lambda = w^2 rho h^2 / E
   const lambdas = r.values.map((v) => Math.max(0, v - shift));
@@ -586,16 +800,17 @@ export async function bucklingFactors(fea, sigma, { nev, precondFull = null, app
   // them, and the search there is slow (a cluster of eigenvalues near zero) and ill-conditioned
   const floor = Number.isFinite(maxFactor) && maxFactor > 0 ? 1 / maxFactor : 0;
   const KG = new GeometricStiffness(fea, sigma);
+  await KG.share();
   const ops = compactOps(fea, precondFull, applyFull);
   const L = fea.levels[0];
   const full = new Float64Array(L.nDof), out = new Float64Array(L.nDof);
   // smallest (most negative) theta of K_G x = theta K x  <=>  buckling factor -1/theta
   const r = await lobpcg({
-    n: ops.map.n, nev, tol, onProgress, settleAbove: floor > 0 ? -floor : Infinity,
+    n: ops.map.n, nev, tol, onProgress, settleAbove: floor > 0 ? -floor : Infinity, threads: fea.threads,
     applyA: (x, y) => { KG.apply(ops.map.scatter(x, full), out); ops.map.gather(out, y); },
     applyB: ops.applyK,
     blockB: ops.blockK,
-    precond: (R) => ops.precond(R),
+    precond: ops.precond,
   });
   const factors = r.values.map((t) => (t < -floor ? -1 / t : Infinity));
   return { factors, modes: r.vectors.map((v) => ops.expand(v)), converged: r.converged, iterations: r.iterations, residuals: r.residuals, maxFactor };

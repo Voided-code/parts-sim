@@ -47,11 +47,12 @@ function buildModel(m, { free = false, diagAdd = null } = {}) {
 
 /**
  * Solver engine: GPU multigrid-CG (WebGPU) when allowed and working, otherwise the CPU multigrid.
- * Helper threads for the finest level's products and stresses start while the GPU sets up (a
- * study that rebuilds its model every step passes threads: false).
+ * Helper threads for the CPU solver, the products and the stresses start while the GPU sets up;
+ * destroy() hands them on to the job's next model.
  */
-async function engineFor(m, fea, { threads = true } = {}) {
-  const started = threads ? useThreads(fea) : null;
+async function engineFor(m, fea) {
+  const started = useThreads(fea);
+  const release = () => fea.threads?.release();
   let note = null;
   if (m.engine !== 'cpu') {
     try {
@@ -65,7 +66,7 @@ async function engineFor(m, fea, { threads = true } = {}) {
           const sol = await gpu.solve(f, o);
           return sol.converged ? sol : fea.solve(f, o);
         },
-        destroy: () => gpu.destroy(),
+        destroy: () => { gpu.destroy(); release(); },
       };
     } catch (err) {
       note = err?.message || String(err);
@@ -73,16 +74,17 @@ async function engineFor(m, fea, { threads = true } = {}) {
   }
   await started;
   const pre = cpuPreconditioner(fea);
-  return { name: 'CPU', note, precond: async (R) => pre(R), solve: async (f, o) => fea.solve(f, o), destroy() {} };
+  return { name: 'CPU', note, precond: async (R) => pre(R), solve: async (f, o) => fea.solve(f, o), destroy: release };
 }
 
 /**
  * The eigenvalue solvers' block operations (a V-cycle or a stiffness product for each vector of a
- * block). The CPU engine spreads them over helper threads, which start building their copies of
- * the model right away while this thread carries on.
+ * block). Without shared-memory threads (which already share each V-cycle and product), the CPU
+ * engine spreads them over a pool of workers, which start building their copies of the model
+ * right away while this thread carries on.
  */
 function blockOps(engine, fea, block) {
-  const pool = engine.name === 'CPU' ? BlockPool.create(fea, { maxThreads: block - 1 }) : Promise.resolve(null);
+  const pool = engine.name === 'CPU' && !fea.threads ? BlockPool.create(fea, { maxThreads: block - 1 }) : Promise.resolve(null);
   const L = fea.levels[0];
   return {
     precondFull: async (R) => (await pool)?.precondition(R) ?? engine.precond(R),
@@ -273,6 +275,7 @@ async function nonlinear(m, post) {
       post({ type: 'step', kind, ...point, u, vm, pe, p1, iterations: s.iterations }, [u.buffer, vm.buffer, pe.buffer, p1.buffer]);
     };
     const model = new NonlinearModel(fea, { largeDisplacement: m.largeDisplacement !== false, plastic });
+    await model.share();
     const res = await loadRamp(model, f, precond, {
       target: m.untilFailure ? Infinity : 1,
       steps: m.steps || 10,
@@ -370,7 +373,7 @@ async function topology(m, post) {
     dims: m.dims, fill: m.density, keep: m.keep, volFrac: m.volFrac, maxIter: m.maxIter || 40, rmin: m.rmin || 1.5,
     solve: async (density, x0) => {
       const fea = new VoxelFEA({ dims: m.dims, density, nu: m.nu, bc: m.bc, ...(m.engine !== 'cpu' ? { coarsestMaxDof: GPU_COARSEST_DOF } : {}) });
-      const engine = await engineFor(m, fea, { threads: false });
+      const engine = await engineFor(m, fea);
       engineName = engine.name;
       note = engine.note;
       try {
