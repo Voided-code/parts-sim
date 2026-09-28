@@ -1,18 +1,25 @@
-// Runs the CPU lattice-Boltzmann solver off the main thread and streams flow snapshots.
+// Runs the CPU lattice-Boltzmann solver off the main thread (with helper threads where memory can
+// be shared) and streams flow snapshots.
 import { LBMCPU } from './lbm-cpu.js';
+import { LBMThreads } from './lbm-threads.js';
 
 let sim = null;
 let running = false;
 let timer = 0;
 
-self.onmessage = (ev) => {
+self.onmessage = async (ev) => {
   const m = ev.data;
   try {
   if (m.type === 'init') {
     running = false;
     clearTimeout(timer);
-    sim = new LBMCPU(m.params);
+    sim?.threads?.stop();
+    sim = null;
+    const next = new LBMCPU(m.params);
+    await LBMThreads.start(next);
+    sim = next;
     self.postMessage({ type: 'ready' });
+    if (running) loop(); // asked to run while the threads started
   } else if (m.type === 'run') {
     if (!running) {
       running = true;

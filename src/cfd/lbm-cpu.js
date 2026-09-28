@@ -148,6 +148,7 @@ export class LBMCPU {
     validateGrid(o);
     if (o.links && o.links.length !== 19 * o.solid.length) throw new Error('Wall links do not match the flow grid.');
     this.links = o.links || null;
+    this.threads = null; // lbm-threads.js
     const [nx, ny, nz] = o.dims;
     this.dims = o.dims;
     this.N = nx * ny * nz;
@@ -190,114 +191,129 @@ export class LBMCPU {
     this.steps = 0;
   }
 
+  /** The fields stepRows needs (shared with helper threads by lbm-threads.js). */
+  kernelState() {
+    const { dims, N, solid, off, tau0, smag, macro, links, runs, runStart, src } = this;
+    return { dims, N, solid, off, tau0, smag, macro, links, runs, runStart, src };
+  }
+
   step(writeMacro = false) {
-    const [nx, ny, nz] = this.dims;
-    const { N, f, g, solid, off, tau0, smag, macro, links, runs, runStart, src } = this;
+    const [, ny, nz] = this.dims;
     const uin = inletVelocity(this.uLat, this.steps);
     const feqIn = new Float64Array(19);
     for (let i = 0; i < 19; i++) {
       const cu = CX[i] * uin;
       feqIn[i] = W[i] * (1 + 3 * cu + 4.5 * cu * cu - 1.5 * uin * uin);
     }
-    const fi = new Float64Array(19);
-    const fe = new Float64Array(19);
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        const edge = y === 0 || z === 0 || y === ny - 1 || z === nz - 1;
-        const row = y + ny * z;
-        let r = runStart[row];
-        const rEnd = runStart[row + 1];
-        for (let x = 0; x < nx; x++) {
-          if (r < rEnd && x === runs[2 * r]) {
-            collideRun(f, g, macro, N, src, nx * row + x, nx * row + runs[2 * r + 1], tau0, smag, writeMacro);
-            x = runs[2 * r + 1] - 1;
-            r++;
-            continue;
-          }
-          const c = x + nx * (y + ny * z);
-          if (solid[c]) continue;
-          if (x === 0) {
-            for (let i = 0; i < 19; i++) g[i * N + c] = feqIn[i];
-            if (writeMacro) {
-              macro[4 * c] = 1; macro[4 * c + 1] = uin; macro[4 * c + 2] = 0; macro[4 * c + 3] = 0;
-            }
-            continue;
-          }
-          if (edge || x === nx - 1) {
-            // open boundary: velocity of the nearest interior cell (previous step), ambient pressure
-            const u0 = Math.min(x, nx - 2) + nx * (Math.min(Math.max(y, 1), ny - 2) + ny * Math.min(Math.max(z, 1), nz - 2));
-            let ux = uin, uy = 0, uz = 0;
-            if (!solid[u0]) {
-              let r = 0, px = 0, py = 0, pz = 0;
-              for (let i = 0; i < 19; i++) {
-                const v = f[i * N + u0];
-                r += v; px += CX[i] * v; py += CY[i] * v; pz += CZ[i] * v;
-              }
-              ux = px / r; uy = py / r; uz = pz / r;
-            }
-            const usq = 1.5 * (ux * ux + uy * uy + uz * uz);
-            for (let i = 0; i < 19; i++) {
-              const cu = CX[i] * ux + CY[i] * uy + CZ[i] * uz;
-              g[i * N + c] = W[i] * (1 + 3 * cu + 4.5 * cu * cu - usq);
-            }
-            if (writeMacro) {
-              macro[4 * c] = 1; macro[4 * c + 1] = ux; macro[4 * c + 2] = uy; macro[4 * c + 3] = uz;
-            }
-            continue;
-          }
-          let rho = 0, mx = 0, my = 0, mz = 0;
+    if (this.threads) this.threads.step(this, uin, feqIn, writeMacro);
+    else stepRows(this, this.f, this.g, uin, feqIn, writeMacro, 0, ny * nz);
+    [this.f, this.g] = [this.g, this.f];
+    this.steps++;
+  }
+}
+
+// one thread's scratch for the cells off the fast path
+const fi = new Float64Array(19), fe = new Float64Array(19);
+
+/**
+ * One step (pull from f, collide into g) on the rows r0 <= row < r1 (row = y + ny z) of the flow
+ * grid, with inlet speed uin and its equilibrium feqIn. Cells only read f, so rows can be split
+ * between threads. sim: LBMCPU.kernelState().
+ */
+export function stepRows(sim, f, g, uin, feqIn, writeMacro, r0, r1) {
+  const [nx, ny, nz] = sim.dims;
+  const { N, solid, off, tau0, smag, macro, links, runs, runStart, src } = sim;
+  for (let row = r0; row < r1; row++) {
+    const y = row % ny, z = (row / ny) | 0;
+    const edge = y === 0 || z === 0 || y === ny - 1 || z === nz - 1;
+    let r = runStart[row];
+    const rEnd = runStart[row + 1];
+    for (let x = 0; x < nx; x++) {
+      if (r < rEnd && x === runs[2 * r]) {
+        collideRun(f, g, macro, N, src, nx * row + x, nx * row + runs[2 * r + 1], tau0, smag, writeMacro);
+        x = runs[2 * r + 1] - 1;
+        r++;
+        continue;
+      }
+      const c = x + nx * row;
+      if (solid[c]) {
+        if (writeMacro) { macro[4 * c] = 1; macro[4 * c + 1] = 0; macro[4 * c + 2] = 0; macro[4 * c + 3] = 0; }
+        continue;
+      }
+      if (x === 0) {
+        for (let i = 0; i < 19; i++) g[i * N + c] = feqIn[i];
+        if (writeMacro) {
+          macro[4 * c] = 1; macro[4 * c + 1] = uin; macro[4 * c + 2] = 0; macro[4 * c + 3] = 0;
+        }
+        continue;
+      }
+      if (edge || x === nx - 1) {
+        // open boundary: velocity of the nearest interior cell (previous step), ambient pressure
+        const u0 = Math.min(x, nx - 2) + nx * (Math.min(Math.max(y, 1), ny - 2) + ny * Math.min(Math.max(z, 1), nz - 2));
+        let ux = uin, uy = 0, uz = 0;
+        if (!solid[u0]) {
+          let r = 0, px = 0, py = 0, pz = 0;
           for (let i = 0; i < 19; i++) {
-            const s = c - off[i];
-            let v;
-            if (!solid[s]) v = f[i * N + s];
-            else {
-              // population that left toward the wall (direction j) comes back as direction i
-              const j = OPP[i];
-              v = f[j * N + c];
-              const qb = links ? links[i * N + c] : 0;
-              if (qb) {
-                const q = (qb - 1) / 254;
-                if (q < 0.5) {
-                  const n2 = c + off[i];
-                  if (!solid[n2]) v = 2 * q * v + (1 - 2 * q) * f[j * N + n2];
-                } else {
-                  v = (0.5 / q) * v + (1 - 0.5 / q) * f[i * N + c];
-                }
-              }
+            const v = f[i * N + u0];
+            r += v; px += CX[i] * v; py += CY[i] * v; pz += CZ[i] * v;
+          }
+          ux = px / r; uy = py / r; uz = pz / r;
+        }
+        const usq = 1.5 * (ux * ux + uy * uy + uz * uz);
+        for (let i = 0; i < 19; i++) {
+          const cu = CX[i] * ux + CY[i] * uy + CZ[i] * uz;
+          g[i * N + c] = W[i] * (1 + 3 * cu + 4.5 * cu * cu - usq);
+        }
+        if (writeMacro) {
+          macro[4 * c] = 1; macro[4 * c + 1] = ux; macro[4 * c + 2] = uy; macro[4 * c + 3] = uz;
+        }
+        continue;
+      }
+      let rho = 0, mx = 0, my = 0, mz = 0;
+      for (let i = 0; i < 19; i++) {
+        const s = c - off[i];
+        let v;
+        if (!solid[s]) v = f[i * N + s];
+        else {
+          // population that left toward the wall (direction j) comes back as direction i
+          const j = OPP[i];
+          v = f[j * N + c];
+          const qb = links ? links[i * N + c] : 0;
+          if (qb) {
+            const q = (qb - 1) / 254;
+            if (q < 0.5) {
+              const n2 = c + off[i];
+              if (!solid[n2]) v = 2 * q * v + (1 - 2 * q) * f[j * N + n2];
+            } else {
+              v = (0.5 / q) * v + (1 - 0.5 / q) * f[i * N + c];
             }
-            fi[i] = v;
-            rho += v;
-            mx += CX[i] * v;
-            my += CY[i] * v;
-            mz += CZ[i] * v;
-          }
-          const ux = mx / rho, uy = my / rho, uz = mz / rho;
-          const usq = 1.5 * (ux * ux + uy * uy + uz * uz);
-          let pxx = 0, pyy = 0, pzz = 0, pxy = 0, pxz = 0, pyz = 0;
-          for (let i = 0; i < 19; i++) {
-            const cx = CX[i], cy = CY[i], cz = CZ[i];
-            const cu = cx * ux + cy * uy + cz * uz;
-            const e = W[i] * rho * (1 + 3 * cu + 4.5 * cu * cu - usq);
-            fe[i] = e;
-            const d = fi[i] - e;
-            pxx += cx * cx * d; pyy += cy * cy * d; pzz += cz * cz * d;
-            pxy += cx * cy * d; pxz += cx * cz * d; pyz += cy * cz * d;
-          }
-          const q = Math.sqrt(pxx * pxx + pyy * pyy + pzz * pzz + 2 * (pxy * pxy + pxz * pxz + pyz * pyz));
-          const tau = 0.5 * (tau0 + Math.sqrt(tau0 * tau0 + (smag * q) / rho));
-          const om = 1 / tau;
-          for (let i = 0; i < 19; i++) g[i * N + c] = fi[i] - om * (fi[i] - fe[i]);
-          if (writeMacro) {
-            macro[4 * c] = rho; macro[4 * c + 1] = ux; macro[4 * c + 2] = uy; macro[4 * c + 3] = uz;
           }
         }
+        fi[i] = v;
+        rho += v;
+        mx += CX[i] * v;
+        my += CY[i] * v;
+        mz += CZ[i] * v;
       }
-    }
-    this.f = g;
-    this.g = f;
-    this.steps++;
-    if (writeMacro) {
-      for (let c = 0; c < N; c++) if (solid[c]) { macro[4 * c] = 1; macro[4 * c + 1] = 0; macro[4 * c + 2] = 0; macro[4 * c + 3] = 0; }
+      const ux = mx / rho, uy = my / rho, uz = mz / rho;
+      const usq = 1.5 * (ux * ux + uy * uy + uz * uz);
+      let pxx = 0, pyy = 0, pzz = 0, pxy = 0, pxz = 0, pyz = 0;
+      for (let i = 0; i < 19; i++) {
+        const cx = CX[i], cy = CY[i], cz = CZ[i];
+        const cu = cx * ux + cy * uy + cz * uz;
+        const e = W[i] * rho * (1 + 3 * cu + 4.5 * cu * cu - usq);
+        fe[i] = e;
+        const d = fi[i] - e;
+        pxx += cx * cx * d; pyy += cy * cy * d; pzz += cz * cz * d;
+        pxy += cx * cy * d; pxz += cx * cz * d; pyz += cy * cz * d;
+      }
+      const q = Math.sqrt(pxx * pxx + pyy * pyy + pzz * pzz + 2 * (pxy * pxy + pxz * pxz + pyz * pyz));
+      const tau = 0.5 * (tau0 + Math.sqrt(tau0 * tau0 + (smag * q) / rho));
+      const om = 1 / tau;
+      for (let i = 0; i < 19; i++) g[i * N + c] = fi[i] - om * (fi[i] - fe[i]);
+      if (writeMacro) {
+        macro[4 * c] = rho; macro[4 * c + 1] = ux; macro[4 * c + 2] = uy; macro[4 * c + 3] = uz;
+      }
     }
   }
 }
