@@ -1,0 +1,36 @@
+# Writes Parts-Sim-<version>-SHA256SUMS.txt for every asset of a v* release (by their GitHub names,
+# which have dots for spaces) and attaches it. The desktop and native workflows run it after
+# uploading a tag's packages; run it by hand after attaching a package built elsewhere (the macOS
+# native app).
+name: Release checksums
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.6.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  checksums:
+    runs-on: ubuntu-latest
+    # one at a time per release, so the last run sees every workflow's uploads
+    concurrency:
+      group: release-checksums-${{ inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Checksums of the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          sums="Parts-Sim-${TAG#v}-SHA256SUMS.txt"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+          rm -f "assets/$sums"
+          (cd assets && sha256sum -- * > "../$sums")
+          cat "$sums"
+          gh release upload "$TAG" "$sums" --clobber --repo "$GITHUB_REPOSITORY"

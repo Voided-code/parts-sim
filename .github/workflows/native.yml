@@ -1,5 +1,6 @@
 # Native C++ app (native/): builds, tests and packages it for Windows and Linux.
-# Windows: a portable .zip and an installer (.exe). Linux: an AppImage.
+# Windows: a portable .zip and an installer (.exe). Linux: an AppImage. For v* tags the packages
+# go to the release, with the release's checksums (the macOS app is built and attached by hand).
 # OpenCascade 7.9 is built from source once per system and cached; Qt comes from the Qt
 # installer (aqtinstall), wgpu-native from its GitHub release.
 name: Native app
@@ -7,6 +8,7 @@ name: Native app
 on:
   push:
     branches: [main]
+    tags: ['v*'] # (path filters do not apply to tags)
     paths: ['native/**', 'build/icon.*', 'LICENSE', '.github/workflows/native.yml']
   pull_request:
     paths: ['native/**', '.github/workflows/native.yml']
@@ -17,6 +19,10 @@ on:
         type: choice
         options: [clang, system]
         default: clang
+
+# the release steps attach packages to the tag's release (the repository's default token is read-only)
+permissions:
+  contents: write
 
 env:
   QT_VERSION: '6.8.3'
@@ -41,7 +47,7 @@ jobs:
       OCCT_DIR: ${{ github.workspace }}/.native-deps/occt
       WGPU_NATIVE_DIR: ${{ github.workspace }}/.native-deps/wgpu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Linux build packages
         if: runner.os == 'Linux'
@@ -51,9 +57,22 @@ jobs:
             libxkbcommon-x11-0 libvulkan-dev libx11-dev libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
             libxcb-shape0 libxcb-xinerama0 libxcb-randr0 libxcb-render-util0 libxcb-image0 libfontconfig1 xvfb
 
+      # the x64 build tools' environment (what vcvars64.bat sets) for the steps after this one
       - name: MSVC environment
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio with the C++ tools is not installed.' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $before[$Matches[1]] -ne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed.' }
 
       - name: zlib (Windows)
         if: runner.os == 'Windows'
@@ -77,7 +96,7 @@ jobs:
 
       - name: Cache OpenCascade
         id: occt-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.OCCT_DIR }}
           key: occt-${{ matrix.name }}-${{ env.OCCT_TAG }}-minimal-v2
@@ -107,7 +126,7 @@ jobs:
       # Save immediately: a later app or packaging failure must not discard this costly build.
       - name: Save OpenCascade
         if: steps.occt-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.OCCT_DIR }}
           key: ${{ steps.occt-cache.outputs.cache-primary-key }}
@@ -203,15 +222,26 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run -a python3 native/tests/smoke_app.py dist/Parts-Sim-*.AppImage --isolated --screenshot package-smoke.png
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: parts-sim-native-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+
       - name: Upload packaged-app screenshot
         if: always() && hashFiles('package-smoke.png') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: parts-sim-native-${{ matrix.name }}-smoke
           path: package-smoke.png
+
+  checksums:
+    needs: build
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    uses: ./.github/workflows/release-checksums.yml
