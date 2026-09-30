@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Parts Sim benchmark</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #f4f6f9; --fg: #1b1f24; --muted: #5b6573; --accent: #2a78d6; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #111317; --fg: #e6e9ee; --muted: #9aa4b2; --accent: #5b9df0; } }
+      body { margin: 0; padding: 16px 24px; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      #state { color: var(--muted); margin: 0 0 12px; }
+      #bar { height: 6px; background: color-mix(in srgb, var(--muted) 25%, transparent); border-radius: 3px; overflow: hidden; margin-bottom: 12px; }
+      #bar > div { height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+      pre { margin: 0; white-space: pre-wrap; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+    </style>
+  </head>
+  <body>
+    <h1>Parts Sim benchmark</h1>
+    <p id="state">Starting…</p>
+    <div id="bar"><div></div></div>
+    <pre id="log"></pre>
+    <script type="module" src="/src/bench/bench.js"></script>
+  </body>
+</html>

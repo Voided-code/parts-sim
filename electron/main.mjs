@@ -5,7 +5,7 @@
 // what a browser cannot: native menus, open/save dialogs, opening files from Finder/Explorer
 // and the command line, and reading an assembly's part files from the folder it lives in.
 import { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, net, protocol, shell } from 'electron';
-import { readFile, readdir, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -49,9 +49,27 @@ let win = null;
 let rendererReady = false;
 const pendingPaths = [];
 
+// Benchmark mode (the Windows benchmark kit): --bench[=full|quick|speed] runs bench.html without
+// clicks and writes its JSON report to --bench-out (default: next to the executable). --bench-native
+// names a native-app report to include in it. --bench-cases limits the validation cases, and
+// --bench-solver picks the flow solver (v0.6 or v1).
+const argValue = (name) => process.argv.find((a) => a === `--${name}` || a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
+const benchSuite = argValue('bench');
+const bench = benchSuite === undefined ? null : {
+  suite: benchSuite || 'full',
+  cases: argValue('bench-cases') || '',
+  solver: argValue('bench-solver') || '',
+  out: path.resolve(argValue('bench-out') || path.join(path.dirname(process.execPath), 'parts-sim-bench-report.json')),
+  native: argValue('bench-native') ? path.resolve(argValue('bench-native')) : null,
+};
+
+// full-precision GPU timestamps and the adapter's memory heaps and backend in the report
+if (bench) app.commandLine.appendSwitch('enable-webgpu-developer-features');
+
 // Tests run with their own profile so they neither collide with nor open files in a running copy
 // (the single-instance lock is per profile).
 if (process.env.PARTS_SIM_USER_DATA) app.setPath('userData', process.env.PARTS_SIM_USER_DATA);
+else if (bench) app.setPath('userData', path.join(app.getPath('temp'), 'parts-sim-bench'));
 if (!app.requestSingleInstanceLock()) app.quit();
 
 app.on('second-instance', (_e, argv) => {
@@ -207,6 +225,7 @@ function createWindow() {
       sandbox: true,
       nodeIntegration: false,
       spellcheck: false,
+      ...(bench ? { additionalArguments: ['--parts-sim-bench'], backgroundThrottling: false } : {}),
     },
   });
   win.once('ready-to-show', () => win.show());
@@ -225,7 +244,27 @@ function createWindow() {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.loadURL(`${ORIGIN}/index.html`);
+  if (bench) {
+    const query = new URLSearchParams({ suite: bench.suite, ...(bench.cases ? { cases: bench.cases } : {}), ...(bench.solver ? { solver: bench.solver } : {}) });
+    win.loadURL(`${ORIGIN}/bench.html?${query}`);
+  } else win.loadURL(`${ORIGIN}/index.html`);
+}
+
+if (bench) {
+  // the report is written whole after every item, through a temporary file so it is never half-written
+  ipcMain.handle('bench-write', async (e, json) => {
+    if (e.sender !== win?.webContents || typeof json !== 'string') return false;
+    await writeFile(`${bench.out}.tmp`, json);
+    await rename(`${bench.out}.tmp`, bench.out);
+    return true;
+  });
+  ipcMain.handle('bench-native', async (e) => {
+    if (e.sender !== win?.webContents || !bench.native) return null;
+    return readFile(bench.native, 'utf8').catch(() => null);
+  });
+  ipcMain.on('bench-done', (e) => {
+    if (e.sender === win?.webContents) setTimeout(() => app.quit(), 500);
+  });
 }
 
 ipcMain.on('renderer-ready', (e) => {
@@ -292,9 +331,9 @@ app.whenReady().then(() => {
       return new Response(res.body, { status: res.status, headers });
     });
   });
-  buildMenu();
+  if (!bench) buildMenu();
   createWindow();
-  queueOpen(filesFromArgv(process.argv));
+  if (!bench) queueOpen(filesFromArgv(process.argv));
   app.on('activate', () => {
     if (!BrowserWindow.getAllWindows().length) createWindow();
   });

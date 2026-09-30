@@ -301,8 +301,10 @@ export class LBMGPU {
     const adapter = await hardwareAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('No WebGPU adapter');
     const half = o.half !== false && adapter.features.has('shader-f16');
+    // benchmarks: GPU time of each batch from timestamp queries (LBMGPU.timing turns it on for every solver)
+    const timing = !!(o.timing ?? LBMGPU.timing) && adapter.features.has('timestamp-query');
     const device = await adapter.requestDevice({
-      requiredFeatures: half ? ['shader-f16'] : [],
+      requiredFeatures: [...(half ? ['shader-f16'] : []), ...(timing ? ['timestamp-query'] : [])],
       requiredLimits: {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxBufferSize: adapter.limits.maxBufferSize,
@@ -311,7 +313,7 @@ export class LBMGPU {
     let sim;
     try {
       device.pushErrorScope('validation');
-      sim = new LBMGPU(device, o, half);
+      sim = new LBMGPU(device, o, half, timing);
       const info = await sim.module.getCompilationInfo();
       const errors = info.messages.filter((m) => m.type === 'error');
       const err = await device.popErrorScope();
@@ -326,9 +328,15 @@ export class LBMGPU {
     }
   }
 
-  constructor(device, o, half = false) {
+  constructor(device, o, half = false, timing = false) {
     this.device = device;
     this.half = half;
+    this.gpuSeconds = 0; // total GPU time of the timed batches (timing only)
+    if (timing) {
+      this.querySet = device.createQuerySet({ type: 'timestamp', count: 2 });
+      this.queryBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+      this.queryRead = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    }
     this.dims = o.dims;
     const [nx, ny, nz] = o.dims;
     const N = (this.N = nx * ny * nz);
@@ -428,17 +436,34 @@ export class LBMGPU {
     if (!Number.isInteger(count) || count < 1 || count > MAX_BATCH) throw new Error(`GPU batch must contain 1 to ${MAX_BATCH} steps.`);
     this.writeParams(count);
     const enc = this.device.createCommandEncoder();
+    const timed = !!this.querySet && !this.queryRead.mapState?.startsWith('p');
     for (let s = 0; s < count; s++) {
-      const pass = enc.beginComputePass();
+      const timestampWrites = timed && (s === 0 || s === count - 1)
+        ? { querySet: this.querySet, ...(s === 0 ? { beginningOfPassWriteIndex: 0 } : {}), ...(s === count - 1 ? { endOfPassWriteIndex: 1 } : {}) }
+        : undefined;
+      const pass = enc.beginComputePass(timestampWrites ? { timestampWrites } : undefined);
       pass.setPipeline(this.stepPipe);
       pass.setBindGroup(0, this.bindGroups[this.parity], [s * this.paramStride]);
       pass.dispatchWorkgroups(this.wgX, this.wgY);
       pass.end();
       this.parity ^= 1;
     }
+    if (timed) {
+      enc.resolveQuerySet(this.querySet, 0, 2, this.queryBuf, 0);
+      enc.copyBufferToBuffer(this.queryBuf, 0, this.queryRead, 0, 16);
+    }
     this.device.queue.submit([enc.finish()]);
     this.steps += count;
-    return this.device.queue.onSubmittedWorkDone();
+    const done = this.device.queue.onSubmittedWorkDone();
+    if (!timed) return done;
+    return done.then(async () => {
+      await this.queryRead.mapAsync(GPUMapMode.READ);
+      const t = new BigInt64Array(this.queryRead.getMappedRange());
+      const ns = Number(t[1] - t[0]);
+      this.queryRead.unmap();
+      if (ns > 0) this.gpuSeconds += ns / 1e9;
+      this.lastGpuSeconds = ns > 0 ? ns / 1e9 : NaN;
+    });
   }
 
   /** Copy of [rho, ux, uy, uz] per cell. */
@@ -453,7 +478,8 @@ export class LBMGPU {
   }
 
   destroy() {
-    for (const b of [...this.fBufs, this.solidBuf, this.flagBuf, this.macroBuf, this.linkBuf, this.readBuf, this.paramBuf]) b?.destroy();
+    for (const b of [...this.fBufs, this.solidBuf, this.flagBuf, this.macroBuf, this.linkBuf, this.readBuf, this.paramBuf, this.queryBuf, this.queryRead]) b?.destroy();
+    this.querySet?.destroy();
     this.device.destroy();
   }
 }

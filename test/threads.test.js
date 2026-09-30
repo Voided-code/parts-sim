@@ -108,3 +108,21 @@ test('threads need shared memory: none without cross-origin isolation', async ()
     globalThis.crossOriginIsolated = isolated;
   }
 });
+
+test('v1 flow solver: the same on helper threads (bulk, wall model, faces)', async (t) => {
+  const { buildTunnel } = await import('../src/cfd/flowcase.js');
+  const { caseById } = await import('../src/cfd/validation.js');
+  const { FlowCPU } = await import('../src/cfd/flow-cpu.js');
+  const { FlowThreads } = await import('../src/cfd/flow-threads.js');
+  const tun = buildTunnel(caseById('ahmed25'), { across: 40, legacy: false });
+  const params = { uLat: 0.08, nuLat: 1e-5 };
+  const one = new FlowCPU(tun.grid, params);
+  const many = new FlowCPU(tun.grid, params);
+  const threads = await FlowThreads.start(many, { minCells: 0, helpers: 2 });
+  assert.ok(threads, 'helper threads started');
+  t.after(() => threads.stop());
+  one.step(40);
+  many.step(40);
+  assert.deepEqual(many.macro(), one.macro());
+  assert.deepEqual(many.takeForces(), one.takeForces());
+});

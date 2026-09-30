@@ -20,3 +20,12 @@ contextBridge.exposeInMainWorld('partsSimDesktop', {
   /** Native save dialog for an exported STL (bytes). */
   saveFile: (data, name) => ipcRenderer.invoke('save-file', data, name),
 });
+
+// benchmark mode only (--bench): the page saves its report through the shell
+if (process.argv.includes('--parts-sim-bench')) {
+  contextBridge.exposeInMainWorld('partsSimBench', {
+    write: (json) => ipcRenderer.invoke('bench-write', json),
+    readNative: () => ipcRenderer.invoke('bench-native'),
+    done: () => ipcRenderer.send('bench-done'),
+  });
+}
