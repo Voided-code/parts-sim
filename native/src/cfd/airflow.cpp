@@ -367,8 +367,9 @@ void AirflowSim::loop() {
     std::deque<Pending> inFlight;
     auto lastDone = Clock::now();
     auto lastFields = lastDone - std::chrono::seconds(10), lastSurface = lastFields;
-    auto busyFrom = lastDone;
+    auto busyFrom = lastDone, rateFrom = lastDone;
     double gpuFrom = sim.gpuSeconds;
+    int64_t rateSteps = 0;
     try {
         while (running_) {
             flow::Forces f;
@@ -378,21 +379,29 @@ void AirflowSim::loop() {
                 const Pending p = inFlight.front();
                 inFlight.pop_front();
                 f = sim.collect(p.ticket);
-                // the time per completed batch (with the next one queued behind it)
+                // the time per completed batch (with the next one queued behind it; next to nothing
+                // when the GPU finished it while this thread read results). Batches at most double
+                // at a time: one that ran for seconds would have the OS reset the GPU.
                 const double dt = std::max(1e-4, seconds(lastDone));
                 lastDone = Clock::now();
-                mlups_ = N * p.steps / dt / 1e6;
-                batch = std::clamp(int(std::lround(p.steps * BATCH_SECONDS / dt)), 1, 256);
+                batch = std::clamp(int(std::lround(p.steps * BATCH_SECONDS / dt)), std::max(1, p.steps / 2), std::min(256, 2 * p.steps));
+                rateSteps += p.steps;
             } else {
                 const auto t0 = Clock::now();
                 sim.step(batch);
                 f = sim.takeForces();
                 const double dt = std::max(1e-4, seconds(t0));
-                mlups_ = N * batch / dt / 1e6;
+                rateSteps += batch;
                 batch = std::clamp(int(std::lround(batch * BATCH_SECONDS / dt)), 1, 1000);
             }
             int64_t at = sim.steps;
             for (const auto& p : inFlight) at -= p.steps;
+            // speed over the last half second or so (a single batch's time says little)
+            if (seconds(rateFrom) > 0.5) {
+                mlups_ = N * double(rateSteps) / seconds(rateFrom) / 1e6;
+                rateSteps = 0;
+                rateFrom = Clock::now();
+            }
             if (sim.timed && seconds(busyFrom) > 1) {
                 gpuBusy_ = (sim.gpuSeconds - gpuFrom) / seconds(busyFrom);
                 gpuFrom = sim.gpuSeconds;

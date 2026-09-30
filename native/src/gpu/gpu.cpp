@@ -122,13 +122,24 @@ void GpuContext::wait() {
 void gpuWaitFor(GpuContext& ctx, const bool& done) {
     // A blocking poll sleeps in 1 ms steps on some backends (Metal), which dominates short GPU
     // jobs such as one solver iteration: spin on non-blocking polls for the first few
-    // milliseconds, then block for long jobs.
+    // milliseconds, then block for long jobs. On Metal a blocking poll can also oversleep by
+    // seconds with work queued behind the awaited submission (the flow solver keeps two batches in
+    // flight), so there it keeps polling with short naps.
     const auto t0 = std::chrono::steady_clock::now();
     while (!done) {
         const bool spin = std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(4);
+#ifdef __APPLE__
+        wgpuDevicePoll(ctx.device, false, nullptr);
+        wgpuInstanceProcessEvents(ctx.instance);
+        if (!done) {
+            if (spin) std::this_thread::yield();
+            else std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+#else
         wgpuDevicePoll(ctx.device, !spin, nullptr);
         wgpuInstanceProcessEvents(ctx.instance);
         if (spin && !done) std::this_thread::yield();
+#endif
     }
 }
 

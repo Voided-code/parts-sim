@@ -402,8 +402,10 @@ export class AirflowStudy {
         const now = performance.now(), dt = Math.max(1, now - lastDone);
         lastDone = now;
         this.mlups = (this.N * n) / (dt * 1000);
-        // the next batches: about SUBMIT_MS each (dt is the time per completed batch, with two queued)
-        batch = Math.max(1, Math.min(256, Math.round((n * SUBMIT_MS) / dt)));
+        // the next batches: about SUBMIT_MS each (dt is the time per completed batch, with two queued;
+        // next to nothing when the GPU finished it while the page was busy). They at most double at a
+        // time: one that ran for seconds would have the OS reset the GPU.
+        batch = Math.max(Math.max(1, n >> 1), Math.min(256, 2 * n, Math.round((n * SUBMIT_MS) / dt)));
         this.onForces(f, sim.steps - inFlight.reduce((a, b) => a + b.n, 0));
         if (now - lastFields > FIELDS_EVERY && !this.readingFields) {
           lastFields = now;

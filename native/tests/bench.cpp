@@ -373,7 +373,7 @@ static FlowTiming timedFlow(flow::Solver& sim, double seconds) {
         r.steps += n;
         const double dt = std::max(1e-4, since(last));
         last = Clock::now();
-        batch = std::clamp(int(std::lround(n * 0.040 / dt)), 1, 256);
+        batch = std::clamp(int(std::lround(n * 0.040 / dt)), std::max(1, n / 2), std::min(256, 2 * n));
     }
     for (const auto& [ticket, n] : inFlight) { sim.collect(ticket); r.steps += n; }
     r.seconds = since(t0);
@@ -415,7 +415,8 @@ static std::string kitReportV1(std::string& log) {
                 const double cells = double(g.N), mlups = cells * t.steps / t.seconds / 1e6, bytes = gpuShaderF16() ? bytes16 : bytes32;
                 r.num("cells", cells).raw("dims", "[" + std::to_string(g.dims[0]) + "," + std::to_string(g.dims[1]) + "," + std::to_string(g.dims[2]) + "]");
                 r.num("steps", double(t.steps)).num("seconds", t.seconds).num("mlups", mlups).num("bytesPerCellStep", bytes).num("gbs", mlups * bytes / 1e3);
-                r.num("gpuBusy", t.busy).num("kernelMlups", t.busy > 0 ? mlups / t.busy : NAN);
+                // Metal's pass timestamps are sometimes far off (a busy share of a few %): flagged
+                r.num("gpuBusy", t.busy).num("kernelMlups", t.busy > 0 ? mlups / t.busy : NAN).num("timestampSuspect", !(t.busy > 0.2 && t.busy < 1.05));
                 say("ladder %.0fM: %.0f MLUPS (%.0f GB/s), GPU busy %.0f%%\n", cells / 1e6, mlups, mlups * bytes / 1e3, 100 * t.busy);
             } catch (const std::exception& e) {
                 r.num("cells", n).str("error", e.what());
