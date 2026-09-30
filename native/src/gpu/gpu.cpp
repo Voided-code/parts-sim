@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -22,7 +24,18 @@ std::string str(WGPUStringView v) { return v.data ? std::string(v.data, v.length
 
 GpuContext* create() {
     auto* ctx = new GpuContext();
-    ctx->instance = wgpuCreateInstance(nullptr);
+    // PARTS_SIM_GPU_BACKEND=vulkan | dx12 | metal picks the backend (to compare them); by default
+    // wgpu chooses (Vulkan first on Windows and Linux)
+    WGPUInstanceExtras extras = {};
+    extras.chain.sType = static_cast<WGPUSType>(WGPUSType_InstanceExtras);
+    WGPUInstanceDescriptor idesc = WGPU_INSTANCE_DESCRIPTOR_INIT;
+    if (const char* env = std::getenv("PARTS_SIM_GPU_BACKEND"); env && *env) {
+        std::string b(env);
+        for (auto& ch : b) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        extras.backends = b == "vulkan" ? WGPUInstanceBackend_Vulkan : b == "dx12" || b == "d3d12" ? WGPUInstanceBackend_DX12 : b == "metal" ? WGPUInstanceBackend_Metal : 0;
+        idesc.nextInChain = &extras.chain;
+    }
+    ctx->instance = wgpuCreateInstance(idesc.nextInChain ? &idesc : nullptr);
     if (!ctx->instance) { ctx->error = "no WebGPU instance"; return ctx; }
     WGPURequestAdapterOptions opts = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
     opts.powerPreference = WGPUPowerPreference_HighPerformance;

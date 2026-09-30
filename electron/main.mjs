@@ -51,7 +51,7 @@ const pendingPaths = [];
 
 // Benchmark mode (the Windows benchmark kit): --bench[=full|quick|speed] runs bench.html without
 // clicks and writes its JSON report to --bench-out (default: next to the executable). --bench-native
-// names a native-app report to include in it. --bench-cases limits the validation cases, and
+// names a folder whose native-app reports (native*.json) are included in it. --bench-cases limits the validation cases, and
 // --bench-solver picks the flow solver (v0.6 or v1).
 const argValue = (name) => process.argv.find((a) => a === `--${name}` || a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
 const benchSuite = argValue('bench');
@@ -258,9 +258,15 @@ if (bench) {
     await rename(`${bench.out}.tmp`, bench.out);
     return true;
   });
+  // the native app's reports (native*.json) in the --bench-native folder, as one JSON array
   ipcMain.handle('bench-native', async (e) => {
     if (e.sender !== win?.webContents || !bench.native) return null;
-    return readFile(bench.native, 'utf8').catch(() => null);
+    const names = (await readdir(bench.native).catch(() => [])).filter((f) => /^native.*\.json$/i.test(f)).sort();
+    const reports = [];
+    for (const f of names) {
+      try { reports.push(JSON.parse(await readFile(path.join(bench.native, f), 'utf8'))); } catch { /* an unfinished report */ }
+    }
+    return reports.length ? JSON.stringify(reports) : null;
   });
   ipcMain.on('bench-done', (e) => {
     if (e.sender === win?.webContents) setTimeout(() => app.quit(), 500);

@@ -134,6 +134,7 @@ ps_test(test_lbm)
 # performance benchmark (run by hand: build/bench [filter])
 add_executable(bench tests/bench.cpp)
 target_link_libraries(bench PRIVATE partssim_core)
+target_compile_definitions(bench PRIVATE PARTS_SIM_VERSION="${PROJECT_VERSION}")
 
 # ---------------------------------------------------------------------------------------------
 # Desktop app (Qt Widgets, 3D viewport through Qt RHI: Metal / Direct3D / Vulkan / OpenGL)

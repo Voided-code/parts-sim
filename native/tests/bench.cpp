@@ -239,7 +239,121 @@ static void voxelizeCase(const char* name, int res) {
     std::printf("%-22s %7.2f M cells  voxelize %6.0f ms   wall links %6.0f ms (%d links)\n", name, frac.size() / 1e6, 1e3 * tv, 1e3 * tl, links);
 }
 
+// ---------- the Windows benchmark kit's native part (bench --json report.json kit) ----------
+
+// a flat JSON writer: enough for the kit's report
+struct Json {
+    std::string s;
+    bool first = true;
+    void key(const char* k) { s += first ? "" : ","; first = false; s += "\""; s += k; s += "\":"; }
+    Json& num(const char* k, double v) {
+        key(k);
+        char b[64];
+        std::snprintf(b, sizeof b, std::isfinite(v) ? "%.6g" : "null", v);
+        s += b;
+        return *this;
+    }
+    Json& str(const char* k, const std::string& v) {
+        key(k);
+        s += "\"";
+        for (char c : v) {
+            if (c == '"' || c == '\\') s += '\\';
+            if (c == '\n') { s += "\\n"; continue; }
+            s += c;
+        }
+        s += "\"";
+        return *this;
+    }
+    Json& raw(const char* k, const std::string& v) { key(k); s += v; return *this; }
+    std::string obj() const { return "{" + s + "}"; }
+};
+
+// steps of a GPU flow solver for about `seconds`, in submissions of ~40 ms (the OS resets or stops a
+// GPU that runs one submission for seconds); returns [steps, seconds]
+static std::pair<int64_t, double> timedSteps(LbmSolver& sim, double seconds) {
+    int batch = std::max(1, std::min(400, int(2e7 / double(sim.cells))));
+    sim.step(std::min(batch, 20));  // warm up
+    int64_t steps = 0;
+    const auto t0 = Clock::now();
+    while (since(t0) < seconds) {
+        const auto tb = Clock::now();
+        sim.step(batch);
+        steps += batch;
+        batch = std::max(1, std::min(400, int(std::lround(batch * 0.040 / std::max(1e-4, since(tb))))));
+    }
+    return {steps, since(t0)};
+}
+
+static std::string kitReport(std::string& log) {
+    Json j;
+    j.str("format", "parts-sim-native-bench/1");
+#ifdef PARTS_SIM_VERSION
+    j.str("version", PARTS_SIM_VERSION);
+#endif
+    j.str("solver", "v0.6");
+    j.str("gpu", gpuAvailable() ? gpuName() : "none");
+    j.str("backendRequest", std::getenv("PARTS_SIM_GPU_BACKEND") ? std::getenv("PARTS_SIM_GPU_BACKEND") : "default");
+    j.num("threads", ThreadPool::instance().size());
+    j.num("shaderF16", gpuShaderF16() ? 1 : 0);
+    std::string ladder = "[";
+    if (gpuAvailable()) {
+        // v0.6's GPU memory per cell: two population arrays, moments, flags, solid, links, read-back
+        const double cap = std::min(0.95 * double(lbmGpuMaxCells()), 64e6);
+        const double bytes = 38.0 * (gpuShaderF16() ? 2 : 4) + 4;
+        for (double n = 1e6; n <= cap; n *= 2) {
+            const int ny = std::max(16, int(std::lround(std::cbrt(n / 2.5)))), nz = ny, nx = std::max(16, int(std::lround(n / (double(ny) * nz))));
+            Json r;
+            try {
+                auto s = tunnel(nx, ny, nz);
+                auto sim = makeLbmGpu(s);
+                const auto [steps, secs] = timedSteps(*sim, 4);
+                const double cells = double(nx) * ny * nz, mlups = cells * steps / secs / 1e6;
+                r.num("cells", cells).raw("dims", "[" + std::to_string(nx) + "," + std::to_string(ny) + "," + std::to_string(nz) + "]");
+                r.num("steps", double(steps)).num("seconds", secs).num("mlups", mlups).num("bytesPerCellStep", bytes).num("gbs", mlups * bytes / 1e3);
+                char b[160];
+                std::snprintf(b, sizeof b, "ladder %.0fM: %.0f MLUPS (%.0f GB/s)\n", cells / 1e6, mlups, mlups * bytes / 1e3);
+                log += b;
+                std::fputs(b, stdout);
+            } catch (const std::exception& e) {
+                r.num("cells", n).str("error", e.what());
+                ladder += (ladder.size() > 1 ? "," : "") + r.obj();
+                break;
+            }
+            ladder += (ladder.size() > 1 ? "," : "") + r.obj();
+        }
+    }
+    j.raw("ladder", ladder + "]");
+    // CPU flow solver on all cores
+    {
+        auto s = tunnel(200, 72, 72);
+        LbmCpu sim(s);
+        sim.step(5);
+        const auto t0 = Clock::now();
+        sim.step(60);
+        const double secs = since(t0), mlups = 200.0 * 72 * 72 * 60 / secs / 1e6;
+        j.raw("cpu", Json().num("cells", 200.0 * 72 * 72).num("mlups", mlups).obj());
+        char b[96];
+        std::snprintf(b, sizeof b, "cpu 1M: %.0f MLUPS\n", mlups);
+        log += b;
+        std::fputs(b, stdout);
+    }
+    return j.obj();
+}
+
 int main(int argc, char** argv) {
+    // bench --json <file> kit: the benchmark kit's report
+    if (argc > 3 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "kit") {
+        std::string log;
+        const std::string json = kitReport(log);
+        if (FILE* f = std::fopen(argv[2], "wb")) {
+            std::fwrite(json.data(), 1, json.size(), f);
+            std::fclose(f);
+        } else {
+            std::fprintf(stderr, "Could not write %s\n", argv[2]);
+            return 1;
+        }
+        return 0;
+    }
     const std::string only = argc > 1 ? argv[1] : "";
     auto want = [&](const char* n) { return only.empty() || std::string(n).find(only) != std::string::npos; };
     std::printf("%u threads, GPU: %s\n", ThreadPool::instance().size(), gpuAvailable() ? gpuName().c_str() : "none");

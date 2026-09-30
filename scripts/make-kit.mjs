@@ -3,7 +3,7 @@
 //   node scripts/make-kit.mjs [--native <folder with bench.exe and the native app>] [--skip-build]
 // Output: release/kit/parts-sim-kit-<version>-<commit>.zip
 import { execFileSync, execSync } from 'node:child_process';
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
@@ -26,7 +26,22 @@ if (!args.includes('--skip-build')) {
 await rm(out, { recursive: true, force: true });
 await mkdir(out, { recursive: true });
 await cp(path.join(root, 'release', 'win-unpacked'), path.join(out, 'electron'), { recursive: true });
-if (nativeDir) await cp(nativeDir, path.join(out, 'native'), { recursive: true });
+if (nativeDir) {
+  // CI's artifacts: the portable package (Parts-Sim-*.zip) and bench.exe; bench.exe goes next to the
+  // app's DLLs
+  const files = await readdir(nativeDir, { recursive: true });
+  const zipFile = files.find((f) => /Parts-Sim-.*\.zip$/i.test(f));
+  const benchFile = files.find((f) => /(^|[\\/])bench\.exe$/i.test(f));
+  if (!zipFile || !benchFile) throw new Error(`${nativeDir} needs the native package (.zip) and bench.exe`);
+  const tmp = path.join(root, 'release', 'kit', 'native-unzip');
+  await rm(tmp, { recursive: true, force: true });
+  execFileSync('ditto', ['-x', '-k', path.join(nativeDir, zipFile), tmp]);
+  const exe = (await readdir(tmp, { recursive: true })).find((f) => /(^|[\\/])Parts Sim\.exe$/.test(f));
+  if (!exe) throw new Error('The native package has no Parts Sim.exe');
+  await cp(path.join(tmp, path.dirname(exe)), path.join(out, 'native'), { recursive: true });
+  await cp(path.join(nativeDir, benchFile), path.join(out, 'native', 'bench.exe'));
+  await rm(tmp, { recursive: true, force: true });
+}
 
 const cmd = String.raw`@echo off
 rem Parts Sim benchmark kit ${version} (${commit}). Runs for about 20 minutes without clicks.
@@ -40,13 +55,17 @@ echo Leave the PC alone until it says Done (about 20 minutes). Closing the windo
 echo.
 powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate,VideoProcessor | ConvertTo-Json | Out-File -Encoding utf8 '%OUT%\gpu.json'; Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json | Out-File -Encoding utf8 '%OUT%\cpu.json'; Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize | ConvertTo-Json | Out-File -Encoding utf8 '%OUT%\os.json'"
 if exist "native\bench.exe" (
-  echo [1/4] Native app benchmark (Vulkan and Direct3D 12^)...
-  "native\bench.exe" --json "%OUT%\native.json" kit > "%OUT%\native.log" 2>&1
+  echo [1/4] Native app benchmark: Vulkan, then Direct3D 12...
+  set PARTS_SIM_GPU_BACKEND=vulkan
+  "native\bench.exe" --json "%OUT%\native-vulkan.json" kit > "%OUT%\native-vulkan.log" 2>&1
+  set PARTS_SIM_GPU_BACKEND=dx12
+  "native\bench.exe" --json "%OUT%\native-dx12.json" kit > "%OUT%\native-dx12.log" 2>&1
+  set PARTS_SIM_GPU_BACKEND=
 ) else (
   echo [1/4] No native build in this kit: skipped.
 )
 echo [2/4] Desktop app: the current solver's benchmark and validation (WebGPU)...
-"electron\Parts Sim.exe" --bench=full --bench-out="%OUT%\report.json" --bench-native="%OUT%\native.json"
+"electron\Parts Sim.exe" --bench=full --bench-out="%OUT%\report.json" --bench-native="%OUT%"
 echo [3/4] Desktop app: the new flow engine's checks and speed...
 "electron\Parts Sim.exe" --bench=engine --bench-solver=v1 --bench-out="%OUT%\report-engine.json"
 echo [4/4] Desktop app speed with Chromium's Vulkan switches (to see which backend it picks)...
