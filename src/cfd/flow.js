@@ -296,41 +296,63 @@ function wallModelData(plan, tris, rec, kind, { lo, hi, periodicZ }) {
     if (i >= 0 && !(rec.groundMask[r] && rec.dist[r] === 0.5)) at[i] = r;
   }
   const { origin, h } = plan, P = plan.q;
-  const v = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  for (let t = 0; t < tris.length; t += 3) {
-    for (let k = 0; k < 3; k++) for (let a = 0; a < 3; a++) v[k][a] = (P[3 * tris[t + k] + a] - origin[a]) / h;
-    const e1 = [v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]], e2 = [v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]];
-    // area vector (outward: the part's triangles face out)
-    const A = [(e1[1] * e2[2] - e1[2] * e2[1]) / 2, (e1[2] * e2[0] - e1[0] * e2[2]) / 2, (e1[0] * e2[1] - e1[1] * e2[0]) / 2];
-    const len = Math.hypot(A[0], A[1], A[2]);
-    if (!(len > 0)) continue;
-    // the triangle's area is shared among the records along it: points on a grid of about half a
-    // cell over the triangle, each to the nearest record just outside it (a large CAD face would
-    // otherwise hang on one record); with a periodic span only the points inside it count
-    const m1 = Math.min(4096, Math.max(1, Math.ceil(Math.hypot(...e1) / 0.5))), m2 = Math.min(4096, Math.max(1, Math.ceil(Math.hypot(...e2) / 0.5)));
-    let inside = 0;
-    for (let i = 0; i < m1; i++) for (let j = 0; j < m2; j++) if ((i + 0.5) / m1 + (j + 0.5) / m2 < 1) inside++;
-    const w = inside ? 1 / inside : 1;
-    const assign = (a, b) => {
-      const s0 = v[0][2] + a * e1[2] + b * e2[2];
-      if (periodicZ && (s0 < 0 || s0 >= nz)) return;
-      const p = [v[0][0] + a * e1[0] + b * e2[0] + (0.6 * A[0]) / len, v[0][1] + a * e1[1] + b * e2[1] + (0.6 * A[1]) / len, s0 + (0.6 * A[2]) / len];
-      const cx = Math.floor(p[0]), cy = Math.floor(p[1]), czz = Math.floor(p[2]);
-      let bestR = -1, bestD = Infinity;
-      for (let dz = -1; dz <= 1; dz++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const zz = periodicZ ? (((czz + dz) % nz) + nz) % nz : czz + dz;
+  // the nearest record to a point just outside the surface (within two cells), or -1
+  const nearest = (p) => {
+    const cx = Math.floor(p[0]), cy = Math.floor(p[1]), cz = Math.floor(p[2]);
+    let best = -1, bestD = Infinity;
+    for (let reach = 1; reach <= 2 && best < 0; reach++) {
+      for (let dz = -reach; dz <= reach; dz++) {
+        for (let dy = -reach; dy <= reach; dy++) {
+          for (let dx = -reach; dx <= reach; dx++) {
+            const zz = periodicZ ? (((cz + dz) % nz) + nz) % nz : cz + dz;
             const i = boxIndex(cx + dx, cy + dy, zz);
             if (i < 0 || at[i] < 0) continue;
-            const d = (cx + dx + 0.5 - p[0]) ** 2 + (cy + dy + 0.5 - p[1]) ** 2 + (czz + dz + 0.5 - p[2]) ** 2;
-            if (d < bestD) { bestD = d; bestR = at[i]; }
+            const d = (cx + dx + 0.5 - p[0]) ** 2 + (cy + dy + 0.5 - p[1]) ** 2 + (cz + dz + 0.5 - p[2]) ** 2;
+            if (d < bestD) { bestD = d; best = at[i]; }
           }
         }
       }
-      if (bestR >= 0) for (let k = 0; k < 3; k++) rec.area[3 * bestR + k] += A[k] * w;
-    };
-    if (!inside) assign(1 / 3, 1 / 3);
-    else for (let i = 0; i < m1; i++) for (let j = 0; j < m2; j++) { const a = (i + 0.5) / m1, b = (j + 0.5) / m2; if (a + b < 1) assign(a, b); }
+    }
+    return best;
+  };
+  // a triangle's area shared among the records along it: points on a grid of about half a cell over
+  // it, each to the nearest record just outside it (a large CAD face would otherwise hang on one)
+  const share = (v0, v1, v2) => {
+    const e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]], e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    // area vector (outward: the part's triangles face out)
+    const A = [(e1[1] * e2[2] - e1[2] * e2[1]) / 2, (e1[2] * e2[0] - e1[0] * e2[2]) / 2, (e1[0] * e2[1] - e1[1] * e2[0]) / 2];
+    const len = Math.hypot(A[0], A[1], A[2]);
+    if (!(len > 1e-12)) return;
+    const m1 = Math.min(4096, Math.max(1, Math.ceil(Math.hypot(...e1) / 0.5))), m2 = Math.min(4096, Math.max(1, Math.ceil(Math.hypot(...e2) / 0.5)));
+    const pts = [];
+    for (let i = 0; i < m1; i++) for (let j = 0; j < m2; j++) if ((i + 0.5) / m1 + (j + 0.5) / m2 < 1) pts.push([(i + 0.5) / m1, (j + 0.5) / m2]);
+    if (!pts.length) pts.push([1 / 3, 1 / 3]);
+    const owners = [];
+    for (const [a, b] of pts) {
+      const r = nearest([0, 1, 2].map((k) => v0[k] + a * e1[k] + b * e2[k] + (0.6 * A[k]) / len));
+      if (r >= 0) owners.push(r);
+    }
+    // the points without a record nearby give their share to the others
+    for (const r of owners) for (let k = 0; k < 3; k++) rec.area[3 * r + k] += A[k] / owners.length;
+  };
+  // with a periodic span, only the part of each triangle inside it (clipped exactly, so the surface
+  // still closes)
+  const clip = (poly, z, side) => {
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      const da = side * (a[2] - z), db = side * (b[2] - z);
+      if (da >= 0) out.push(a);
+      if ((da >= 0) !== (db >= 0)) {
+        const t = da / (da - db);
+        out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), z]);
+      }
+    }
+    return out;
+  };
+  for (let t = 0; t < tris.length; t += 3) {
+    let poly = [0, 1, 2].map((k) => [0, 1, 2].map((a) => (P[3 * tris[t + k] + a] - origin[a]) / h));
+    if (periodicZ) poly = clip(clip(poly, 0, 1), nz, -1);
+    for (let i = 1; i + 1 < poly.length; i++) share(poly[0], poly[i], poly[i + 1]);
   }
 }
