@@ -109,6 +109,8 @@ public:
         bb_.resize(19 * size_t(n));
         acc_.resize(4 * size_t(n));
         rhoSum_.resize(size_t(n));
+        forceSum_.resize(3 * size_t(n));
+        utauSum_.resize(size_t(n));
         // neighbour offsets per layer: z = 0, inside, z = nz - 1 (the span wraps when periodic)
         for (int l = 0; l < 3; l++) {
             const int z = l == 0 ? 0 : l == 1 ? std::min(1, nz_ - 1) : nz_ - 1;
@@ -158,6 +160,8 @@ public:
             for (int k = 0; k < 19; k++) { aux_[19 * r + k] = float(W[k]); bb_[19 * r + k] = float(W[k]); }
         std::fill(acc_.begin(), acc_.end(), 0.0);
         std::fill(rhoSum_.begin(), rhoSum_.end(), 0.0);
+        std::fill(forceSum_.begin(), forceSum_.end(), 0.0);
+        std::fill(utauSum_.begin(), utauSum_.end(), 0.0);
         steps = 0;
         accSteps_ = rhoSteps_ = 0;
         avg_.clear();
@@ -188,6 +192,7 @@ public:
             out.friction[0] += fx - fn * nx; out.friction[1] += fy - fn * ny; out.friction[2] += fz - fn * nz;
             const double drho = acc_[4 * r + 3];
             rhoSum_[r] += drho;
+            forceSum_[3 * r] += fx; forceSum_[3 * r + 1] += fy; forceSum_[3 * r + 2] += fz;
             const uint32_t m = rec_.mask[r] & ~rec_.groundMask[r];
             for (int k = 1; k <= 6; k++) {
                 if (!(m & (1u << k))) continue;
@@ -203,6 +208,8 @@ public:
 
     void resetAverages() override {
         std::fill(rhoSum_.begin(), rhoSum_.end(), 0.0);
+        std::fill(forceSum_.begin(), forceSum_.end(), 0.0);
+        std::fill(utauSum_.begin(), utauSum_.end(), 0.0);
         rhoSteps_ = 0;
         avg_.clear();
         samples_ = 0;
@@ -212,6 +219,16 @@ public:
         std::vector<float> out(size_t(rec_.count), 0.0f);
         if (rhoSteps_)
             for (int64_t r = 0; r < rec_.count; r++) out[r] = float(rhoSum_[r] / double(rhoSteps_));
+        return out;
+    }
+
+    std::vector<double> recordForces() override {
+        std::vector<double> out(4 * size_t(rec_.count), 0.0);
+        if (!rhoSteps_) return out;
+        for (int64_t r = 0; r < rec_.count; r++) {
+            for (int a = 0; a < 3; a++) out[4 * r + a] = forceSum_[3 * r + a] / double(rhoSteps_);
+            out[4 * r + 3] = utauSum_[r] / double(rhoSteps_);
+        }
         return out;
     }
 
@@ -390,6 +407,7 @@ private:
         acc_[4 * r + 1] += -p * ay + tw * ey;
         acc_[4 * r + 2] += -p * az + tw * ez;
         acc_[4 * r + 3] += rho2 - 1;
+        utauSum_[r] += utau;
         return true;
     }
 
@@ -464,7 +482,7 @@ private:
     double uLat_ = 0.08, nu0_ = 1e-5, tau0_ = 0.5, smag_ = 0, uin_ = 0, uBelt_ = 0;
     int odd_ = 0;
     std::vector<float> F_, aux_, bb_;
-    std::vector<double> acc_, rhoSum_, avg_;
+    std::vector<double> acc_, rhoSum_, avg_, forceSum_, utauSum_;
     int64_t off_[3][19];
     std::vector<std::pair<int, int>> runs_;
     std::vector<int64_t> runStart_;

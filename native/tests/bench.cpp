@@ -4,6 +4,10 @@
 //   bench --json <file> cases <folder> [ids] [engine=cpu] [scale=1] [margins=1] [wall=on|off] [maxft=10]
 //       the airflow validation cases exported by scripts/export-cases.mjs, run to converged forces
 //   bench --json <file> app <folder> [cells...]   the app's airflow study on the Ahmed body (speed, GPU busy)
+//   case diagnostics (environment): BENCH_TRACE=1 prints the forces of every sample; BENCH_DUMP=<file> writes the
+//   averaged view fields (BENCH_DUMP_INST=1: the last instantaneous ones) as int32 dims[3], factor, then
+//   float32 [rho - 1, ux, uy, uz] per coarse cell; BENCH_RECORDS=<file> (engine=cpu) writes every wall
+//   record's mean force, friction velocity and density as CSV
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -549,7 +553,7 @@ static std::string runFlowCase(const json::Value& c, const std::string& dir, con
         const auto f = sim->takeForces();
         if (sim->steps < dev && std::getenv("BENCH_TRACE")) std::printf("    step %lld: Cd %.4f Cl %.4f\n", (long long)sim->steps, f.me[0] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC, f.me[1] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC);
         if (sim->steps < dev) continue;
-        if (dump && sx.empty()) sim->resetAverages();
+        if ((dump || std::getenv("BENCH_RECORDS")) && sx.empty()) sim->resetAverages();
         if (std::getenv("BENCH_TRACE")) std::printf("    step %lld: Cd %.4f Cl %.4f\n", (long long)sim->steps, f.me[0] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC, f.me[1] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC);
         const double k = 1 / (0.5 * AIR_U_LAT * AIR_U_LAT * double(f.steps));
         if (!std::isfinite(f.me[0] + f.me[1] + f.me[2])) { failed = true; break; }
@@ -570,6 +574,27 @@ static std::string runFlowCase(const json::Value& c, const std::string& dir, con
         }
     }
     const double secs = since(tRun);
+    // BENCH_RECORDS=<file> (engine=cpu): per wall record, its cell, normal, wall distance, surface area,
+    // mean force per step and friction velocity (lattice units) and mean density - 1, as CSV
+    if (const char* rf = std::getenv("BENCH_RECORDS")) {
+        const auto forces = sim->recordForces();
+        const auto rho = sim->surfaceRho();
+        if (FILE* f = std::fopen(rf, "wb")) {
+            std::fprintf(f, "# dims %d %d %d, h %.9g mm, origin %.9g %.9g %.9g mm, uLat %g, nuLat %.9g, steps averaged %zu\n", dims[0], dims[1], dims[2], plan.h,
+                         plan.origin[0], plan.origin[1], plan.origin[2], AIR_U_LAT, p.nuLat, sx.size());
+            std::fprintf(f, "r,x,y,z,nx,ny,nz,dist,samp,onBelt,partLinks,ax,ay,az,fx,fy,fz,utau,rho1\n");
+            const auto& R = grid.rec;
+            for (int64_t r = 0; r < R.count; r++) {
+                const int64_t c = R.cell[r];
+                const int x = int(c % dims[0]), y = int((c / dims[0]) % dims[1]), z = int(c / (int64_t(dims[0]) * dims[1]));
+                const double* fr = forces.empty() ? nullptr : &forces[4 * r];
+                std::fprintf(f, "%lld,%d,%d,%d,%.5f,%.5f,%.5f,%.4f,%d,%d,%d,%.6g,%.6g,%.6g,%.8g,%.8g,%.8g,%.8g,%.8g\n", (long long)r, x, y, z, R.normal[3 * r], R.normal[3 * r + 1],
+                             R.normal[3 * r + 2], R.dist[r], int(R.samp[r]), int(R.onBelt[r]), int(__builtin_popcount(R.mask[r] & ~R.groundMask[r])), R.area[3 * r], R.area[3 * r + 1], R.area[3 * r + 2],
+                             fr ? fr[0] : NAN, fr ? fr[1] : NAN, fr ? fr[2] : NAN, fr ? fr[3] : NAN, r < int64_t(rho.size()) ? rho[r] : NAN);
+            }
+            std::fclose(f);
+        }
+    }
     if (dump) {
         const auto fl = sim->fields();
         if (FILE* f = std::fopen(dump, "wb")) {

@@ -108,6 +108,12 @@ public:
     /** The view fields now (instantaneous and averaged). */
     virtual Fields fields() = 0;
     /**
+     * Diagnostics (the CPU solver; empty elsewhere): per wall record since the last resetAverages,
+     * the mean force on the part per step [fx, fy, fz] and the wall model's mean friction velocity
+     * (0 where it is off), 4 values per record, lattice units.
+     */
+    virtual std::vector<double> recordForces() { return {}; }
+    /**
      * Pipelined stepping (the GPU keeps running while the caller reads results): queue `count` steps
      * with their forces summed; returns a ticket for collect(). The CPU solver runs them at once.
      */
