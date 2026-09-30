@@ -40,6 +40,8 @@ struct GpuContext {
     WGPULimits limits{};
     std::string name, error;
     bool shaderF16 = false;  // 16-bit floats in shaders (WGSL "enable f16")
+    bool timestamps = false;     // timestamp queries at compute-pass boundaries (benchmarks)
+    double timestampPeriod = 1;  // nanoseconds per timestamp tick
     std::mutex lock;  // one GPU job at a time
 
     static GpuContext* get();  // nullptr when unavailable

@@ -245,7 +245,7 @@ fn smagorinskyTau(f: ptr<function, array<f32, 19>>, rho: f32, u: vec3<f32>) -> f
 // Wall model (flow-cpu.js wallModelCell, Malaspinas & Sagaut 2014): sample the flow at the bulk cell
 // n + c_samp, take u_tau from Reichardt's law, and rebuild this cell's populations as the regularised
 // state with the law's velocity and shear at its own distance from the wall.
-fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32, rho1: f32) {
+fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32) {
   let base = r * REC;
   // the sample cell (its z wraps around with a periodic span)
   var zm = i32(z) + CZ[j];
@@ -276,13 +276,13 @@ fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32, rho1:
     e = tv / ut2;
   }
   // the cell's velocity from the law of the wall, along the wall only (a velocity toward the wall
-  // pumps pressure waves in narrow gaps), with the cell's own density (the model makes no mass)
+  // pumps pressure waves in narrow gaps)
   let u1 = wv + ut1 * e;
-  let c = -rho1 * tauN * dudn / 3.0;
+  let c = -rho2 * tauN * dudn / 3.0;
   let pi = array<f32, 6>(2.0 * c * e.x * nrm.x, 2.0 * c * e.y * nrm.y, 2.0 * c * e.z * nrm.z,
     c * (e.x * nrm.y + e.y * nrm.x), c * (e.x * nrm.z + e.z * nrm.x), c * (e.y * nrm.z + e.z * nrm.y));
   var f: array<f32, 19>;
-  regularized(&f, rho1, u1, pi, 1.0 - 1.0 / tauN);
+  regularized(&f, rho2, u1, pi, 1.0 - 1.0 / tauN);
   storeCell(n, o, &f, 0u);
   for (var k = 1u; k < 19u; k++) {
     if ((mask & (1u << k)) != 0u) {
@@ -313,6 +313,8 @@ fn wall(@builtin(global_invocation_id) gid: vec3<u32>) {
   let z = n / (P.nx * P.ny);
   let o = offsets(z);
   let samp = rec[base + R_SAMP];
+  // the wall model on the part when it is on, and always on the moving ground (flow-cpu.js wallCells)
+  if (samp != 0u && (P.wallModel == 4u || (mask & 1u) != 0u)) { modelCell(r, n, z, o, mask, samp); return; }
   var f: array<f32, 19>;
   loadCell(n, o, &f);
   var fb: array<f32, 19>;
@@ -336,13 +338,6 @@ fn wall(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
     f[k] = fk;
-  }
-  // the wall model on the part when it is on, and always on the moving ground (flow-cpu.js wallCells)
-  if (samp != 0u && (P.wallModel == 4u || (mask & 1u) != 0u)) {
-    var rho1 = 0.0;
-    for (var i = 0u; i < 19u; i++) { rho1 += f[i]; }
-    modelCell(r, n, z, o, mask, samp, rho1);
-    return;
   }
   // wall model (flow-cpu.js wallCells): 1 = slip, the wall moves along the near-wall flow at the
   // speed that gives the log law's wall shear with the cell's own viscosity; 2 = the log-law eddy

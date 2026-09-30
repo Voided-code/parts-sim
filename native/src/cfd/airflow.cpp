@@ -235,6 +235,7 @@ void AirflowSim::setup(std::shared_ptr<const Part> p, const AirflowOptions& o, c
     wallModel = o.boundaryLayer == BoundaryLayer::Turbulent || (o.boundaryLayer == BoundaryLayer::Auto && reynoldsLength >= TURBULENT_RE);
     q_ = 0.5 * o.airDensity * o.speed * o.speed;
     frontal_ = frontalArea(plan, part->tris) / (h * h);
+    groundGap = o.ground >= 0 ? o.ground / h : -1;
     records = grid.rec.count;
     // for each part vertex, the wall record next to it (the surface pressure)
     {
@@ -301,6 +302,7 @@ void AirflowSim::createSolver(const flow::Grid& grid) {
     p.wallModel = wallModel;
     p.belt = true;
     p.half = !std::getenv("PARTS_SIM_LBM_FP32");  // diagnostics: 32-bit populations
+    p.timing = opts.timing;
     if (useGPU_) {
         solver_ = flow::makeGpu(grid, p);
         engine = "GPU";
@@ -365,6 +367,8 @@ void AirflowSim::loop() {
     std::deque<Pending> inFlight;
     auto lastDone = Clock::now();
     auto lastFields = lastDone - std::chrono::seconds(10), lastSurface = lastFields;
+    auto busyFrom = lastDone;
+    double gpuFrom = sim.gpuSeconds;
     try {
         while (running_) {
             flow::Forces f;
@@ -389,6 +393,11 @@ void AirflowSim::loop() {
             }
             int64_t at = sim.steps;
             for (const auto& p : inFlight) at -= p.steps;
+            if (sim.timed && seconds(busyFrom) > 1) {
+                gpuBusy_ = (sim.gpuSeconds - gpuFrom) / seconds(busyFrom);
+                gpuFrom = sim.gpuSeconds;
+                busyFrom = Clock::now();
+            }
             onForces(f, at, mlups_);
             if (running_ && seconds(lastFields) > FIELDS_EVERY) {
                 fields_ = std::make_shared<const flow::Fields>(sim.fields());
@@ -502,6 +511,7 @@ void AirflowSim::publish(bool notify) {
     s->steps = steps_;
     s->samples = int(sx_.size());
     s->mlups = mlups_;
+    s->gpuBusy = gpuBusy_;
     s->developing = developing_;
     s->converged = converged_;
     s->results = results_;

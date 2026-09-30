@@ -587,6 +587,8 @@ void AirflowPanel::update() {
         else
             notes << tr("Boundary layer: resolved by the grid (laminar%1).")
                          .arg(sim_->reynoldsLength >= TURBULENT_RE ? tr(", set by hand; the real one is turbulent") : QString());
+        if (sim_->groundGap >= 0 && sim_->groundGap < 4)
+            notes << tr("The gap under the part is only %1 cells high, too few to resolve the flow through it: use more cells.").arg(num(sim_->groundGap, 2));
         if (sim_->simReynolds < 0.5 * sim_->reynolds)
             notes << tr("The grid holds the flow at a lower Reynolds number (%1) than real air (%2): expect the drag of rounded shapes to differ.")
                          .arg(num(sim_->simReynolds), num(sim_->reynolds));

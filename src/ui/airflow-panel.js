@@ -297,6 +297,7 @@ export class AirflowPanel {
       notes.push(s.wallModel
         ? `Boundary layer: turbulent (wall model, Re ${num(s.reynoldsLength)} along the part${s.reynoldsLength < TURBULENT_RE ? ', set by hand' : ''}).`
         : `Boundary layer: resolved by the grid (laminar${s.reynoldsLength >= TURBULENT_RE ? ', set by hand; the real one is turbulent' : ''}).`);
+      if (s.groundGap >= 0 && s.groundGap < 4) notes.push(`The gap under the part is only ${num(s.groundGap, 2)} cells high, too few to resolve the flow through it: use more cells.`);
       if (s.simReynolds < 0.5 * s.reynolds) notes.push(`The grid holds the flow at a lower Reynolds number (${num(s.simReynolds)}) than real air (${num(s.reynolds)}): expect the drag of rounded shapes to differ.`);
       $('#flow-notes').textContent = notes.join(' ');
     } else {

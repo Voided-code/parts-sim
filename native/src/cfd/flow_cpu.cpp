@@ -305,6 +305,9 @@ private:
             const uint32_t mask = rec_.mask[r], gm = rec_.groundMask[r];
             const int z = int(n / (int64_t(nx_) * ny_));
             neighbours(n, z, nb);
+            // the wall model on the part when it is on, and always on the moving ground (plain
+            // bounce-back from a belt moving with the air leaves grid-scale waves undamped)
+            if (rec_.samp[r] && (wallModel_ || rec_.onBelt[r]) && modelCell(r, n, z, nb)) continue;
             load(n, nb, f);
             // bounce-back: the cell's own outgoing populations toward its walls from the last step
             for (int k = 1; k < 19; k++)
@@ -321,14 +324,6 @@ private:
                     else { fk = (0.5 / qq) * v + (1 - 0.5 / qq) * aux_[19 * r + k]; fq[k] = 3 / qq; }
                 }
                 f[k] = fk;
-            }
-            // the wall model on the part when it is on, and always on the moving ground (plain
-            // bounce-back from a belt moving with the air leaves grid-scale waves undamped); the cell
-            // keeps its own density (what streamed in, with the walls' bounce-back)
-            if (rec_.samp[r] && (wallModel_ || rec_.onBelt[r])) {
-                double rho1 = 0;
-                for (int k = 0; k < 19; k++) rho1 += f[k];
-                if (modelCell(r, n, z, nb, rho1)) continue;
             }
             // momentum to the part: what left toward it minus what came back, c_opp = -c_k, less the
             // air at rest's (the reference pressure, as the wall model's surface integral has it: a
@@ -351,13 +346,13 @@ private:
     }
 
     // wall model (flow-cpu.js wallModelCell)
-    bool modelCell(int64_t r, int64_t n, int z, const int64_t* nb, double rho1) {
+    bool modelCell(int64_t r, int64_t n, int z, const int64_t* nb) {
         const int j = rec_.samp[r];
         const int zm = periodic_ ? (z + CZ[j] + nz_) % nz_ : z + CZ[j];
         const int64_t m = nb[j];
         const auto mo = storedMoments(m, zm);
         const double rho2 = mo[0];
-        if (!(rho2 > 0) || !(rho1 > 0)) return false;
+        if (!(rho2 > 0)) return false;
         const double wx = rec_.onBelt[r] ? uBelt_ : 0;
         const double nx = rec_.normal[3 * r], ny = rec_.normal[3 * r + 1], nz = rec_.normal[3 * r + 2];
         const double ux = mo[1] / rho2 - wx, uy = mo[2] / rho2, uz = mo[3] / rho2;
@@ -377,11 +372,11 @@ private:
             ex = tx / ut2; ey = ty / ut2; ez = tz / ut2;
         }
         // the cell's velocity from the law of the wall, along the wall only (a velocity toward the wall
-        // pumps pressure waves in narrow gaps), with the cell's own density (the model makes no mass)
-        const double c = -rho1 * tauN * dudn / 3;
+        // pumps pressure waves in narrow gaps)
+        const double c = -rho2 * tauN * dudn / 3;
         const double pi[6] = {2 * c * ex * nx, 2 * c * ey * ny, 2 * c * ez * nz, c * (ex * ny + ey * nx), c * (ex * nz + ez * nx), c * (ey * nz + ez * ny)};
         double g[19];
-        regularized(g, rho1, wx + ut1 * ex, ut1 * ey, ut1 * ez, pi, 1 - 1 / tauN, rr_);
+        regularized(g, rho2, wx + ut1 * ex, ut1 * ey, ut1 * ez, pi, 1 - 1 / tauN, rr_);
         store(n, nb, g);
         const uint32_t mask = rec_.mask[r];
         for (int k = 1; k < 19; k++) {

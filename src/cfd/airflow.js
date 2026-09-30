@@ -243,6 +243,7 @@ export class AirflowStudy {
     this.wallModel = bl === 'turbulent' || (bl === 'auto' && this.reynoldsLength >= TURBULENT_RE);
     this.q = 0.5 * o.airDensity * o.speed * o.speed;
     this.frontal = frontalArea(plan, part.tris) / (h * h);
+    this.groundGap = ground !== null ? ground / h : -1;
 
     const M = new THREE.Matrix4().makeBasis(basis[0], basis[1], basis[2])
       .multiply(new THREE.Matrix4().makeTranslation(origin[0], origin[1], origin[2]))

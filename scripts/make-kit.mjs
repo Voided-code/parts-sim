@@ -43,32 +43,39 @@ if (nativeDir) {
   await rm(tmp, { recursive: true, force: true });
 }
 
+// the validation cases' meshes for the native benchmark (scripts/export-cases.mjs)
+execFileSync(process.execPath, [path.join(root, 'scripts', 'export-cases.mjs'), path.join(out, 'cases')], { stdio: 'inherit' });
+
 const cmd = String.raw`@echo off
-rem Parts Sim benchmark kit ${version} (${commit}). Runs for about 20 minutes without clicks.
+rem Parts Sim benchmark kit ${version} (${commit}). Runs for about 30 minutes without clicks.
 setlocal
 cd /d "%~dp0"
 set "OUT=%~dp0report"
 if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%"
 echo Parts Sim benchmark kit ${version} (${commit})
-echo Leave the PC alone until it says Done (about 20 minutes). Closing the window stops it.
+echo Leave the PC alone until it says Done (about 30 minutes). Closing the window stops it.
 echo.
 powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate,VideoProcessor | ConvertTo-Json | Out-File -Encoding utf8 '%OUT%\gpu.json'; Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json | Out-File -Encoding utf8 '%OUT%\cpu.json'; Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize | ConvertTo-Json | Out-File -Encoding utf8 '%OUT%\os.json'"
 if exist "native\bench.exe" (
-  echo [1/4] Native app benchmark: Vulkan, then Direct3D 12...
+  echo [1/6] Native app: flow engine speed with Vulkan, then Direct3D 12...
   set PARTS_SIM_GPU_BACKEND=vulkan
   "native\bench.exe" --json "%OUT%\native-vulkan.json" kit > "%OUT%\native-vulkan.log" 2>&1
   set PARTS_SIM_GPU_BACKEND=dx12
   "native\bench.exe" --json "%OUT%\native-dx12.json" kit > "%OUT%\native-dx12.log" 2>&1
   set PARTS_SIM_GPU_BACKEND=
+  echo [2/6] Native app: the airflow study itself on the Ahmed body...
+  "native\bench.exe" --json "%OUT%\native-app.json" app cases 4000000 16000000 64000000 128000000 > "%OUT%\native-app.log" 2>&1
+  echo [3/6] Native app: validation cases...
+  "native\bench.exe" --json "%OUT%\native-cases.json" cases cases plate,cube,sphere,ahmed25,ahmed35,wing,plate-turbulent,plate-laminar > "%OUT%\native-cases.log" 2>&1
 ) else (
-  echo [1/4] No native build in this kit: skipped.
+  echo [1/6] No native build in this kit: steps 1 to 3 skipped.
 )
-echo [2/4] Desktop app: the current solver's benchmark and validation (WebGPU)...
-"electron\Parts Sim.exe" --bench=full --bench-out="%OUT%\report.json" --bench-native="%OUT%"
-echo [3/4] Desktop app: the new flow engine's checks and speed...
-"electron\Parts Sim.exe" --bench=engine --bench-solver=v1 --bench-out="%OUT%\report-engine.json"
-echo [4/4] Desktop app speed with Chromium's Vulkan switches (to see which backend it picks)...
+echo [4/6] Desktop app: flow engine checks, speed and the airflow study (WebGPU)...
+"electron\Parts Sim.exe" --bench=engine --bench-out="%OUT%\report-engine.json"
+echo [5/6] Desktop app: validation cases and five minutes of sustained speed...
+"electron\Parts Sim.exe" --bench=kit --bench-out="%OUT%\report.json" --bench-native="%OUT%"
+echo [6/6] Desktop app speed with Chromium's Vulkan switches (to see which backend it picks)...
 "electron\Parts Sim.exe" --bench=backend --bench-out="%OUT%\report-vulkan.json" --use-vulkan=native --enable-features=Vulkan,SkiaGraphite
 powershell -NoProfile -Command "Compress-Archive -Force -Path '%OUT%\*' -DestinationPath '%~dp0parts-sim-report.zip'"
 echo.
@@ -80,7 +87,7 @@ await writeFile(path.join(out, 'run-benchmark.cmd'), cmd.replace(/\n/g, '\r\n'))
 const readme = `Parts Sim benchmark kit ${version} (${commit})
 1. Unzip this folder anywhere, close games and other heavy apps, and double-click run-benchmark.cmd.
 2. If Windows SmartScreen warns about an unknown app, choose More info, then Run anyway (the builds are not code-signed).
-3. It runs for about 20 minutes without clicks in four steps; windows open and close by themselves. Leave the PC alone until the window says Done.
+3. It runs for about 30 minutes without clicks in six steps; windows open and close by themselves. Leave the PC alone until the window says Done.
 4. The results land in this folder as parts-sim-report.zip (and the report folder beside it).
 5. Send parts-sim-report.zip back. It holds speeds, forces and the names and drivers of the GPU, CPU and Windows version, nothing else.
 `;

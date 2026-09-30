@@ -5,10 +5,20 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
+// a kit's reports: report.json, with the ladder and app loop of report-engine.json (kit 2 on) merged in
 function load(file) {
-  if (statSync(file).isDirectory()) return load(path.join(file, 'report.json'));
-  if (file.endsWith('.zip')) return JSON.parse(execFileSync('unzip', ['-p', file, 'report.json']).toString());
-  return JSON.parse(readFileSync(file, 'utf8'));
+  let read;
+  if (statSync(file).isDirectory()) read = (name) => (existsSync(path.join(file, name)) ? readFileSync(path.join(file, name), 'utf8') : null);
+  else if (file.endsWith('.zip')) read = (name) => { try { return execFileSync('unzip', ['-p', file, name], { stdio: ['ignore', 'pipe', 'ignore'] }).toString() || null; } catch { return null; } };
+  else return JSON.parse(readFileSync(file, 'utf8'));
+  const report = JSON.parse(read('report.json'));
+  const engine = read('report-engine.json');
+  if (engine) {
+    const e = JSON.parse(engine);
+    for (const k of ['ladder', 'appLoop', 'tune']) if (!report[k]?.length && e[k]?.length) report[k] = e[k];
+    report.errors = [...(report.errors || []), ...(e.errors || [])];
+  }
+  return report;
 }
 
 const [a, b] = process.argv.slice(2).map((f) => {

@@ -42,6 +42,7 @@ struct AirflowOptions {
     double toMeters = 0.001;
     double ground = -1;         // gap under the part to a road moving with the wind (model units); < 0: free air
     BoundaryLayer boundaryLayer = BoundaryLayer::Auto;
+    bool timing = false;        // benchmarks: the GPU's busy share (AirSnapshot::gpuBusy)
 };
 
 /** How large a flow grid this machine can take, and what each cell costs. */
@@ -97,6 +98,7 @@ struct AirSnapshot {
     int64_t steps = 0;
     int samples = 0;  // force samples in the averages
     double mlups = 0;
+    double gpuBusy = std::numeric_limits<double>::quiet_NaN();  // GPU time / wall time (AirflowOptions::timing)
     bool developing = true, converged = false;
     AirResults results;
 };
@@ -135,6 +137,7 @@ public:
     double reynolds = 0, reynoldsLength = 0, simReynolds = 0, nuLat = 0, nuAir = 0;
     bool wallModel = false;
     int64_t records = 0;                   // wall records (cells next to the part or the ground)
+    double groundGap = -1;                 // cells between the part and the ground (-1: free air)
     std::string engine;
     AirflowOptions opts;
     std::shared_ptr<const Part> part;
@@ -172,7 +175,7 @@ private:
     std::vector<double> sx_, sy_, sz_, sfx_;  // force samples since the flow developed (coefficient units)
     int64_t averageFrom_ = 0;
     bool developing_ = true, converged_ = false;
-    double mlups_ = 0;
+    double mlups_ = 0, gpuBusy_ = std::numeric_limits<double>::quiet_NaN();
     int64_t steps_ = 0;
     AirResults results_;
     std::shared_ptr<const flow::Fields> fields_;

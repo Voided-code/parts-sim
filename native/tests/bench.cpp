@@ -3,6 +3,8 @@
 //   bench --json <file> kit [v0.6]   the benchmark kit's report (the v1 flow engine unless v0.6)
 //   bench --json <file> cases <folder> [ids] [engine=cpu] [scale=1] [margins=1] [wall=on|off] [maxft=10]
 //       the airflow validation cases exported by scripts/export-cases.mjs, run to converged forces
+//   bench --json <file> app <folder> [cells...]   the app's airflow study on the Ahmed body (speed, GPU busy)
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cfd/airflow.hpp"
@@ -351,16 +354,31 @@ static std::string kitReport(std::string& log) {
     return j.obj();
 }
 
-// the v1 engine (cfd/flow.hpp): steps for about `seconds` in submissions of ~40 ms (step() sizes them)
-static std::pair<int64_t, double> timedFlow(flow::Solver& sim, double seconds) {
-    sim.step(20);
-    int64_t steps = 0;
-    const auto t0 = Clock::now();
+// the v1 engine (cfd/flow.hpp) as the app runs it: two batches in flight, each about 40 ms of GPU
+// work, for about `seconds`; steps, wall seconds and the GPU's busy share (timestamp queries)
+struct FlowTiming { int64_t steps = 0; double seconds = 0, busy = NAN; };
+static FlowTiming timedFlow(flow::Solver& sim, double seconds) {
+    sim.step(20);  // compile and warm up
+    int batch = std::clamp(int(2e7 / double(sim.cells)), 1, 256);
+    std::vector<std::pair<int, int>> inFlight;
+    FlowTiming r;
+    const double gpu0 = sim.gpuSeconds;
+    auto t0 = Clock::now(), last = t0;
     while (since(t0) < seconds) {
-        sim.step(50);
-        steps += 50;
+        inFlight.push_back({sim.submit(batch), batch});
+        if (inFlight.size() < 2) continue;
+        const auto [ticket, n] = inFlight.front();
+        inFlight.erase(inFlight.begin());
+        sim.collect(ticket);
+        r.steps += n;
+        const double dt = std::max(1e-4, since(last));
+        last = Clock::now();
+        batch = std::clamp(int(std::lround(n * 0.040 / dt)), 1, 256);
     }
-    return {steps, since(t0)};
+    for (const auto& [ticket, n] : inFlight) { sim.collect(ticket); r.steps += n; }
+    r.seconds = since(t0);
+    if (sim.timed) r.busy = (sim.gpuSeconds - gpu0) / r.seconds;
+    return r;
 }
 
 static std::string kitReportV1(std::string& log) {
@@ -391,12 +409,14 @@ static std::string kitReportV1(std::string& log) {
                 const auto g = flow::syntheticGrid(n);
                 flow::Params p;
                 p.nuLat = 1e-5;
+                p.timing = true;
                 auto sim = flow::makeGpu(g, p);
-                const auto [steps, secs] = timedFlow(*sim, 4);
-                const double cells = double(g.N), mlups = cells * steps / secs / 1e6, bytes = gpuShaderF16() ? bytes16 : bytes32;
+                const auto t = timedFlow(*sim, 4);
+                const double cells = double(g.N), mlups = cells * t.steps / t.seconds / 1e6, bytes = gpuShaderF16() ? bytes16 : bytes32;
                 r.num("cells", cells).raw("dims", "[" + std::to_string(g.dims[0]) + "," + std::to_string(g.dims[1]) + "," + std::to_string(g.dims[2]) + "]");
-                r.num("steps", double(steps)).num("seconds", secs).num("mlups", mlups).num("bytesPerCellStep", bytes).num("gbs", mlups * bytes / 1e3);
-                say("ladder %.0fM: %.0f MLUPS (%.0f GB/s)\n", cells / 1e6, mlups, mlups * bytes / 1e3);
+                r.num("steps", double(t.steps)).num("seconds", t.seconds).num("mlups", mlups).num("bytesPerCellStep", bytes).num("gbs", mlups * bytes / 1e3);
+                r.num("gpuBusy", t.busy).num("kernelMlups", t.busy > 0 ? mlups / t.busy : NAN);
+                say("ladder %.0fM: %.0f MLUPS (%.0f GB/s), GPU busy %.0f%%\n", cells / 1e6, mlups, mlups * bytes / 1e3, 100 * t.busy);
             } catch (const std::exception& e) {
                 r.num("cells", n).str("error", e.what());
                 ladder += (ladder.size() > 1 ? "," : "") + r.obj();
@@ -421,8 +441,8 @@ static std::string kitReportV1(std::string& log) {
                 p.wgx = v.wgx;
                 p.wgy = v.wgy;
                 auto sim = flow::makeGpu(g, p);
-                const auto [steps, secs] = timedFlow(*sim, 3);
-                const double mlups = double(g.N) * steps / secs / 1e6;
+                const auto t = timedFlow(*sim, 3);
+                const double mlups = double(g.N) * t.steps / t.seconds / 1e6;
                 r.num("cells", double(g.N)).num("mlups", mlups).num("gbs", mlups * (v.half && gpuShaderF16() ? bytes16 : bytes32) / 1e3);
                 say("tune %dx%d %s %s: %.0f MLUPS\n", v.wgx, v.wgy, v.half ? "16-bit" : "32-bit", v.rr ? "rr" : "bgk", mlups);
             } catch (const std::exception& e) {
@@ -458,6 +478,7 @@ struct CaseOptions {
     double scale = 1, margins = 1, maxFlowThroughs = 10, tol = 0.02;
     int wall = -1;  // -1: the app's choice (turbulent from Re 5e5 along the part)
     bool half = true;  // GPU: 16-bit populations
+    double alpha = NAN;  // only this angle of attack of the wing sections
 };
 
 static std::string runFlowCase(const json::Value& c, const std::string& dir, const std::string& mesh, double alpha, const CaseOptions& o, double* clOut) {
@@ -469,6 +490,14 @@ static std::string runFlowCase(const json::Value& c, const std::string& dir, con
     MeshSource src = readSTL(bytes);
     src.name = c["id"].string();
     const auto part = buildPart(src);
+    // the triangles' signed volume: positive when they face outward
+    double v6 = 0;
+    for (int t = 0; t < part->nTri; t++) {
+        const float* a = &part->vertices[3 * part->tris[3 * t]];
+        const float* b = &part->vertices[3 * part->tris[3 * t + 1]];
+        const float* d = &part->vertices[3 * part->tris[3 * t + 2]];
+        v6 += a[0] * (b[1] * d[2] - b[2] * d[1]) - a[1] * (b[0] * d[2] - b[2] * d[0]) + a[2] * (b[0] * d[1] - b[1] * d[0]);
+    }
     const double across = c["across"].number() * o.scale;
     const double lref = c["lref"].number(), aref = c["aref"].number(), speed = c["speed"].number();
     TunnelOptions to;
@@ -556,6 +585,7 @@ static std::string runFlowCase(const json::Value& c, const std::string& dir, con
     Json j;
     j.str("id", c["id"].string()).num("alpha", alpha).str("engine", sim->name + (gpu ? " (GPU)" : " (CPU)"));
     j.raw("dims", "[" + std::to_string(dims[0]) + "," + std::to_string(dims[1]) + "," + std::to_string(dims[2]) + "]");
+    j.num("partVolume", part->volume).num("signedVolume", v6 / 6).num("triangles", part->nTri);
     j.num("cells", double(grid.N)).num("across", across).num("h_mm", plan.h).num("records", double(grid.rec.count));
     j.num("reynolds", reynolds).num("reynoldsLength", reynoldsLength).num("wallModel", p.wallModel).num("nuLat", p.nuLat);
     j.num("simReynolds", AIR_U_LAT * (lref / hm) / p.nuLat).num("marginScale", o.margins);
@@ -604,6 +634,7 @@ static int runCases(const std::string& out, int argc, char** argv) {
         else if (k == "maxft") o.maxFlowThroughs = std::stod(v);
         else if (k == "tol") o.tol = std::stod(v);
         else if (k == "half") o.half = v != "0";
+        else if (k == "alpha") o.alpha = std::stod(v);
     }
     std::printf("%s, %u threads\n", gpuAvailable() && !o.cpu ? gpuName().c_str() : "CPU", ThreadPool::instance().size());
     std::string runs = "[";
@@ -613,6 +644,7 @@ static int runCases(const std::string& out, int argc, char** argv) {
             if (c["alphas"].type == json::Value::Array) {
                 std::vector<double> as, cls;
                 for (const auto& a : c["alphas"].arr) {
+                    if (std::isfinite(o.alpha) && a.num != o.alpha) continue;
                     double cl = 0;
                     runs += (runs.size() > 1 ? "," : "") + runFlowCase(c, dir, c["meshes"][std::to_string(int(a.num))].string(), a.num, o, &cl);
                     as.push_back(a.num);
@@ -641,7 +673,64 @@ static int runCases(const std::string& out, int argc, char** argv) {
     return 0;
 }
 
+// ---------- the airflow study as the app runs it ----------
+
+// bench --json <file> app <cases folder> [cells...]: the Ahmed body over its moving road in the app's
+// airflow study (AirflowSim: pipelined batches, forces, view fields, surface pressure) at each grid
+// size for 20 s; speed and the GPU's busy share
+static int runApp(const std::string& out, int argc, char** argv) {
+    const std::string dir = argv[4];
+    std::vector<double> sizes;
+    for (int i = 5; i < argc; i++) sizes.push_back(std::stod(argv[i]));
+    if (sizes.empty()) sizes = {4e6, 16e6, 64e6};
+    std::ifstream in(dir + "/ahmed25.stl", std::ios::binary);
+    if (!in) { std::fprintf(stderr, "No ahmed25.stl in %s\n", dir.c_str()); return 1; }
+    const Bytes bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    MeshSource src = readSTL(bytes);
+    src.name = "ahmed25";
+    const std::shared_ptr<const Part> part = buildPart(src);
+    std::string runs = "[";
+    for (double cells : sizes) {
+        AirflowSim sim;
+        AirflowOptions o;
+        o.dir = {1, 0, 0};
+        o.speed = 40;
+        o.cells = cells;
+        o.ground = 50;
+        o.engine = gpuAvailable() ? 1 : 2;
+        o.timing = true;
+        Json r;
+        try {
+            const auto t0 = Clock::now();
+            sim.setup(part, o, nullptr);
+            const double setup = since(t0);
+            sim.start();
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            const auto s = sim.snapshot();
+            sim.pause();
+            r.num("cells", double(sim.dims[0]) * sim.dims[1] * sim.dims[2]).str("engine", sim.engine).num("setupSeconds", setup);
+            r.num("steps", s ? double(s->steps) : 0).num("mlups", s ? s->mlups : 0).num("gpuBusy", s ? s->gpuBusy : NAN);
+            r.num("cd", s ? s->results.cd : NAN).num("developing", s ? s->developing : 1);
+            std::printf("app %.0fM cells: %.0f MLUPS, GPU busy %.0f%%, setup %.1f s\n", cells / 1e6, s ? s->mlups : 0, s ? 100 * s->gpuBusy : NAN, setup);
+        } catch (const std::exception& e) {
+            r.num("cells", cells).str("error", e.what());
+            std::printf("app %.0fM cells: %s\n", cells / 1e6, e.what());
+        }
+        std::fflush(stdout);
+        runs += (runs.size() > 1 ? "," : "") + r.obj();
+    }
+    Json j;
+    j.str("format", "parts-sim-native-app/1").str("gpu", gpuAvailable() ? gpuName() : "none").raw("runs", runs + "]");
+    if (FILE* f = std::fopen(out.c_str(), "wb")) {
+        const std::string t = j.obj();
+        std::fwrite(t.data(), 1, t.size(), f);
+        std::fclose(f);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 4 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "app") return runApp(argv[2], argc, argv);
     if (argc > 4 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "cases") return runCases(argv[2], argc, argv);
     // bench --json <file> kit [v0.6|v1]: the benchmark kit's report (the v1 engine by default)
     if (argc > 3 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "kit") {

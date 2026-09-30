@@ -7,6 +7,7 @@ import { FlowCPU } from '../src/cfd/flow-cpu.js';
 import { buildTunnel, syntheticFlowGrid, runCase } from '../src/cfd/flowcase.js';
 import { caseById } from '../src/cfd/validation.js';
 import { batchMeans } from '../src/cfd/stats.js';
+import { frontalArea } from '../src/cfd/airflow.js';
 
 test('in-place streaming matches two-buffer streaming exactly (walls, links, faces)', () => {
   const t = buildTunnel(caseById('sphere'), { across: 8, legacy: false });
@@ -102,6 +103,23 @@ test('wall records carry the part\'s whole surface, once', () => {
     assert.ok(Math.hypot(...sum) < 1e-6 * mag, `${id}: net area ${sum}`);
     for (let r = 0; r < rec.count; r++) assert.equal(t.grid.kind[rec.cell[r]], WALL);
   }
+});
+
+test('frontal area: the part\'s shadow along the wind, thin plates and spheres alike', () => {
+  for (const [id, area] of [['plate', 100 * 100], ['sphere', Math.PI * 50 * 50], ['cube', 100 * 100]]) {
+    const t = buildTunnel(caseById(id), { across: 8, legacy: false });
+    const a = frontalArea(t.plan, t.part.tris);
+    assert.ok(Math.abs(a / area - 1) < 0.01, `${id}: ${a} of ${area} mm^2`);
+  }
+});
+
+test('a large face\'s area is shared among the wall records along it', () => {
+  const t = buildTunnel(caseById('cube'), { across: 16, legacy: false });
+  const { rec } = t.grid;
+  let holding = 0;
+  for (let r = 0; r < rec.count; r++) if (rec.area[3 * r] || rec.area[3 * r + 1] || rec.area[3 * r + 2]) holding++;
+  // 12 triangles over six 16 x 16 faces: most records next to them carry some of it
+  assert.ok(holding > 6 * 14 * 14, `${holding} records hold area`);
 });
 
 test('the 95% interval of a correlated series covers its mean about 95% of the time', () => {

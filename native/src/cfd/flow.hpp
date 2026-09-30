@@ -76,6 +76,7 @@ struct Params {
     bool belt = true;       // the ground moves with the wind
     bool half = true;       // GPU: 16-bit population storage
     int wgx = 64, wgy = 1;  // GPU: the bulk kernel's workgroup
+    bool timing = false;    // GPU: time the batches with timestamp queries (Solver::gpuSeconds)
 };
 
 /** Forces on the part over some steps (lattice units, summed over them). */
@@ -117,7 +118,8 @@ public:
     int sampleEvery = 20;
     int64_t steps = 0;
     int64_t cells = 0;
-    double gpuSeconds = 0;  // GPU time of the steps (timestamp queries, when available)
+    double gpuSeconds = 0;  // GPU time of the batches (Params::timing, when the GPU has timestamp queries)
+    bool timed = false;     // gpuSeconds is measured
     std::string name;
 };
 

@@ -70,12 +70,14 @@ GpuContext* create() {
     req.maxStorageBuffersPerShaderStage = std::min<uint32_t>(alimits.maxStorageBuffersPerShaderStage, 10);
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &req;
-    // 16-bit floats where the adapter has them (the flow solver stores its populations in them)
-    const WGPUFeatureName f16 = WGPUFeatureName_ShaderF16;
-    if (wgpuAdapterHasFeature(ctx->adapter, f16)) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &f16;
-    }
+    // 16-bit floats where the adapter has them (the flow solver stores its populations in them), and
+    // timestamp queries (the benchmarks' GPU time)
+    const WGPUFeatureName f16 = WGPUFeatureName_ShaderF16, ts = WGPUFeatureName_TimestampQuery;
+    std::vector<WGPUFeatureName> features;
+    if (wgpuAdapterHasFeature(ctx->adapter, f16)) features.push_back(f16);
+    if (wgpuAdapterHasFeature(ctx->adapter, ts)) features.push_back(ts);
+    dd.requiredFeatureCount = features.size();
+    dd.requiredFeatures = features.data();
     dd.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const*, WGPUErrorType, WGPUStringView, void*, void*) {};
     struct DeviceReq { WGPUDevice device = nullptr; bool done = false; std::string msg; } dreq;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -93,6 +95,8 @@ GpuContext* create() {
     ctx->device = dreq.device;
     ctx->queue = wgpuDeviceGetQueue(ctx->device);
     ctx->shaderF16 = wgpuDeviceHasFeature(ctx->device, f16);
+    ctx->timestamps = wgpuDeviceHasFeature(ctx->device, ts);
+    if (ctx->timestamps) ctx->timestampPeriod = wgpuQueueGetTimestampPeriod(ctx->queue);
     wgpuDeviceGetLimits(ctx->device, &ctx->limits);
     return ctx;
 }

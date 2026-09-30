@@ -1,7 +1,7 @@
 // Benchmark and validation run (bench.html). Runs without clicks: in the desktop app with --bench,
 // or in a browser. Writes one JSON report, saved after every item so a crash still leaves data.
 //
-// URL parameters: suite = full | quick | speed | check | tune | engine | backend; cases = comma-separated
+// URL parameters: suite = full | quick | kit | speed | check | tune | engine | backend | sustained; cases = comma-separated
 // case ids (optional); solver = v0.6 | v1 (and its options, below).
 import * as THREE from 'three';
 import { CASES, caseById } from '../cfd/validation.js';
@@ -15,8 +15,9 @@ import { buildPart } from '../core/mesh.js';
 const params = new URLSearchParams(location.search);
 const suite = params.get('suite') || 'full';
 const only = params.get('cases')?.split(',').filter(Boolean) || null;
-// the solver and its options (experiments): solver = v1 | v0.6, collision = rr | bgk, wm = 0 | 1, nufloor
-const solver = params.get('solver') || 'v0.6';
+// the solver and its options (experiments): solver = v1 (the app's) | v0.6 (the baseline), collision =
+// rr | bgk, wm = 0 | 1, nufloor
+const solver = params.get('solver') || 'v1';
 const engineOptions = {
   solver,
   collision: params.get('collision') || 'rr',
@@ -107,12 +108,13 @@ async function adapterInfo() {
 // ---------- validation ----------
 
 function variants(c) {
-  if (suite === 'quick') return [{ variant: 'base' }];
+  if (suite === 'quick' || suite === 'kit') return [{ variant: 'base' }];
   return [{ variant: 'base' }, { variant: 'viscosity x2', nuScale: 2 }, { variant: 'finer grid', across: Math.round(c.across * 1.26) }];
 }
 
 async function validation() {
-  const cases = CASES.filter((c) => (only ? only.includes(c.id) : suite === 'quick' ? ['plate', 'cube', 'sphere', 'wing', 'ahmed'].includes(c.id) : true));
+  // the benchmark kit: every case but the 2D wing section (its three angles take long)
+  const cases = CASES.filter((c) => (only ? only.includes(c.id) : suite === 'quick' ? ['plate', 'cube', 'sphere', 'wing', 'ahmed25'].includes(c.id) : suite === 'kit' ? c.id !== 'naca0012' : true));
   const jobs = [];
   for (const c of cases) for (const v of variants(c)) jobs.push([c, v]);
   let done = 0;
@@ -436,6 +438,10 @@ async function main() {
       await tune();
       await appLoop('ahmed', 1e6, 15);
       await appLoop('ahmed', 16e6, 20);
+      await appLoop('ahmed', 64e6, 20);
+    } else if (suite === 'kit') {
+      await validation();
+      await sustained(5);
     } else {
       if (suite !== 'speed') await validation();
       if (suite !== 'quick') {

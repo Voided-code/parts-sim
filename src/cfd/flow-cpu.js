@@ -286,7 +286,7 @@ export function regularized(g, rho, ux, uy, uz, pi, k, rr) {
  * on the part is the pressure on the surface next to it plus that shear. Returns false when the
  * sample is unusable (the cell keeps plain bounce-back).
  */
-function wallModelCell(s, t, r, n, x, y, z, rho1) {
+function wallModelCell(s, t, r, n, x, y, z) {
   const { rec, nx, ny, nz, nu0, odd, rr, uBelt, acc } = s;
   const j = rec.samp[r];
   const xm = x + CX[j], ym = y + CY[j], zm = s.periodicZ ? (z + CZ[j] + nz) % nz : z + CZ[j];
@@ -300,7 +300,7 @@ function wallModelCell(s, t, r, n, x, y, z, rho1) {
     const v = src[storedIndex(s, m, nbm, i, odd)];
     rho2 += v; jx += CX[i] * v; jy += CY[i] * v; jz += CZ[i] * v;
   }
-  if (!(rho2 > 0) || !(rho1 > 0)) return false;
+  if (!(rho2 > 0)) return false;
   const wx = rec.onBelt[r] ? uBelt : 0;
   const nxv = rec.normal[3 * r], nyv = rec.normal[3 * r + 1], nzv = rec.normal[3 * r + 2];
   const ux = jx / rho2 - wx, uy = jy / rho2, uz = jz / rho2;
@@ -320,15 +320,15 @@ function wallModelCell(s, t, r, n, x, y, z, rho1) {
   }
   const ex = ut2 > 1e-12 ? tx / ut2 : 0, ey = ut2 > 1e-12 ? ty / ut2 : 0, ez = ut2 > 1e-12 ? tz / ut2 : 0;
   // velocity at the wall cell: the law's, along the wall only (a velocity toward the wall pumps
-  // pressure waves in narrow gaps); the cell keeps its own density (the model makes no mass)
+  // pressure waves in narrow gaps)
   const u1x = wx + ut1 * ex, u1y = ut1 * ey, u1z = ut1 * ez;
   // non-equilibrium stress of the shear du_t/dn: Pi = -rho tau / 3 * du/dn (t n + n t)
-  const c = (-rho1 * tauN * dudn) / 3;
+  const c = (-rho2 * tauN * dudn) / 3;
   const pi = t.pi || (t.pi = new Float64Array(6));
   pi[0] = 2 * c * ex * nxv; pi[1] = 2 * c * ey * nyv; pi[2] = 2 * c * ez * nzv;
   pi[3] = c * (ex * nyv + ey * nxv); pi[4] = c * (ex * nzv + ez * nxv); pi[5] = c * (ey * nzv + ez * nyv);
   const { g, nb } = t;
-  regularized(g, rho1, u1x, u1y, u1z, pi, 1 - 1 / tauN, rr);
+  regularized(g, rho2, u1x, u1y, u1z, pi, 1 - 1 / tauN, rr);
   neighbours(s, x, y, z, nb);
   store(s, n, nb, g, odd);
   const mask = rec.mask[r];
@@ -359,6 +359,9 @@ export function wallCells(s, t, r0, r1) {
     const n = rec.cell[r], mask = rec.mask[r], gm = rec.groundMask[r];
     const x = n % nx, y = ((n / nx) | 0) % ny, z = (n / (nx * ny)) | 0;
     neighbours(s, x, y, z, nb);
+    // the wall model on the part when it is on, and always on the moving ground: plain bounce-back
+    // from a belt moving with the air leaves grid-scale waves undamped at low viscosity
+    if (rec.samp[r] && ((wallModel && s.wallMode === 'model') || rec.onBelt[r]) && wallModelCell(s, t, r, n, x, y, z)) continue;
     load(s, n, nb, f, odd);
     // incoming populations from solid cells, and the momentum they exchange with the part
     let mx = 0, my = 0, mz = 0;
@@ -385,14 +388,6 @@ export function wallCells(s, t, r0, r1) {
         }
       }
       f[k] = fk;
-    }
-    // the wall model on the part when it is on, and always on the moving ground: plain bounce-back
-    // from a belt moving with the air leaves grid-scale waves undamped at low viscosity. The cell keeps
-    // its own density (what streamed in, with the walls' bounce-back).
-    if (rec.samp[r] && ((wallModel && s.wallMode === 'model') || rec.onBelt[r])) {
-      let rho1 = 0;
-      for (let i = 0; i < 19; i++) rho1 += f[i];
-      if (wallModelCell(s, t, r, n, x, y, z, rho1)) continue;
     }
     // slip wall model: the wall moves along the near-wall flow at the speed that makes the wall
     // shear stress the log law's rho u_tau^2 at this cell's distance from the wall, given the cell's

@@ -93,6 +93,7 @@ public:
         wallModel_ = p.wallModel && p.rr;
         belt_ = p.belt;
         half_ = p.half && ctx_.shaderF16;
+        timed = p.timing && ctx_.timestamps;
         wg_ = {uint32_t(std::max(1, p.wgx)), uint32_t(std::max(1, p.wgy))};
         name = ctx_.name;
         std::lock_guard<std::mutex> lock(ctx_.lock);
@@ -132,7 +133,15 @@ public:
         partial.back() = float(REDUCE_GROUPS);
         partial_ = gpuBuffer(ctx_, partial.size() * 4, partial.data());
         history_ = gpuBuffer(ctx_, 12 * 4 * 16);
-        for (auto& r : ring_) r.staging = gpuReadback(ctx_, 48);
+        for (auto& r : ring_) r.staging = gpuReadback(ctx_, 64);
+        if (timed) {
+            // two timestamps per ring slot, resolved at 256-byte offsets
+            WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
+            qd.type = WGPUQueryType_Timestamp;
+            qd.count = 2 * RING;
+            querySet_ = wgpuDeviceCreateQuerySet(ctx_.device, &qd);
+            resolve_ = gpuBuffer(ctx_, 256 * RING, nullptr, WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc);
+        }
         cf_ = std::max(1, int(std::ceil(std::cbrt(double(N_) / MAX_COARSE))));
         cdims_ = {(dims_[0] + cf_ - 1) / cf_, (dims_[1] + cf_ - 1) / cf_, (dims_[2] + cf_ - 1) / cf_};
         nCoarse_ = int64_t(cdims_[0]) * cdims_[1] * cdims_[2];
@@ -172,6 +181,7 @@ public:
     }
 
     ~FlowGpu() override {
+        if (querySet_) wgpuQuerySetRelease(querySet_);
         for (auto* k : {&k_.init, &k_.bulk, &k_.wall, &k_.face, &k_.reduce1, &k_.reduce2, &k_.sample, &k_.clearRho}) {
             if (k->playout) wgpuPipelineLayoutRelease(k->playout);
             if (k->layout) wgpuBindGroupLayoutRelease(k->layout);
@@ -193,7 +203,15 @@ public:
         if (rs.pending) throw std::runtime_error("GPU flow batches submitted faster than collected.");
         writeParams(n + 1, slot);
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(ctx_.device, nullptr);
-        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
+        WGPUPassTimestampWrites tw = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+        if (timed) {
+            tw.querySet = querySet_;
+            tw.beginningOfPassWriteIndex = uint32_t(2 * slot);
+            tw.endOfPassWriteIndex = uint32_t(2 * slot + 1);
+            pd.timestampWrites = &tw;
+        }
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &pd);
         const uint32_t bulk[3] = {(uint32_t(dims_[0]) + wg_[0] - 1) / wg_[0], (uint32_t(dims_[1]) + wg_[1] - 1) / wg_[1], uint32_t(dims_[2])};
         const auto wallG = groups1(nRec_), faceG = groups1(nFace_), sampleG = groups1(uint64_t(nCoarse_));
         int samples = 0;
@@ -212,6 +230,10 @@ public:
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
         wgpuCommandEncoderCopyBufferToBuffer(enc, history_.get(), uint64_t(slot) * 48, rs.staging.get(), 0, 48);
+        if (timed) {
+            wgpuCommandEncoderResolveQuerySet(enc, querySet_, uint32_t(2 * slot), 2, resolve_.get(), uint64_t(slot) * 256);
+            wgpuCommandEncoderCopyBufferToBuffer(enc, resolve_.get(), uint64_t(slot) * 256, rs.staging.get(), 48, 16);
+        }
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
         wgpuQueueSubmit(ctx_.queue, 1, &cmd);
         wgpuCommandBufferRelease(cmd);
@@ -228,7 +250,7 @@ public:
             r->done = true;
         };
         cb.userdata1 = &rs;
-        wgpuBufferMapAsync(rs.staging.get(), WGPUMapMode_Read, 0, 48, cb);
+        wgpuBufferMapAsync(rs.staging.get(), WGPUMapMode_Read, 0, 64, cb);
         steps += n;
         samples_ += samples;
         rhoSteps_ += n;
@@ -245,8 +267,12 @@ public:
             rs.pending = false;
             if (!rs.ok) throw std::runtime_error("Could not read the flow's forces back from the GPU.");
             float v[12];
-            std::memcpy(v, wgpuBufferGetConstMappedRange(rs.staging.get(), 0, 48), 48);
+            uint64_t t[2];
+            const auto* mapped = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(rs.staging.get(), 0, 64));
+            std::memcpy(v, mapped, 48);
+            std::memcpy(t, mapped + 48, 16);
             wgpuBufferUnmap(rs.staging.get());
+            if (timed && t[1] > t[0]) gpuSeconds += double(t[1] - t[0]) * ctx_.timestampPeriod * 1e-9;
             f.steps = rs.steps;
             for (int a = 0; a < 3; a++) { f.me[a] = v[a]; f.pressure[a] = v[3 + a]; f.friction[a] = v[6 + a]; }
         }
@@ -501,6 +527,8 @@ private:
     int64_t nCoarse_ = 0;
     uint64_t paramStride_ = 256;
     GpuModule module_;
+    WGPUQuerySet querySet_ = nullptr;
+    GpuBuffer resolve_;
     struct {
         Kernel init, bulk, wall, face, reduce1, reduce2, sample, clearRho;
     } k_;
