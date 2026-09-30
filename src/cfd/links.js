@@ -54,3 +54,31 @@ export function wallLinks(positions, tris, { origin, h, dims }, solid) {
   geometry.dispose();
   return { links, count };
 }
+
+/**
+ * For the v1 engine's wall records (flow.js buildFlowGrid): a ray caster over the part's triangles
+ * in the wind frame. cast(x, y, z, i) follows the link from cell (x, y, z) toward its solid
+ * neighbour at c - c_i and returns the link's fluid fraction q and the hit triangle's unit normal
+ * (lattice frame), or null when no surface lies on the link.
+ */
+export function wallRayCaster(positions, tris) {
+  return (plan) => {
+    const { origin, h } = plan;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(tris), 1));
+    const bvh = new MeshBVH(geometry, { indirect: true });
+    const ray = new THREE.Ray();
+    const dirs = CX.map((_, i) => new THREE.Vector3(-CX[i], -CY[i], -CZ[i]));
+    const lens = dirs.map((d) => d.length() * h);
+    for (const d of dirs) d.normalize();
+    return (x, y, z, i) => {
+      ray.origin.set(origin[0] + (x + 0.5) * h, origin[1] + (y + 0.5) * h, origin[2] + (z + 0.5) * h);
+      ray.direction.copy(dirs[i]);
+      const hit = bvh.raycastFirst(ray, THREE.DoubleSide, 0, lens[i]);
+      if (!hit) return null;
+      const n = hit.face.normal;
+      return { q: hit.distance / lens[i], normal: [n.x, n.y, n.z] };
+    };
+  };
+}
