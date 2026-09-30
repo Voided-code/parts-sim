@@ -41,6 +41,7 @@ public:
     void run();
     void stop();
     bool busy() const { return bool(job_); }
+    bool flowRunning() const { return sim_ && sim_->running(); }
     bool hasResults() const;
     void useAsLoad();
     /** Automation: set the grid size (cells). */
@@ -83,6 +84,7 @@ private:
     double cpMin_ = 0, cpMax_ = 0;
     double lastCp_ = -1e9, lastStream_ = -1e9, lastInfo_ = -1e9, clock_ = 0;
     int64_t shownSteps_ = -1;
+    const void* shownFields_ = nullptr;
 
     // particles in lattice coordinates, with a short trail each
     static constexpr int TRAIL = 12;
@@ -99,6 +101,12 @@ private:
     QLabel* pitchOut_;
     QDoubleSpinBox* speed_;
     QDoubleSpinBox* density_;
+    QCheckBox* groundChk_;
+    QWidget* groundRow_;
+    QDoubleSpinBox* clearance_;
+    QLabel* groundUnit_;
+    QComboBox* boundary_;
+    QCheckBox* autoStopChk_;
     QSlider* cellsSlider_ = nullptr;
     QLabel* cellsOut_ = nullptr;
     QLabel* cellsInfo_ = nullptr;
@@ -108,6 +116,7 @@ private:
     QPushButton* resetBtn_;
     QFrame* flowCard_;
     KpiGrid* kpis_;
+    QLabel* notes_;
     QLabel* state_;
     QFrame* displayCard_;
     QCheckBox* cpChk_;

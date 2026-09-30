@@ -129,6 +129,19 @@ void runScript(ps::MainWindow* w, QStringList steps) {
     else if (cmd == "view") w->viewer->setView(arg);
     else if (cmd == "level") w->structural->setLevelPublic(arg);
     else if (cmd == "wait") return next(arg.toInt());
+    else if (cmd == "airwait") {
+        // airwait:<seconds> - wait until the airflow stops by itself (converged) or the time is up
+        const double limit = arg.toDouble();
+        auto deadline = std::make_shared<QElapsedTimer>();
+        deadline->start();
+        auto poll = std::make_shared<std::function<void()>>();
+        *poll = [w, steps, limit, deadline, poll] {
+            if (w->airflow->flowRunning() && deadline->elapsed() < limit * 1000) return void(QTimer::singleShot(250, w, *poll));
+            runScript(w, steps);
+            *poll = nullptr;
+        };
+        return void(QTimer::singleShot(250, w, *poll));
+    }
     else if (cmd == "idle") {
         // wait until no solver job is running
         if (w->structural->job || w->thermal->job || w->airflow->busy() || w->busy->busy()) {

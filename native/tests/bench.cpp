@@ -1,6 +1,11 @@
 // Performance benchmark of the solver kernels at realistic sizes (not a test: run it by hand).
 //   bench [filter]   runs the cases whose name contains filter
+//   bench --json <file> kit [v0.6]   the benchmark kit's report (the v1 flow engine unless v0.6)
+//   bench --json <file> cases <folder> [ids] [engine=cpu] [scale=1] [margins=1] [wall=on|off] [maxft=10]
+//       the airflow validation cases exported by scripts/export-cases.mjs, run to converged forces
 #include <chrono>
+#include <fstream>
+#include <sstream>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,8 +14,12 @@
 #include <string>
 #include <vector>
 
+#include "cfd/airflow.hpp"
 #include "cfd/flow.hpp"
 #include "cfd/lbm.hpp"
+#include "cfd/stats.hpp"
+#include "core/importers.hpp"
+#include "core/mesh.hpp"
 #include "core/voxelize.hpp"
 #include "fea/eigen.hpp"
 #include "fea/explicit.hpp"
@@ -19,6 +28,7 @@
 #include "fea/voxel_fea.hpp"
 #include "gpu/gpu.hpp"
 #include "gpu/gpu_fea.hpp"
+#include "util/json.hpp"
 #include "util/parallel.hpp"
 
 using namespace ps;
@@ -441,7 +451,198 @@ static std::string kitReportV1(std::string& log) {
     return j.obj();
 }
 
+// ---------- airflow validation cases (src/cfd/flowcase.js runCase) ----------
+
+struct CaseOptions {
+    bool cpu = false;
+    double scale = 1, margins = 1, maxFlowThroughs = 10, tol = 0.02;
+    int wall = -1;  // -1: the app's choice (turbulent from Re 5e5 along the part)
+    bool half = true;  // GPU: 16-bit populations
+};
+
+static std::string runFlowCase(const json::Value& c, const std::string& dir, const std::string& mesh, double alpha, const CaseOptions& o, double* clOut) {
+    constexpr double TO_M = 0.001;  // the cases are in millimetres
+    const auto t0 = Clock::now();
+    std::ifstream in(dir + "/" + mesh, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + mesh);
+    const Bytes bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    MeshSource src = readSTL(bytes);
+    src.name = c["id"].string();
+    const auto part = buildPart(src);
+    const double across = c["across"].number() * o.scale;
+    const double lref = c["lref"].number(), aref = c["aref"].number(), speed = c["speed"].number();
+    TunnelOptions to;
+    to.h = lref / TO_M / across;
+    const auto& tn = c["tunnel"];
+    if (tn.has("ground")) to.ground = tn["ground"].number();
+    to.periodicSpan = tn.has("periodicSpan") && tn["periodicSpan"].b;
+    to.spanCells = c["spanCells"].integer(8) > 0 ? c["spanCells"].integer(8) : 8;
+    if (tn.has("margins")) {
+        const auto& m = tn["margins"];
+        to.margins.up = m["up"].number(to.margins.up);
+        to.margins.down = m["down"].number(to.margins.down);
+        to.margins.side = m["side"].number(to.margins.side);
+        to.margins.ofLength = m.has("ofLength") && m["ofLength"].b;
+    }
+    to.margins.up *= o.margins;
+    to.margins.down *= o.margins;
+    to.margins.side *= o.margins;
+    const TunnelPlan plan = planTunnel(*part, {1, 0, 0}, 0, to);
+    const flow::Grid grid = flow::buildGrid(plan.spec(), plan.q, part->tris);
+    const auto& dims = plan.dims;
+    const double hm = plan.h * TO_M, nu = airNu(1.225);
+    const double reynolds = speed * lref / nu, reynoldsLength = speed * plan.L[0] * TO_M / nu;
+    const double nuReal = nu * AIR_U_LAT / (speed * hm);
+    flow::Params p;
+    p.uLat = AIR_U_LAT;
+    p.nuLat = std::max(nuReal, V1_NU_FLOOR);
+    p.wallModel = o.wall >= 0 ? o.wall == 1 : reynoldsLength >= TURBULENT_RE;
+    p.half = o.half;
+    const bool gpu = !o.cpu && gpuAvailable();
+    auto sim = gpu ? flow::makeGpu(grid, p) : flow::makeCpu(grid, p);
+    // BENCH_DUMP=<file>: the averaged view fields at the end (dims, factor, [rho - 1, u] per coarse cell)
+    const char* dump = std::getenv("BENCH_DUMP");
+    sim->sampleEvery = dump ? 20 : 0;
+    const double setup = since(t0);
+    const double flowThrough = dims[0] / AIR_U_LAT;
+    const int64_t dev = flow::RAMP_STEPS + std::llround(1.5 * flowThrough);
+    const int every = std::max(50, int(std::lround(flowThrough / 40)));
+    const int64_t minAvg = std::llround(2 * flowThrough), maxSteps = std::llround(o.maxFlowThroughs * flowThrough);
+    // cells^2 -> coefficient (per span for the periodic sections)
+    const double toC = hm * hm * (plan.periodicSpan ? 1 / (dims[2] * hm) : 1) / aref;
+    std::vector<double> sx, sy, px, fx;
+    const auto tRun = Clock::now();
+    bool failed = false;
+    while (sim->steps < maxSteps) {
+        const int n = sim->steps < dev ? int(std::min<int64_t>(dev - sim->steps, std::getenv("BENCH_TRACE") ? every : 2000)) : every;
+        sim->step(n);
+        const auto f = sim->takeForces();
+        if (sim->steps < dev && std::getenv("BENCH_TRACE")) std::printf("    step %lld: Cd %.4f Cl %.4f\n", (long long)sim->steps, f.me[0] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC, f.me[1] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC);
+        if (sim->steps < dev) continue;
+        if (dump && sx.empty()) sim->resetAverages();
+        if (std::getenv("BENCH_TRACE")) std::printf("    step %lld: Cd %.4f Cl %.4f\n", (long long)sim->steps, f.me[0] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC, f.me[1] * 2 / (AIR_U_LAT * AIR_U_LAT * f.steps) * toC);
+        const double k = 1 / (0.5 * AIR_U_LAT * AIR_U_LAT * double(f.steps));
+        if (!std::isfinite(f.me[0] + f.me[1] + f.me[2])) { failed = true; break; }
+        sx.push_back(f.me[0] * k);
+        sy.push_back(f.me[1] * k);
+        px.push_back(f.pressure[0] * k);
+        fx.push_back(f.friction[0] * k);
+        if (sim->steps - dev >= minAvg && sx.size() >= 16) {
+            // settled: the drag and lift coefficients' 95% intervals within tol of their values (or
+            // 0.004 and 0.01 for small ones), and the halves agreeing as well
+            bool ok = true;
+            for (auto [xs, floor] : {std::pair<const std::vector<double>*, double>{&sx, 0.004}, {&sy, 0.01}}) {
+                const auto b = batchMeans(*xs);
+                const double band = std::max(o.tol * std::abs(b.mean * toC), floor);
+                ok = ok && b.ci * toC <= band && std::abs(b.drift * toC) <= std::max(b.ci * toC, band);
+            }
+            if (ok) break;
+        }
+    }
+    const double secs = since(tRun);
+    if (dump) {
+        const auto fl = sim->fields();
+        if (FILE* f = std::fopen(dump, "wb")) {
+            const int32_t hdr[4] = {fl.dims[0], fl.dims[1], fl.dims[2], fl.factor};
+            std::fwrite(hdr, 4, 4, f);
+            const auto& fd = std::getenv("BENCH_DUMP_INST") ? fl.inst : fl.avg;
+            std::fwrite(fd.data(), 4, fd.size(), f);
+            std::fclose(f);
+        }
+    }
+    const double q = 0.5 * 1.225 * speed * speed;
+    const double kN = q * hm * hm / (plan.periodicSpan ? dims[2] * hm : 1);  // cells^2 -> N (per metre of span)
+    const auto bx = batchMeans(sx), by = batchMeans(sy), bf = batchMeans(fx), bp = batchMeans(px);
+    Json j;
+    j.str("id", c["id"].string()).num("alpha", alpha).str("engine", sim->name + (gpu ? " (GPU)" : " (CPU)"));
+    j.raw("dims", "[" + std::to_string(dims[0]) + "," + std::to_string(dims[1]) + "," + std::to_string(dims[2]) + "]");
+    j.num("cells", double(grid.N)).num("across", across).num("h_mm", plan.h).num("records", double(grid.rec.count));
+    j.num("reynolds", reynolds).num("reynoldsLength", reynoldsLength).num("wallModel", p.wallModel).num("nuLat", p.nuLat);
+    j.num("simReynolds", AIR_U_LAT * (lref / hm) / p.nuLat).num("marginScale", o.margins);
+    j.num("setupSeconds", setup).num("seconds", secs).num("steps", double(sim->steps)).num("flowThroughs", sim->steps / flowThrough);
+    j.num("mlups", double(grid.N) * sim->steps / secs / 1e6).num("samples", double(sx.size()));
+    j.num("converged", !failed && sim->steps < maxSteps);
+    if (failed) j.str("error", "unstable (the forces are no longer finite)");
+    j.num("drag", bx.mean * kN).num("lift", by.mean * kN).num("dragCI", bx.ci * kN).num("liftCI", by.ci * kN);
+    j.num("cd", bx.mean * toC).num("cl", by.mean * toC).num("cdCI", bx.ci * toC).num("clCI", by.ci * toC);
+    j.num("frictionDrag", bf.mean * kN).num("pressureDrag", (bx.mean - bf.mean) * kN).num("pressureIntegralDrag", bp.mean * kN);
+    if (c["friction"].b) {
+        const auto& ref = c["ref"];
+        const double cfRef = ref.has("cfLaminar") ? 1.328 / std::sqrt(reynolds) : 0.455 / std::pow(std::log10(reynolds), 2.58);
+        j.num("cf", bf.mean * toC).num("cfReference", cfRef);
+    }
+    if (clOut) *clOut = by.mean * toC;
+    std::printf("  %-16s %s%5.0f cells across, %d x %d x %d, %.1f flow-throughs in %.0f s: Cd %.4f ± %.4f, Cl %.4f ± %.4f%s\n", c["id"].string().c_str(),
+                std::isfinite(alpha) ? ("α " + std::to_string(int(alpha)) + "°, ").c_str() : "", across, dims[0], dims[1], dims[2], sim->steps / flowThrough, secs,
+                bx.mean * toC, bx.ci * toC, by.mean * toC, by.ci * toC, failed ? " UNSTABLE" : "");
+    std::fflush(stdout);
+    return j.obj();
+}
+
+static int runCases(const std::string& out, int argc, char** argv) {
+    const std::string dir = argv[4];
+    std::ifstream in(dir + "/cases.json");
+    if (!in) { std::fprintf(stderr, "No cases.json in %s (node scripts/export-cases.mjs)\n", dir.c_str()); return 1; }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const auto doc = json::parse(ss.str());
+    CaseOptions o;
+    std::vector<std::string> ids;
+    for (int i = 5; i < argc; i++) {
+        const std::string a = argv[i];
+        const auto eq = a.find('=');
+        if (eq == std::string::npos) {
+            std::stringstream is(a);
+            for (std::string id; std::getline(is, id, ',');) ids.push_back(id);
+            continue;
+        }
+        const std::string k = a.substr(0, eq), v = a.substr(eq + 1);
+        if (k == "engine") o.cpu = v == "cpu";
+        else if (k == "scale") o.scale = std::stod(v);
+        else if (k == "margins") o.margins = std::stod(v);
+        else if (k == "wall") o.wall = v == "on" ? 1 : v == "off" ? 0 : -1;
+        else if (k == "maxft") o.maxFlowThroughs = std::stod(v);
+        else if (k == "tol") o.tol = std::stod(v);
+        else if (k == "half") o.half = v != "0";
+    }
+    std::printf("%s, %u threads\n", gpuAvailable() && !o.cpu ? gpuName().c_str() : "CPU", ThreadPool::instance().size());
+    std::string runs = "[";
+    for (const auto& c : doc["cases"].arr) {
+        if (!ids.empty() && std::find(ids.begin(), ids.end(), c["id"].string()) == ids.end()) continue;
+        try {
+            if (c["alphas"].type == json::Value::Array) {
+                std::vector<double> as, cls;
+                for (const auto& a : c["alphas"].arr) {
+                    double cl = 0;
+                    runs += (runs.size() > 1 ? "," : "") + runFlowCase(c, dir, c["meshes"][std::to_string(int(a.num))].string(), a.num, o, &cl);
+                    as.push_back(a.num);
+                    cls.push_back(cl);
+                }
+                // least-squares lift slope per degree
+                double ma = 0, mc = 0, num = 0, den = 0;
+                for (size_t i = 0; i < as.size(); i++) { ma += as[i] / as.size(); mc += cls[i] / as.size(); }
+                for (size_t i = 0; i < as.size(); i++) { num += (as[i] - ma) * (cls[i] - mc); den += (as[i] - ma) * (as[i] - ma); }
+                std::printf("  %-16s lift slope %.4f per degree\n", c["id"].string().c_str(), num / den);
+                runs += "," + Json().str("id", c["id"].string()).num("clSlope", num / den).obj();
+            } else runs += (runs.size() > 1 ? "," : "") + runFlowCase(c, dir, c["meshes"]["default"].string(), NAN, o, nullptr);
+        } catch (const std::exception& e) {
+            std::printf("  %-16s failed: %s\n", c["id"].string().c_str(), e.what());
+            runs += (runs.size() > 1 ? "," : "") + Json().str("id", c["id"].string()).str("error", e.what()).obj();
+        }
+        // keep what has run so far
+        Json j;
+        j.str("format", "parts-sim-native-cases/1").str("gpu", gpuAvailable() ? gpuName() : "none").raw("runs", runs + "]");
+        if (FILE* f = std::fopen(out.c_str(), "wb")) {
+            const std::string s = j.obj();
+            std::fwrite(s.data(), 1, s.size(), f);
+            std::fclose(f);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 4 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "cases") return runCases(argv[2], argc, argv);
     // bench --json <file> kit [v0.6|v1]: the benchmark kit's report (the v1 engine by default)
     if (argc > 3 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "kit") {
         std::string log;

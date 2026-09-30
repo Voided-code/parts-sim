@@ -61,10 +61,18 @@ TEST("wall records measure the true wall position along lattice links") {
     CHECK_NEAR((g.rec.q[18 * r + 1] - 1) / 254.0, 0.8, 0.01);
     CHECK_NEAR(g.rec.normal[3 * r], -1.0, 1e-6);
     CHECK_NEAR(g.rec.dist[r], 0.8, 0.01);
-    // the surface areas add up to the box's (4 x 4 x 6)
-    double area = 0;
-    for (int64_t i = 0; i < g.rec.count; i++) area += std::sqrt(std::pow(g.rec.area[3 * i], 2) + std::pow(g.rec.area[3 * i + 1], 2) + std::pow(g.rec.area[3 * i + 2], 2));
-    CHECK_NEAR(area, 96.0, 0.5);
+    // the surface areas add up to the box's faces (4 x 4 each), shared among the records along them
+    double out[3] = {0, 0, 0}, in[3] = {0, 0, 0};
+    int holding = 0;
+    for (int64_t i = 0; i < g.rec.count; i++) {
+        for (int a = 0; a < 3; a++) (g.rec.area[3 * i + a] > 0 ? out : in)[a] += g.rec.area[3 * i + a];
+        holding += g.rec.area[3 * i] != 0 || g.rec.area[3 * i + 1] != 0 || g.rec.area[3 * i + 2] != 0;
+    }
+    for (int a = 0; a < 3; a++) {
+        CHECK_NEAR(out[a], 16.0, 0.3);
+        CHECK_NEAR(in[a], -16.0, 0.3);
+    }
+    CHECK(holding > 60);  // not one record per triangle
 }
 
 TEST("a plate with no cell inside it still blocks the flow (thin-wall links)") {
@@ -122,6 +130,55 @@ TEST("GPU flow engine matches the CPU engine (walls, wall model, faces)") {
         CHECK(a.steps == 300 && b.steps == 300);
         CHECK_NEAR(b.me[0], a.me[0], 1e-4 * std::abs(a.me[0]));
         CHECK_NEAR(h.me[0], a.me[0], 2e-3 * std::abs(a.me[0]));
+    }
+}
+
+TEST("GPU flow engine matches the CPU engine over a moving ground") {
+    if (!gpuAvailable()) {
+        std::printf("    (skipped: no GPU)\n");
+        return;
+    }
+    // a slab 3 cells above the road (part walls without the wall model there) and one 9 cells above
+    std::vector<float> P;
+    std::vector<uint32_t> T;
+    box(P, T, 12, 40, 4.2, 8.2, 6, 18);
+    box(P, T, 12, 40, 10.2, 13.2, 6, 18);
+    GridSpec sp = spec({64, 22, 24}, {12, 4.2, 6}, {40, 13.2, 18});
+    sp.ground = true;
+    const Grid g = buildGrid(sp, P, T);
+    Params p;
+    p.nuLat = 1e-5;
+    p.half = false;
+    auto cpu = makeCpu(g, p);
+    auto gpu = makeGpu(g, p);
+    for (int k = 0; k < 4; k++) {
+        cpu->step(100);
+        gpu->step(100);
+        const auto a = cpu->takeForces(), b = gpu->takeForces();
+        std::printf("    step %d: lift CPU %.6f, GPU %.6f; drag CPU %.6f, GPU %.6f\n", 100 * (k + 1), a.me[1], b.me[1], a.me[0], b.me[0]);
+        CHECK_NEAR(b.me[1], a.me[1], 1e-4 * std::abs(a.me[1]) + 1e-4);
+        CHECK_NEAR(b.me[0], a.me[0], 1e-4 * std::abs(a.me[0]) + 1e-4);
+    }
+}
+
+TEST("a ground moving with the wind leaves the free stream undisturbed") {
+    GridSpec sp = spec({64, 20, 12}, {30, 8, 5}, {31, 9, 6});
+    sp.ground = true;
+    const Grid g = buildGrid(sp, {}, {});
+    for (double nu : {0.01, 3e-6})
+    for (bool gpu : {false, true}) {
+        if (gpu && !gpuAvailable()) continue;
+        Params p;
+        p.nuLat = nu;
+        p.wallModel = false;
+        auto sim = gpu ? makeGpu(g, p) : makeCpu(g, p);
+        sim->sampleEvery = 1;
+        sim->step(3000);
+        const auto f = sim->fields();
+        std::printf("    %s, nu %g: ux/U up from the ground at x = 48:", gpu ? "GPU" : "CPU", nu);
+        for (int y = 2; y < 19; y++) std::printf(" %.3f", f.inst[4 * (48 + 64 * (y + 20 * 6)) + 1] / 0.08);
+        std::printf("\n");
+        for (int y = 2; y < 19; y++) CHECK_NEAR(f.inst[4 * (48 + 64 * (y + 20 * 6)) + 1] / 0.08, 1.0, 0.03);
     }
 }
 

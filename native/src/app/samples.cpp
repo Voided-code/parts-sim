@@ -301,7 +301,7 @@ const std::vector<Sample>& samples() {
         s.push_back({"ahmed", "Ahmed body (car)", "Standard car aerodynamics benchmark: rounded nose, 25° rear slant", ahmedBody, [](const Part& p) {
                          SampleSetup st;
                          st.material = "al-6061";
-                         st.airflow = SampleSetup::Air{90, 0, 40};
+                         st.airflow = SampleSetup::Air{90, 0, 40, 50};
                          st.fixtures.push_back({"Underside", {where(p, [](const double* c, const float* n, const BBox& b) { return c[1] < b.min[1] + EPS && n[1] < -0.9; })}});
                          return st;
                      }});

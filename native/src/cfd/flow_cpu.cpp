@@ -18,7 +18,6 @@ void bulkRun(float* __restrict F, int64_t N, int64_t c0, int64_t c1, const int64
 namespace {
 
 constexpr double CS2 = 1.0 / 3.0;
-constexpr double SLIP_FILTER = 0.05;  // the wall model's time filter (flow-cpu.js SLIP_FILTER)
 
 void equilibrium(double* g, double rho, double ux, double uy, double uz, bool rr) {
     const double usq = 1.5 * (ux * ux + uy * uy + uz * uz);
@@ -109,7 +108,6 @@ public:
         aux_.resize(19 * size_t(n));
         bb_.resize(19 * size_t(n));
         acc_.resize(4 * size_t(n));
-        slip_.resize(3 * size_t(n));
         rhoSum_.resize(size_t(n));
         // neighbour offsets per layer: z = 0, inside, z = nz - 1 (the span wraps when periodic)
         for (int l = 0; l < 3; l++) {
@@ -159,7 +157,6 @@ public:
         for (int64_t r = 0; r < rec_.count; r++)
             for (int k = 0; k < 19; k++) { aux_[19 * r + k] = float(W[k]); bb_[19 * r + k] = float(W[k]); }
         std::fill(acc_.begin(), acc_.end(), 0.0);
-        std::fill(slip_.begin(), slip_.end(), 0.0f);
         std::fill(rhoSum_.begin(), rhoSum_.end(), 0.0);
         steps = 0;
         accSteps_ = rhoSteps_ = 0;
@@ -308,7 +305,6 @@ private:
             const uint32_t mask = rec_.mask[r], gm = rec_.groundMask[r];
             const int z = int(n / (int64_t(nx_) * ny_));
             neighbours(n, z, nb);
-            if (wallModel_ && rec_.samp[r] && modelCell(r, n, z, nb)) continue;
             load(n, nb, f);
             // bounce-back: the cell's own outgoing populations toward its walls from the last step
             for (int k = 1; k < 19; k++)
@@ -326,11 +322,22 @@ private:
                 }
                 f[k] = fk;
             }
-            // momentum to the part: what left toward it minus what came back, c_opp = -c_k
+            // the wall model on the part when it is on, and always on the moving ground (plain
+            // bounce-back from a belt moving with the air leaves grid-scale waves undamped); the cell
+            // keeps its own density (what streamed in, with the walls' bounce-back)
+            if (rec_.samp[r] && (wallModel_ || rec_.onBelt[r])) {
+                double rho1 = 0;
+                for (int k = 0; k < 19; k++) rho1 += f[k];
+                if (modelCell(r, n, z, nb, rho1)) continue;
+            }
+            // momentum to the part: what left toward it minus what came back, c_opp = -c_k, less the
+            // air at rest's (the reference pressure, as the wall model's surface integral has it: a
+            // part with both kinds of wall cell must not feel the ambient pressure on one side only)
             double mx = 0, my = 0, mz = 0;
             for (int k = 1; k < 19; k++) {
                 if (!(mask & (1u << k)) || (gm & (1u << k))) continue;
-                mx -= CX[k] * (fb[k] + f[k]); my -= CY[k] * (fb[k] + f[k]); mz -= CZ[k] * (fb[k] + f[k]);
+                const double e = fb[k] + f[k] - 2 * W[k];
+                mx -= CX[k] * e; my -= CY[k] * e; mz -= CZ[k] * e;
             }
             collide(f, g, out, tau0_, smag_, rr_, 0);
             store(n, nb, g);
@@ -344,22 +351,20 @@ private:
     }
 
     // wall model (flow-cpu.js wallModelCell)
-    bool modelCell(int64_t r, int64_t n, int z, const int64_t* nb) {
+    bool modelCell(int64_t r, int64_t n, int z, const int64_t* nb, double rho1) {
         const int j = rec_.samp[r];
         const int zm = periodic_ ? (z + CZ[j] + nz_) % nz_ : z + CZ[j];
         const int64_t m = nb[j];
         const auto mo = storedMoments(m, zm);
         const double rho2 = mo[0];
-        if (!(rho2 > 0)) return false;
+        if (!(rho2 > 0) || !(rho1 > 0)) return false;
         const double wx = rec_.onBelt[r] ? uBelt_ : 0;
         const double nx = rec_.normal[3 * r], ny = rec_.normal[3 * r + 1], nz = rec_.normal[3 * r + 2];
         const double ux = mo[1] / rho2 - wx, uy = mo[2] / rho2, uz = mo[3] / rho2;
+        // the sample's velocity along the wall (not filtered in time: a delayed wall law lets the two
+        // walls of a narrow gap drive each other into growing oscillations)
         const double un2 = ux * nx + uy * ny + uz * nz;
-        float* sl = &slip_[3 * r];
-        sl[0] += float(SLIP_FILTER * (ux - un2 * nx - sl[0]));
-        sl[1] += float(SLIP_FILTER * (uy - un2 * ny - sl[1]));
-        sl[2] += float(SLIP_FILTER * (uz - un2 * nz - sl[2]));
-        const double tx = sl[0], ty = sl[1], tz = sl[2];
+        const double tx = ux - un2 * nx, ty = uy - un2 * ny, tz = uz - un2 * nz;
         const double ut2 = std::sqrt(tx * tx + ty * ty + tz * tz);
         const double y1 = rec_.dist[r], y2 = rec_.y2[r];
         double utau = 0, ut1 = 0, dudn = 0, tauN = 0.5 + 3 * nu0_, ex = 0, ey = 0, ez = 0;
@@ -371,11 +376,12 @@ private:
             tauN = 0.5 + 3 * nu0_ / r1[1];
             ex = tx / ut2; ey = ty / ut2; ez = tz / ut2;
         }
-        const double un1 = un2 * y1 / y2;
-        const double c = -rho2 * tauN * dudn / 3;
+        // the cell's velocity from the law of the wall, along the wall only (a velocity toward the wall
+        // pumps pressure waves in narrow gaps), with the cell's own density (the model makes no mass)
+        const double c = -rho1 * tauN * dudn / 3;
         const double pi[6] = {2 * c * ex * nx, 2 * c * ey * ny, 2 * c * ez * nz, c * (ex * ny + ey * nx), c * (ex * nz + ez * nx), c * (ey * nz + ez * ny)};
         double g[19];
-        regularized(g, rho2, wx + ut1 * ex + un1 * nx, ut1 * ey + un1 * ny, ut1 * ez + un1 * nz, pi, 1 - 1 / tauN, rr_);
+        regularized(g, rho1, wx + ut1 * ex, ut1 * ey, ut1 * ez, pi, 1 - 1 / tauN, rr_);
         store(n, nb, g);
         const uint32_t mask = rec_.mask[r];
         for (int k = 1; k < 19; k++) {
@@ -462,7 +468,7 @@ private:
     bool periodic_ = false, rr_ = true, wallModel_ = true, belt_ = true;
     double uLat_ = 0.08, nu0_ = 1e-5, tau0_ = 0.5, smag_ = 0, uin_ = 0, uBelt_ = 0;
     int odd_ = 0;
-    std::vector<float> F_, aux_, bb_, slip_;
+    std::vector<float> F_, aux_, bb_;
     std::vector<double> acc_, rhoSum_, avg_;
     int64_t off_[3][19];
     std::vector<std::pair<int, int>> runs_;

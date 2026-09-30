@@ -111,6 +111,44 @@ export function planTunnel(part, dir, cells, opts = {}) {
   return { basis, q, min, max, L, up, dims, h, origin, ground, periodicSpan: span };
 }
 
+/**
+ * Area of the part's shadow along the wind (model units^2): its triangles projected on the plane across
+ * the wind, filled into a bitmap of up to 1024 pixels along the part's larger side (thin plates too).
+ */
+export function frontalArea(plan, tris) {
+  const { q, min, L } = plan;
+  if (!(L[1] > 0) || !(L[2] > 0)) return 0;
+  const px = Math.max(L[1], L[2]) / 1024;
+  const W = Math.max(1, Math.ceil(L[1] / px)), H = Math.max(1, Math.ceil(L[2] / px));
+  const hit = new Uint8Array(W * H);
+  const y = [0, 0, 0], z = [0, 0, 0];
+  for (let t = 0; t < tris.length; t += 3) {
+    for (let k = 0; k < 3; k++) {
+      y[k] = (q[3 * tris[t + k] + 1] - min[1]) / px;
+      z[k] = (q[3 * tris[t + k] + 2] - min[2]) / px;
+    }
+    const area2 = (y[1] - y[0]) * (z[2] - z[0]) - (y[2] - y[0]) * (z[1] - z[0]);
+    if (Math.abs(area2) < 1e-12) continue;
+    const s = area2 > 0 ? 1 : -1;
+    const i0 = Math.max(0, Math.floor(Math.min(...y))), i1 = Math.min(W - 1, Math.ceil(Math.max(...y)));
+    const j0 = Math.max(0, Math.floor(Math.min(...z))), j1 = Math.min(H - 1, Math.ceil(Math.max(...z)));
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        const cy = i + 0.5, cz = j + 0.5;
+        let inside = true;
+        for (let e = 0; e < 3 && inside; e++) {
+          const a = e, b = (e + 1) % 3;
+          inside = s * ((y[b] - y[a]) * (cz - z[a]) - (cy - y[a]) * (z[b] - z[a])) >= 0;
+        }
+        if (inside) hit[i + W * j] = 1;
+      }
+    }
+  }
+  let n = 0;
+  for (const v of hit) n += v;
+  return n * px * px;
+}
+
 /** Direction the air travels. yaw 0 = toward -Z (hits the +Z face), 90 = toward +X; pitch > 0 tilts upward. */
 export function windDirection(yawDeg, pitchDeg) {
   const y = THREE.MathUtils.degToRad(yawDeg), p = THREE.MathUtils.degToRad(pitchDeg);
@@ -204,7 +242,7 @@ export class AirflowStudy {
     const bl = o.boundaryLayer || 'auto';
     this.wallModel = bl === 'turbulent' || (bl === 'auto' && this.reynoldsLength >= TURBULENT_RE);
     this.q = 0.5 * o.airDensity * o.speed * o.speed;
-    this.frontal = this.frontalCells(grid);
+    this.frontal = frontalArea(plan, part.tris) / (h * h);
 
     const M = new THREE.Matrix4().makeBasis(basis[0], basis[1], basis[2])
       .multiply(new THREE.Matrix4().makeTranslation(origin[0], origin[1], origin[2]))
@@ -229,22 +267,6 @@ export class AirflowStudy {
     this.onUpdate();
   }
 
-  /** Projected area of the part along the wind, in cells (its solid and wall-link shadow on the y-z plane). */
-  frontalCells(grid) {
-    const [nx, ny, nz] = grid.dims;
-    const shadow = new Uint8Array(ny * nz);
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        const row = nx * (y + ny * z);
-        for (let x = 0; x < nx; x++) {
-          if (grid.kind[row + x] === SOLID && !(grid.ground && y === 0)) { shadow[y + ny * z] = 1; break; }
-        }
-      }
-    }
-    let s = 0;
-    for (const v of shadow) s += v;
-    return s;
-  }
 
   /** For each part vertex, the wall record next to it (for the surface pressure), or -1. */
   mapVertices(part, grid) {

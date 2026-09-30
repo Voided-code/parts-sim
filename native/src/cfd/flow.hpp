@@ -16,6 +16,7 @@ namespace ps::flow {
 
 constexpr uint8_t BULK = 0, WALL = 1, SOLID = 2, FACE = 3;
 constexpr int RAMP_STEPS = 400;
+constexpr int MODEL_CLEAR = 3;  // cells of fluid the wall model needs along its sample direction on the part
 extern const double W[19];
 extern const int CX[19], CY[19], CZ[19], OPP[19];
 /** 13.5 x (H_xxy + H_yzz, H_xzz + H_xyy, H_yyz + H_xxz) and 4.5 x their differences, per direction. */

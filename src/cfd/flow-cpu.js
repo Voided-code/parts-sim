@@ -286,7 +286,7 @@ export function regularized(g, rho, ux, uy, uz, pi, k, rr) {
  * on the part is the pressure on the surface next to it plus that shear. Returns false when the
  * sample is unusable (the cell keeps plain bounce-back).
  */
-function wallModelCell(s, t, r, n, x, y, z) {
+function wallModelCell(s, t, r, n, x, y, z, rho1) {
   const { rec, nx, ny, nz, nu0, odd, rr, uBelt, acc } = s;
   const j = rec.samp[r];
   const xm = x + CX[j], ym = y + CY[j], zm = s.periodicZ ? (z + CZ[j] + nz) % nz : z + CZ[j];
@@ -300,18 +300,14 @@ function wallModelCell(s, t, r, n, x, y, z) {
     const v = src[storedIndex(s, m, nbm, i, odd)];
     rho2 += v; jx += CX[i] * v; jy += CY[i] * v; jz += CZ[i] * v;
   }
-  if (!(rho2 > 0)) return false;
+  if (!(rho2 > 0) || !(rho1 > 0)) return false;
   const wx = rec.onBelt[r] ? uBelt : 0;
   const nxv = rec.normal[3 * r], nyv = rec.normal[3 * r + 1], nzv = rec.normal[3 * r + 2];
   const ux = jx / rho2 - wx, uy = jy / rho2, uz = jz / rho2;
+  // the sample's velocity along the wall (not filtered in time: a delayed wall law lets the two walls
+  // of a narrow gap drive each other into growing oscillations)
   const un2 = ux * nxv + uy * nyv + uz * nzv;
-  // the tangential velocity, low-passed in time (a wall that followed each step's sample would feed
-  // the odd-even oscillation of the near-wall cells)
-  const sl = s.slip, a = SLIP_FILTER;
-  sl[3 * r] += a * (ux - un2 * nxv - sl[3 * r]);
-  sl[3 * r + 1] += a * (uy - un2 * nyv - sl[3 * r + 1]);
-  sl[3 * r + 2] += a * (uz - un2 * nzv - sl[3 * r + 2]);
-  const tx = sl[3 * r], ty = sl[3 * r + 1], tz = sl[3 * r + 2];
+  const tx = ux - un2 * nxv, ty = uy - un2 * nyv, tz = uz - un2 * nzv;
   const ut2 = Math.hypot(tx, ty, tz);
   const y1 = rec.dist[r], y2 = rec.y2[r];
   let utau = 0, ut1 = 0, dudn = 0, tauN = 0.5 + 3 * nu0;
@@ -323,16 +319,16 @@ function wallModelCell(s, t, r, n, x, y, z) {
     tauN = 0.5 + (3 * nu0) / dup1;
   }
   const ex = ut2 > 1e-12 ? tx / ut2 : 0, ey = ut2 > 1e-12 ? ty / ut2 : 0, ez = ut2 > 1e-12 ? tz / ut2 : 0;
-  // velocity at the wall cell: the law's tangential speed, the normal speed linear to the wall
-  const un1 = (un2 * y1) / y2;
-  const u1x = wx + ut1 * ex + un1 * nxv, u1y = ut1 * ey + un1 * nyv, u1z = ut1 * ez + un1 * nzv;
+  // velocity at the wall cell: the law's, along the wall only (a velocity toward the wall pumps
+  // pressure waves in narrow gaps); the cell keeps its own density (the model makes no mass)
+  const u1x = wx + ut1 * ex, u1y = ut1 * ey, u1z = ut1 * ez;
   // non-equilibrium stress of the shear du_t/dn: Pi = -rho tau / 3 * du/dn (t n + n t)
-  const c = (-rho2 * tauN * dudn) / 3;
+  const c = (-rho1 * tauN * dudn) / 3;
   const pi = t.pi || (t.pi = new Float64Array(6));
   pi[0] = 2 * c * ex * nxv; pi[1] = 2 * c * ey * nyv; pi[2] = 2 * c * ez * nzv;
   pi[3] = c * (ex * nyv + ey * nxv); pi[4] = c * (ex * nzv + ez * nxv); pi[5] = c * (ey * nzv + ez * nyv);
   const { g, nb } = t;
-  regularized(g, rho2, u1x, u1y, u1z, pi, 1 - 1 / tauN, rr);
+  regularized(g, rho1, u1x, u1y, u1z, pi, 1 - 1 / tauN, rr);
   neighbours(s, x, y, z, nb);
   store(s, n, nb, g, odd);
   const mask = rec.mask[r];
@@ -366,7 +362,6 @@ export function wallCells(s, t, r0, r1) {
     load(s, n, nb, f, odd);
     // incoming populations from solid cells, and the momentum they exchange with the part
     let mx = 0, my = 0, mz = 0;
-    if (wallModel && s.wallMode === 'model' && rec.samp[r] && wallModelCell(s, t, r, n, x, y, z)) continue;
     // bounce-back: the cell's own outgoing populations toward its walls from the last step, kept in
     // its record (a thin wall's other side is fluid, so the slots across it are not free to read)
     for (let k = 1; k < 19; k++) if (mask & (1 << k)) fb[k] = s.bb[19 * r + k];
@@ -390,6 +385,14 @@ export function wallCells(s, t, r0, r1) {
         }
       }
       f[k] = fk;
+    }
+    // the wall model on the part when it is on, and always on the moving ground: plain bounce-back
+    // from a belt moving with the air leaves grid-scale waves undamped at low viscosity. The cell keeps
+    // its own density (what streamed in, with the walls' bounce-back).
+    if (rec.samp[r] && ((wallModel && s.wallMode === 'model') || rec.onBelt[r])) {
+      let rho1 = 0;
+      for (let i = 0; i < 19; i++) rho1 += f[i];
+      if (wallModelCell(s, t, r, n, x, y, z, rho1)) continue;
     }
     // slip wall model: the wall moves along the near-wall flow at the speed that makes the wall
     // shear stress the log law's rho u_tau^2 at this cell's distance from the wall, given the cell's
@@ -426,18 +429,21 @@ export function wallCells(s, t, r0, r1) {
       s.tauWall[r] = us_(wx, wy, wz);
     }
     // momentum to the part (Galilean invariant for a moving wall, Wen et al. 2014): what left toward
-    // it minus what came back, relative to the wall, with c_opp = -c_k
+    // it minus what came back, relative to the wall, with c_opp = -c_k; less the air at rest's (the
+    // reference pressure, as the wall model's surface integral has it: a part with both kinds of wall
+    // cell must not feel the ambient pressure on one side only)
     for (let k = 1; k < 19; k++) {
       if (!(mask & (1 << k)) || gm & (1 << k)) continue;
-      const v = fb[k], fk = f[k];
-      mx -= CX[k] * (v + fk) + wx * (v - fk);
-      my -= CY[k] * (v + fk) + wy * (v - fk);
-      mz -= CZ[k] * (v + fk) + wz * (v - fk);
+      const v = fb[k], fk = f[k], e = v + fk - 2 * W[k];
+      mx -= CX[k] * e + wx * (v - fk);
+      my -= CY[k] * e + wy * (v - fk);
+      mz -= CZ[k] * e + wz * (v - fk);
     }
     // older variants, kept to compare: the log-law eddy viscosity sets the wall cell's relaxation
-    // ('replace', unstable at high Reynolds numbers), or bounds it from below ('max')
+    // ('replace', unstable at high Reynolds numbers), or bounds it from below ('max'); with 'model' the
+    // cells it leaves out (narrow gaps) keep plain bounce-back
     let tauMin = 0, tauWall = 0;
-    if (wallModel && s.wallMode !== 'slip') {
+    if (wallModel && (s.wallMode === 'replace' || s.wallMode === 'max')) {
       let rho = 0, jx = 0, jy = 0, jz = 0;
       for (let i = 0; i < 19; i++) { rho += f[i]; jx += CX[i] * f[i]; jy += CY[i] * f[i]; jz += CZ[i] * f[i]; }
       const nrm = rec.normal, d = rec.dist[r];

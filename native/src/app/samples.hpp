@@ -15,7 +15,7 @@ struct SampleSetup {
     std::vector<Fixture> fixtures;
     std::vector<Load> loads;
     std::string material;
-    struct Air { double yaw, pitch, speed; };
+    struct Air { double yaw, pitch, speed, ground = -1; };  // ground: clearance to a moving road (model units), < 0 free air
     std::optional<Air> airflow;
 };
 

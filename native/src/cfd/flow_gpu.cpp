@@ -81,7 +81,7 @@ WGPUStringView sv(const char* s) { return WGPUStringView{s, std::strlen(s)}; }
 
 class FlowGpu : public Solver {
 public:
-    FlowGpu(const Grid& g, const Params& p) : ctx_(*GpuContext::get()), grid_(g) {
+    FlowGpu(const Grid& g, const Params& p) : ctx_(*GpuContext::get()), periodicZ_(g.periodicZ) {
         dims_ = g.dims;
         N_ = cells = g.N;
         nRec_ = uint32_t(g.rec.count);
@@ -449,7 +449,7 @@ private:
         for (int s = 0; s < count; s++) {
             const int64_t step = steps + s;
             const float uin = float(inletVelocity(uLat_, step));
-            const uint32_t u[8] = {uint32_t(dims_[0]), uint32_t(dims_[1]), uint32_t(dims_[2]), uint32_t(N_), nRec_, nFace_, grid_.periodicZ ? 1u : 0u, uint32_t(step & 1)};
+            const uint32_t u[8] = {uint32_t(dims_[0]), uint32_t(dims_[1]), uint32_t(dims_[2]), uint32_t(N_), nRec_, nFace_, periodicZ_ ? 1u : 0u, uint32_t(step & 1)};
             const float f[5] = {tau0_, smag_, uin, belt_ ? uin : 0.0f, float(nu0_)};
             const uint32_t w[3] = {wallModel_ ? 4u : 0u, uint32_t(slot), 0u};
             uint8_t* p = buf.data() + size_t(s) * paramStride_;
@@ -482,7 +482,7 @@ private:
     }
 
     GpuContext& ctx_;
-    Grid grid_;
+    bool periodicZ_ = false;
     std::array<int, 3> dims_{};
     int64_t N_ = 0;
     uint32_t nRec_ = 0, nFace_ = 0;

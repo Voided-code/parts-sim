@@ -245,7 +245,7 @@ fn smagorinskyTau(f: ptr<function, array<f32, 19>>, rho: f32, u: vec3<f32>) -> f
 // Wall model (flow-cpu.js wallModelCell, Malaspinas & Sagaut 2014): sample the flow at the bulk cell
 // n + c_samp, take u_tau from Reichardt's law, and rebuild this cell's populations as the regularised
 // state with the law's velocity and shear at its own distance from the wall.
-fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32) {
+fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32, rho1: f32) {
   let base = r * REC;
   // the sample cell (its z wraps around with a periodic span)
   var zm = i32(z) + CZ[j];
@@ -261,13 +261,9 @@ fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32) {
   var wv = vec3<f32>(0.0);
   if ((mask & 1u) != 0u) { wv.x = P.uBelt; }
   let u2 = mo.yzw / rho2 - wv;
-  let un2 = dot(u2, nrm);
-  // tangential velocity, low-passed in time
-  let prev = vec3<f32>(bitcast<f32>(rec[base + R_SLIP]), bitcast<f32>(rec[base + R_SLIP + 1u]), bitcast<f32>(rec[base + R_SLIP + 2u]));
-  let tv = prev + SLIP_FILTER * (u2 - un2 * nrm - prev);
-  rec[base + R_SLIP] = bitcast<u32>(tv.x);
-  rec[base + R_SLIP + 1u] = bitcast<u32>(tv.y);
-  rec[base + R_SLIP + 2u] = bitcast<u32>(tv.z);
+  // the sample's velocity along the wall (not filtered in time: a delayed wall law lets the two walls
+  // of a narrow gap drive each other into growing oscillations)
+  let tv = u2 - dot(u2, nrm) * nrm;
   let ut2 = length(tv);
   var utau = 0.0; var ut1 = 0.0; var dudn = 0.0; var tauN = 0.5 + 3.0 * P.nu0;
   var e = vec3<f32>(0.0);
@@ -279,12 +275,14 @@ fn modelCell(r: u32, n: u32, z: u32, o: array<i32, 19>, mask: u32, j: u32) {
     tauN = 0.5 + 3.0 * P.nu0 / r1.y;
     e = tv / ut2;
   }
-  let u1 = wv + ut1 * e + (un2 * y1 / y2) * nrm;
-  let c = -rho2 * tauN * dudn / 3.0;
+  // the cell's velocity from the law of the wall, along the wall only (a velocity toward the wall
+  // pumps pressure waves in narrow gaps), with the cell's own density (the model makes no mass)
+  let u1 = wv + ut1 * e;
+  let c = -rho1 * tauN * dudn / 3.0;
   let pi = array<f32, 6>(2.0 * c * e.x * nrm.x, 2.0 * c * e.y * nrm.y, 2.0 * c * e.z * nrm.z,
     c * (e.x * nrm.y + e.y * nrm.x), c * (e.x * nrm.z + e.z * nrm.x), c * (e.y * nrm.z + e.z * nrm.y));
   var f: array<f32, 19>;
-  regularized(&f, rho2, u1, pi, 1.0 - 1.0 / tauN);
+  regularized(&f, rho1, u1, pi, 1.0 - 1.0 / tauN);
   storeCell(n, o, &f, 0u);
   for (var k = 1u; k < 19u; k++) {
     if ((mask & (1u << k)) != 0u) {
@@ -315,7 +313,6 @@ fn wall(@builtin(global_invocation_id) gid: vec3<u32>) {
   let z = n / (P.nx * P.ny);
   let o = offsets(z);
   let samp = rec[base + R_SAMP];
-  if (P.wallModel == 4u && samp != 0u) { modelCell(r, n, z, o, mask, samp); return; }
   var f: array<f32, 19>;
   loadCell(n, o, &f);
   var fb: array<f32, 19>;
@@ -339,6 +336,13 @@ fn wall(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
     f[k] = fk;
+  }
+  // the wall model on the part when it is on, and always on the moving ground (flow-cpu.js wallCells)
+  if (samp != 0u && (P.wallModel == 4u || (mask & 1u) != 0u)) {
+    var rho1 = 0.0;
+    for (var i = 0u; i < 19u; i++) { rho1 += f[i]; }
+    modelCell(r, n, z, o, mask, samp, rho1);
+    return;
   }
   // wall model (flow-cpu.js wallCells): 1 = slip, the wall moves along the near-wall flow at the
   // speed that gives the log law's wall shear with the cell's own viscosity; 2 = the log-law eddy
@@ -375,19 +379,20 @@ fn wall(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var k = 1u; k < 19u; k++) {
           if ((mask & (1u << k)) != 0u) { f[k] += fq[k] * WT[k] * rho * dot(vec3<f32>(f32(CX[k]), f32(CY[k]), f32(CZ[k])), w); }
         }
-      } else {
+      } else if (P.wallModel == 2u || P.wallModel == 3u) {
         let nuT = max(utau * utau * d / ut - P.nu0, 0.0);
         tauWall = 3.0 * (P.nu0 + nuT) + 0.5;
         if (P.wallModel == 3u) { tauMin = tauWall; tauWall = 0.0; }
       }
     }
   }
-  // momentum to the part (Galilean invariant for a moving wall, Wen et al. 2014), c_opp = -c_k
+  // momentum to the part (Galilean invariant for a moving wall, Wen et al. 2014), c_opp = -c_k, less
+  // the air at rest's (flow-cpu.js wallCells)
   var m = vec3<f32>(0.0);
   for (var k = 1u; k < 19u; k++) {
     if ((mask & (1u << k)) == 0u || (gmask & (1u << k)) != 0u) { continue; }
     let v = fb[k];
-    m -= vec3<f32>(f32(CX[k]), f32(CY[k]), f32(CZ[k])) * (v + f[k]) + w * (v - f[k]);
+    m -= vec3<f32>(f32(CX[k]), f32(CY[k]), f32(CZ[k])) * (v + f[k] - 2.0 * WT[k]) + w * (v - f[k]);
   }
   var mac: vec4<f32>;
   if (tauWall > 0.0) {

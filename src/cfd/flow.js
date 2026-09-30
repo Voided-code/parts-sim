@@ -244,11 +244,16 @@ export function buildFlowGrid(plan, tris, { voxelize, wallRayCaster }) {
  * For the wall model (flow-cpu.js wallCells), per wall record:
  * - samp: the direction c_j nearest the wall normal whose cell n + c_j is bulk fluid, where the model
  *   samples the flow (0: none, the record keeps plain bounce-back), and y2, that cell's distance
- *   from the wall;
+ *   from the wall. On the part the model also needs MODEL_CLEAR cells of fluid along c_j: two
+ *   modelled walls closer than that (a car's underbody over the road) drive each other into growing
+ *   pressure waves, so the part keeps plain bounce-back there. The moving ground always has it;
  * - area: the part's surface next to the record, as a vector into the fluid (cells^2), from its
  *   triangles (each goes to the nearest record on its outer side). With a periodic span only the
  *   part of each triangle inside the tunnel's span counts.
  */
+// cells of fluid the wall model needs along its sample direction on the part (wallModelData)
+export const MODEL_CLEAR = 3;
+
 function wallModelData(plan, tris, rec, kind, { lo, hi, periodicZ }) {
   const [nx, ny, nz] = plan.dims;
   const n = rec.count;
@@ -267,6 +272,13 @@ function wallModelData(plan, tris, rec, kind, { lo, hi, periodicZ }) {
       if (xx < 0 || yy < 0 || zz < 0 || xx >= nx || yy >= ny || zz >= nz) continue;
       if (kind[xx + nx * (yy + ny * zz)] !== BULK) continue;
       best = dot; bj = j;
+    }
+    const belt = rec.groundMask[r] && rec.dist[r] === 0.5;
+    for (let k = 2; bj && !belt && k <= MODEL_CLEAR; k++) {
+      const xx = x + k * CX[bj], yy = y + k * CY[bj], zz = periodicZ ? (((z + k * CZ[bj]) % nz) + nz) % nz : z + k * CZ[bj];
+      if (xx < 0 || yy < 0 || zz < 0 || xx >= nx || yy >= ny || zz >= nz) break;
+      const kd = kind[xx + nx * (yy + ny * zz)];
+      if (kd === WALL || kd === SOLID) bj = 0;
     }
     rec.samp[r] = bj;
     if (bj) rec.y2[r] = rec.dist[r] + CX[bj] * nv[0] + CY[bj] * nv[1] + CZ[bj] * nv[2];
@@ -292,31 +304,33 @@ function wallModelData(plan, tris, rec, kind, { lo, hi, periodicZ }) {
     const A = [(e1[1] * e2[2] - e1[2] * e2[1]) / 2, (e1[2] * e2[0] - e1[0] * e2[2]) / 2, (e1[0] * e2[1] - e1[1] * e2[0]) / 2];
     const len = Math.hypot(A[0], A[1], A[2]);
     if (!(len > 0)) continue;
-    let frac = 1;
-    const cz = (v[0][2] + v[1][2] + v[2][2]) / 3;
-    let zc = cz;
-    if (periodicZ) {
-      const z0 = Math.min(v[0][2], v[1][2], v[2][2]), z1 = Math.max(v[0][2], v[1][2], v[2][2]);
-      frac = z1 > z0 ? Math.max(0, Math.min(z1, nz) - Math.max(z0, 0)) / (z1 - z0) : z0 >= 0 && z0 < nz ? 1 : 0;
-      if (!frac) continue;
-      zc = Math.min(nz - 0.5, Math.max(0.5, cz));
-    }
-    // a point just outside the surface, and the nearest record around it
-    const p = [(v[0][0] + v[1][0] + v[2][0]) / 3 + (0.6 * A[0]) / len, (v[0][1] + v[1][1] + v[2][1]) / 3 + (0.6 * A[1]) / len, zc + (0.6 * A[2]) / len];
-    const cx = Math.floor(p[0]), cy = Math.floor(p[1]), czz = Math.floor(p[2]);
-    let bestR = -1, bestD = Infinity;
-    for (let dz = -1; dz <= 1; dz++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const zz = periodicZ ? (czz + dz + nz) % nz : czz + dz;
-          const i = boxIndex(cx + dx, cy + dy, zz);
-          if (i < 0 || at[i] < 0) continue;
-          const d = (cx + dx + 0.5 - p[0]) ** 2 + (cy + dy + 0.5 - p[1]) ** 2 + (czz + dz + 0.5 - p[2]) ** 2;
-          if (d < bestD) { bestD = d; bestR = at[i]; }
+    // the triangle's area is shared among the records along it: points on a grid of about half a
+    // cell over the triangle, each to the nearest record just outside it (a large CAD face would
+    // otherwise hang on one record); with a periodic span only the points inside it count
+    const m1 = Math.min(4096, Math.max(1, Math.ceil(Math.hypot(...e1) / 0.5))), m2 = Math.min(4096, Math.max(1, Math.ceil(Math.hypot(...e2) / 0.5)));
+    let inside = 0;
+    for (let i = 0; i < m1; i++) for (let j = 0; j < m2; j++) if ((i + 0.5) / m1 + (j + 0.5) / m2 < 1) inside++;
+    const w = inside ? 1 / inside : 1;
+    const assign = (a, b) => {
+      const s0 = v[0][2] + a * e1[2] + b * e2[2];
+      if (periodicZ && (s0 < 0 || s0 >= nz)) return;
+      const p = [v[0][0] + a * e1[0] + b * e2[0] + (0.6 * A[0]) / len, v[0][1] + a * e1[1] + b * e2[1] + (0.6 * A[1]) / len, s0 + (0.6 * A[2]) / len];
+      const cx = Math.floor(p[0]), cy = Math.floor(p[1]), czz = Math.floor(p[2]);
+      let bestR = -1, bestD = Infinity;
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const zz = periodicZ ? (((czz + dz) % nz) + nz) % nz : czz + dz;
+            const i = boxIndex(cx + dx, cy + dy, zz);
+            if (i < 0 || at[i] < 0) continue;
+            const d = (cx + dx + 0.5 - p[0]) ** 2 + (cy + dy + 0.5 - p[1]) ** 2 + (czz + dz + 0.5 - p[2]) ** 2;
+            if (d < bestD) { bestD = d; bestR = at[i]; }
+          }
         }
       }
-    }
-    if (bestR < 0) continue;
-    for (let a = 0; a < 3; a++) rec.area[3 * bestR + a] += A[a] * frac;
+      if (bestR >= 0) for (let k = 0; k < 3; k++) rec.area[3 * bestR + k] += A[k] * w;
+    };
+    if (!inside) assign(1 / 3, 1 / 3);
+    else for (let i = 0; i < m1; i++) for (let j = 0; j < m2; j++) { const a = (i + 0.5) / m1, b = (j + 0.5) / m2; if (a + b < 1) assign(a, b); }
   }
 }

@@ -108,6 +108,25 @@ void AirflowPanel::buildUi() {
     density_ = numberBox(1.225, 0.01, 2000, 0.01, 3, [this](double) { markDirty(); });
     prop(tr("Speed (m/s)"), speed_);
     prop(tr("Air density (kg/m³)"), density_);
+    groundChk_ = new QCheckBox(tr("Road under the part (moving ground)"), this);
+    groundChk_->setToolTip(tr("A road under the part that moves with the wind, as for a car driving on it"));
+    c->addWidget(groundChk_);
+    groundRow_ = new QWidget(this);
+    auto* gh = new QHBoxLayout(groundRow_);
+    gh->setContentsMargins(0, 0, 0, 0);
+    groundUnit_ = new QLabel(this);
+    gh->addWidget(groundUnit_, 1);
+    clearance_ = numberBox(0, 0, 1e6, 1, 1, [this](double) { markDirty(); });
+    clearance_->setParent(groundRow_);
+    clearance_->setMaximumWidth(120);
+    gh->addWidget(clearance_);
+    groundRow_->hide();
+    c->addWidget(groundRow_);
+    connect(groundChk_, &QCheckBox::toggled, this, [this](bool on) {
+        groundRow_->setVisible(on);
+        updateCellsInfo();
+        markDirty();
+    });
 
     root->addWidget(card(tr("Solver"), &c, this));
     auto* eh = new QHBoxLayout;
@@ -122,6 +141,16 @@ void AirflowPanel::buildUi() {
     });
     eh->addWidget(engine_, 1);
     c->addLayout(eh);
+    auto* bh = new QHBoxLayout;
+    bh->addWidget(new QLabel(tr("Boundary layer"), this));
+    boundary_ = new QComboBox(this);
+    boundary_->setToolTip(tr("How the thin layer of air next to the surface is treated"));
+    boundary_->addItem(tr("Automatic (turbulent above Re 5×10⁵)"), int(BoundaryLayer::Auto));
+    boundary_->addItem(tr("Turbulent (wall model)"), int(BoundaryLayer::Turbulent));
+    boundary_->addItem(tr("Laminar (resolved by the grid)"), int(BoundaryLayer::Laminar));
+    connect(boundary_, &QComboBox::activated, this, [this](int) { markDirty(); });
+    bh->addWidget(boundary_, 1);
+    c->addLayout(bh);
     auto* rh = new QHBoxLayout;
     rh->addWidget(new QLabel(tr("Grid size"), this));
     rh->addStretch();
@@ -147,6 +176,13 @@ void AirflowPanel::buildUi() {
                                    : tr("No compatible GPU was found, so the flow runs on all CPU cores with a coarser grid."),
                     this);
     c->addWidget(gpuInfo_);
+    autoStopChk_ = new QCheckBox(tr("Stop when the forces have settled"), this);
+    autoStopChk_->setToolTip(tr("Pause once the forces' 95% confidence interval is within about 1%"));
+    autoStopChk_->setChecked(true);
+    connect(autoStopChk_, &QCheckBox::toggled, this, [this](bool on) {
+        if (sim_) sim_->autoStop = on;
+    });
+    c->addWidget(autoStopChk_);
 
     auto* runRow = new QHBoxLayout;
     runBtn_ = new QPushButton(tr("Run airflow"), this);
@@ -169,6 +205,8 @@ void AirflowPanel::buildUi() {
     flowCard_ = card(tr("Aerodynamics"), &c, this);
     kpis_ = new KpiGrid(this);
     c->addWidget(kpis_);
+    notes_ = note("", this);
+    c->addWidget(notes_);
     state_ = note("", this);
     c->addWidget(state_);
     flowCard_->hide();
@@ -273,6 +311,8 @@ AirflowOptions AirflowPanel::settings() const {
     o.cells = std::clamp(cells_, capacity().minCells, capacity().maxCells);
     o.engine = engine_->currentIndex();
     o.toMeters = app_->toMeters();
+    o.ground = groundChk_->isChecked() ? clearance_->value() : -1;
+    o.boundaryLayer = BoundaryLayer(boundary_->currentData().toInt());
     return o;
 }
 
@@ -299,9 +339,13 @@ void AirflowPanel::updateCellsInfo() {
     auto count = [](double n) { return n >= 1e6 ? tr("%1 M").arg(num(n / 1e6, 2)) : tr("%1 k").arg(num(n / 1e3, 2)); };
     cellsOut_->setText(tr("%1 cells").arg(count(cells_)));
     QStringList parts;
+    double nx = std::cbrt(cells_);
     if (app_->part) {
         try {
-            const auto plan = planTunnel(*app_->part, windDirection(yaw_, pitch_), cells_);
+            TunnelOptions to;
+            to.ground = groundChk_->isChecked() ? clearance_->value() : -1;
+            const auto plan = planTunnel(*app_->part, windDirection(yaw_, pitch_), cells_, to);
+            nx = plan.dims[0];
             parts << tr("Tunnel %1 × %2 × %3, cells %4 %5 across.")
                          .arg(plan.dims[0]).arg(plan.dims[1]).arg(plan.dims[2])
                          .arg(num(plan.h), app_->units);
@@ -320,11 +364,7 @@ void AirflowPanel::updateCellsInfo() {
     const QString engine = gpuEngine() ? "GPU" : "CPU";
     if (lastMlups_ > 0 && lastEngine_ == engine) {
         const double stepsPerSecond = lastMlups_ * 1e6 / cells_;
-        double nx = std::cbrt(cells_);
-        if (app_->part) {
-            try { nx = planTunnel(*app_->part, windDirection(yaw_, pitch_), cells_).dims[0]; } catch (const std::exception&) {}
-        }
-        const double developSteps = LBM_RAMP_STEPS + 0.6 * nx / AIR_U_LAT;
+        const double developSteps = flow::RAMP_STEPS + 1.5 * nx / AIR_U_LAT;
         parts << tr("At the last run's %1 MLUPS: about %2 steps/s, developed flow after about %3 s.")
                      .arg(num(lastMlups_), num(stepsPerSecond), num(developSteps / stepsPerSecond, 2));
     }
@@ -346,9 +386,9 @@ void AirflowPanel::stop() {
         app_->busy->hideBusy();
     }
     if (sim_) {
+        sim_->pause();
         sim_->onSnapshot = {};
         sim_->onStatus = {};
-        sim_->pause();
         sim_.reset();
     }
 }
@@ -364,8 +404,18 @@ void AirflowPanel::reset(const std::optional<SampleSetup::Air>& preset) {
         speed_->blockSignals(true);
         speed_->setValue(preset->speed);
         speed_->blockSignals(false);
+        groundChk_->blockSignals(true);
+        groundChk_->setChecked(preset->ground >= 0);
+        groundChk_->blockSignals(false);
+        groundRow_->setVisible(preset->ground >= 0);
+        if (preset->ground >= 0) {
+            clearance_->blockSignals(true);
+            clearance_->setValue(preset->ground);
+            clearance_->blockSignals(false);
+        }
         syncWind();
     }
+    groundUnit_->setText(tr("Ground clearance (%1)").arg(app_->units));
     flowCard_->hide();
     displayCard_->hide();
     updateCellsInfo();
@@ -378,7 +428,7 @@ void AirflowPanel::reset(const std::optional<SampleSetup::Air>& preset) {
 
 bool AirflowPanel::hasResults() const {
     auto s = sim_ ? sim_->snapshot() : nullptr;
-    return s && !s->developing;
+    return s && !s->developing && s->surface;
 }
 
 void AirflowPanel::updateButtons() {
@@ -390,7 +440,7 @@ void AirflowPanel::updateButtons() {
     else runBtn_->setText(ready ? tr("Apply & run") : tr("Run airflow"));
     resetBtn_->setEnabled(ready && !building);
     auto s = sim_ ? sim_->snapshot() : nullptr;
-    windLoad_->setEnabled(!dirty_ && s && !s->developing);
+    windLoad_->setEnabled(!dirty_ && s && !s->developing && s->surface);
 }
 
 void AirflowPanel::run() {
@@ -407,6 +457,7 @@ void AirflowPanel::run() {
         stop();
         clearVisuals();
         auto building = std::make_shared<AirflowSim>();
+        building->autoStop = autoStopChk_->isChecked();
         std::shared_ptr<const Part> part = app_->part;
         app_->busy->showBusy(tr("Building wind tunnel…"), [this] {
             stop();
@@ -441,7 +492,7 @@ void AirflowPanel::run() {
                     const QString m = QString::fromStdString(msg);
                     QMetaObject::invokeMethod(self, [self, m, failed] {
                         if (!self) return;
-                        self->app_->status(m, failed ? "error" : "warn");
+                        self->app_->status(m, failed ? "error" : "");
                         self->updateButtons();
                     }, Qt::QueuedConnection);
                 };
@@ -453,11 +504,11 @@ void AirflowPanel::run() {
                 sim_->start();
                 flowCard_->show();
                 displayCard_->show();
-                app_->status(tr("Wind tunnel ready: %1 × %2 × %3 cells on the %4.")
+                app_->status(tr("Wind tunnel ready: %1 × %2 × %3 cells on the %4%5.")
                                  .arg(sim_->dims[0])
                                  .arg(sim_->dims[1])
                                  .arg(sim_->dims[2])
-                                 .arg(QString::fromStdString(sim_->engine)));
+                                 .arg(QString::fromStdString(sim_->engine), sim_->wallModel ? tr(", turbulent boundary layer (wall model)") : QString()));
                 updateButtons();
                 update();
                 renderLegends();
@@ -472,6 +523,7 @@ void AirflowPanel::run() {
         updateButtons();
         return;
     }
+    sim_->autoStop = autoStopChk_->isChecked();
     sim_->start();
     flowCard_->show();
     displayCard_->show();
@@ -482,7 +534,16 @@ void AirflowPanel::run() {
 QString AirflowPanel::aeroSummary() const {
     auto s = sim_ ? sim_->snapshot() : nullptr;
     if (!s) return "no flow";
-    return QString("step %1 (%2 samples): Cd %3, Cl %4").arg(s->steps).arg(s->samples).arg(s->results.cd, 0, 'f', 4).arg(s->results.cl, 0, 'f', 4);
+    const auto& r = s->results;
+    return QString("step %1 (%2 samples%3): Cd %4 ± %5, Cl %6 ± %7, drag %8 N")
+        .arg(s->steps)
+        .arg(s->samples)
+        .arg(s->converged ? ", converged" : "")
+        .arg(r.cd, 0, 'f', 4)
+        .arg(r.cdCI, 0, 'f', 4)
+        .arg(r.cl, 0, 'f', 4)
+        .arg(r.clCI, 0, 'f', 4)
+        .arg(r.drag, 0, 'g', 5);
 }
 
 void AirflowPanel::update() {
@@ -501,14 +562,39 @@ void AirflowPanel::update() {
         if (ratio >= 1) { w.status = "bad"; w.statusText = tr("the wind lifts it"); }
         else if (ratio >= 0.5) { w.status = "warn"; w.statusText = tr("lift is %1% of its weight").arg(std::lround(ratio * 100)); }
         else w.sub = tr("lift is %1% of its weight").arg(std::max(0L, std::lround(ratio * 100)));
+        // "± x" for a 95% confidence interval, once the averages have one
+        const bool ci = r.averaged;
+        auto pm = [&](double v, double c, const std::function<QString(double)>& fmt) {
+            return ci && std::isfinite(c) ? QString("%1 ± %2").arg(fmt(v), fmt(std::abs(c))) : fmt(v);
+        };
+        auto pmForce = [&](double c) { return ci && std::isfinite(c) ? QString("± %1 · ").arg(force(std::abs(c))) : QString(); };
+        const auto plain = [](double x) { return num(x); };
+        const auto newtons = [](double x) { return force(x); };
         kpis_->setKpis({
-            {tr("Drag force"), force(r.drag), QString("Cd %1").arg(num(r.cd))},
-            {tr("Lift force"), force(r.lift), QString("Cl %1").arg(num(r.cl))},
+            {tr("Drag force"), force(r.drag), pmForce(r.dragCI) + "Cd " + pm(r.cd, r.cdCI, plain)},
+            {tr("Lift force"), force(r.lift), pmForce(r.liftCI) + "Cl " + pm(r.cl, r.clCI, plain)},
             w,
-            {tr("Frontal area"), num(area) + " " + app_->units + "²", tr("side force %1").arg(force(r.side))},
-            {tr("Reynolds number"), num(sim_->reynolds), tr("simulated ≈ %1").arg(num(sim_->simReynolds))},
+            {tr("Frontal area"), num(area) + " " + app_->units + "²", tr("side force %1").arg(pm(r.side, r.sideCI, newtons))},
+            {tr("Reynolds number"), num(sim_->reynolds),
+             sim_->simReynolds < 0.5 * sim_->reynolds ? tr("simulated %1").arg(num(sim_->simReynolds)) : tr("simulated at full value")},
         });
-    } else kpis_->setKpis({});
+        QStringList notes;
+        notes << (r.averaged ? tr("Forces are time averages with their 95% confidence intervals, from the momentum the air exchanges with the part (pressure and skin friction).")
+                             : tr("Forces now; their averages start once the flow has developed."));
+        if (sim_->wallModel)
+            notes << tr("Boundary layer: turbulent (wall model, Re %1 along the part%2).")
+                         .arg(num(sim_->reynoldsLength), sim_->reynoldsLength < TURBULENT_RE ? tr(", set by hand") : QString());
+        else
+            notes << tr("Boundary layer: resolved by the grid (laminar%1).")
+                         .arg(sim_->reynoldsLength >= TURBULENT_RE ? tr(", set by hand; the real one is turbulent") : QString());
+        if (sim_->simReynolds < 0.5 * sim_->reynolds)
+            notes << tr("The grid holds the flow at a lower Reynolds number (%1) than real air (%2): expect the drag of rounded shapes to differ.")
+                         .arg(num(sim_->simReynolds), num(sim_->reynolds));
+        notes_->setText(notes.join(" "));
+    } else {
+        kpis_->setKpis({});
+        notes_->clear();
+    }
     if (s && s->mlups > 0 && !s->developing) {
         lastMlups_ = s->mlups;
         lastEngine_ = QString::fromStdString(sim_->engine);
@@ -518,8 +604,11 @@ void AirflowPanel::update() {
         }
     }
     if (sim_ && sim_->ready()) {
-        const QString phase = !s ? tr("starting") : s->developing ? tr("developing flow") : tr("averaging (%1 samples)").arg(s->samples);
-        state_->setText(tr("%1%2 · %3×%4×%5 cells · step %6 · %7 MLUPS · %8. Forces are pressure-only (skin friction is not resolved).")
+        const QString phase = !s || !s->steps ? tr("starting")
+                              : s->developing ? tr("developing flow")
+                              : s->converged  ? tr("converged (%1 samples)").arg(s->samples)
+                                              : tr("averaging (%1 samples)").arg(s->samples);
+        state_->setText(tr("%1%2 · %3×%4×%5 cells · step %6 · %7 MLUPS · %8.")
                             .arg(dirty_ ? tr("Settings changed; apply to update results. ") : QString(), QString::fromStdString(sim_->engine))
                             .arg(sim_->dims[0])
                             .arg(sim_->dims[1])
@@ -533,11 +622,19 @@ void AirflowPanel::update() {
         app_->viewer->clearLayer("flow:slice");
         return;
     }
+    if (!s->surface && !cp_.empty()) {
+        cp_.clear();
+        app_->viewer->setScalars(nullptr);
+    }
     if (s->steps == shownSteps_) return;
     shownSteps_ = s->steps;
     const double t = now();
     if (t - lastCp_ > 0.9) applyColoring();
-    if (sliceChk_->isChecked()) buildSlice();
+    // the view fields change a few times a second, the forces every batch
+    if (s->fields.get() != shownFields_) {
+        shownFields_ = s->fields.get();
+        if (sliceChk_->isChecked()) buildSlice();
+    }
     if (streamChk_->isChecked() && t - lastStream_ > 2.5) buildStreamlines();
 }
 
@@ -545,7 +642,7 @@ void AirflowPanel::applyColoring(bool force) {
     if (app_->tab() != "airflow") return;
     Viewport* v = app_->viewer;
     auto s = sim_ ? sim_->snapshot() : nullptr;
-    if (cpChk_->isChecked() && s) {
+    if (cpChk_->isChecked() && s && s->surface) {
         if (force || now() - lastCp_ > 0.9 || cp_.empty()) {
             cp_ = sim_->surfaceCp(*s);
             lastCp_ = now();
@@ -674,8 +771,9 @@ void AirflowPanel::initParticles() {
 
 void AirflowPanel::stepParticles(double dt) {
     auto snap = sim_ ? sim_->snapshot() : nullptr;
-    if (!snap || !particlesChk_->isChecked() || pos_.empty()) return;
-    const auto& macro = snap->macro;
+    if (!snap || !snap->fields || !particlesChk_->isChecked() || pos_.empty()) return;
+    const flow::Fields& fl = *snap->fields;
+    const auto& field = fl.inst;
     const auto& sim = *sim_;
     const int nx = sim.dims[0], ny = sim.dims[1], nz = sim.dims[2];
     const double k = nx / (4.5 * AIR_U_LAT) * std::min(dt, 0.05);  // free stream crosses the tunnel in ~4.5 s
@@ -690,10 +788,10 @@ void AirflowPanel::stepParticles(double dt) {
     for (int i = 0; i < particles_; i++) {
         double x = pos_[3 * i], y = pos_[3 * i + 1], z = pos_[3 * i + 2];
         double u[3];
-        if (sim.sample(macro, 4, x, y, z, m) < 0.05) { u[0] = AIR_U_LAT * 0.3; u[1] = u[2] = 0; }
+        if (AirflowSim::sample(fl, field, x, y, z, m) < 0.05) { u[0] = AIR_U_LAT * 0.3; u[1] = u[2] = 0; }
         else { u[0] = m[1]; u[1] = m[2]; u[2] = m[3]; }
         // midpoint step
-        if (sim.sample(macro, 4, x + 0.5 * k * u[0], y + 0.5 * k * u[1], z + 0.5 * k * u[2], m) > 0.05) { u[0] = m[1]; u[1] = m[2]; u[2] = m[3]; }
+        if (AirflowSim::sample(fl, field, x + 0.5 * k * u[0], y + 0.5 * k * u[1], z + 0.5 * k * u[2], m) > 0.05) { u[0] = m[1]; u[1] = m[2]; u[2] = m[3]; }
         x += k * u[0]; y += k * u[1]; z += k * u[2];
         age_[i] += float(dt);
         if (x >= nx - 1.5 || sim.isSolidAt(x, y, z) || age_[i] > 20 || y < 1 || z < 1 || y > ny - 1 || z > nz - 1) {
@@ -722,9 +820,10 @@ void AirflowPanel::buildStreamlines() {
     lastStream_ = now();
     app_->viewer->clearLayer("flow:streamlines");
     auto snap = sim_ ? sim_->snapshot() : nullptr;
-    if (!snap || !streamChk_->isChecked() || app_->tab() != "airflow") return;
+    if (!snap || !snap->fields || !streamChk_->isChecked() || app_->tab() != "airflow") return;
     const auto& sim = *sim_;
-    const auto& avgU = snap->avgU;
+    const flow::Fields& fl = *snap->fields;
+    const auto& avg = fl.avg;
     const int nx = sim.dims[0], ny = sim.dims[1], nz = sim.dims[2];
     const auto& pr = sim.partRange;
     const int S = 16;
@@ -735,18 +834,19 @@ void AirflowPanel::buildStreamlines() {
     g.kind = Geometry::Lines;
     g.vertexColors = true;
     g.lit = false;
-    double u[3];
+    double m[4];
     for (int a = 0; a < S; a++)
         for (int b = 0; b < S; b++) {
             double x = 1.5;
             double y = std::min(ny - 2.0, std::max(1.5, pr[0][0] - padY + (a + 0.5) / S * (pr[0][1] - pr[0][0] + 2 * padY)));
             double z = std::min(nz - 2.0, std::max(1.5, pr[1][0] - padZ + (b + 0.5) / S * (pr[1][1] - pr[1][0] + 2 * padZ)));
             for (int s = 0; s < 6 * nx / stride; s++) {
-                if (sim.sample(avgU, 3, x, y, z, u) < 0.05) break;
+                if (AirflowSim::sample(fl, avg, x, y, z, m) < 0.05) break;
+                const double* u = m + 1;
                 double sp = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
                 if (sp < 1e-5) break;
                 const double st = 0.6 * stride / sp;
-                if (sim.sample(avgU, 3, x + 0.5 * st * u[0], y + 0.5 * st * u[1], z + 0.5 * st * u[2], u) < 0.05) break;
+                if (AirflowSim::sample(fl, avg, x + 0.5 * st * u[0], y + 0.5 * st * u[1], z + 0.5 * st * u[2], m) < 0.05) break;
                 sp = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
                 if (!(sp > 0)) sp = 1e-5;
                 const double st2 = 0.6 * stride / sp;
@@ -766,42 +866,45 @@ void AirflowPanel::buildStreamlines() {
 void AirflowPanel::buildSlice() {
     app_->viewer->clearLayer("flow:slice");
     auto snap = sim_ ? sim_->snapshot() : nullptr;
-    if (!snap || !sliceChk_->isChecked() || app_->tab() != "airflow") return;
+    if (!snap || !snap->fields || !sliceChk_->isChecked() || app_->tab() != "airflow") return;
     const auto& sim = *sim_;
-    const int nx = sim.dims[0], ny = sim.dims[1], nz = sim.dims[2];
+    const flow::Fields& fl = *snap->fields;
+    const auto& field = fl.avg;
+    // on the coarse view grid: in-plane axes (a, b) and the fixed coordinate f
+    const int cnx = fl.dims[0], cny = fl.dims[1], cnz = fl.dims[2], cf = fl.factor;
     const QString axis = sliceAxis_->currentData().toString();
     const bool pressure = sliceQty_->currentData() == "pressure";
-    // in-plane axes (a, b) and the fixed coordinate f
     int A, B, n;
-    if (axis == "xy") { A = nx; B = ny; n = nz; }
-    else if (axis == "xz") { A = nx; B = nz; n = ny; }
-    else { A = ny; B = nz; n = nx; }
+    if (axis == "xy") { A = cnx; B = cny; n = cnz; }
+    else if (axis == "xz") { A = cnx; B = cnz; n = cny; }
+    else { A = cny; B = cnz; n = cnx; }
     const int f = std::clamp(int(std::floor(slicePos_->value() / 100.0 * n)), 0, n - 1);
     auto cell = [&](int a, int b) -> int64_t {
-        if (axis == "xy") return a + int64_t(nx) * (b + int64_t(ny) * f);
-        if (axis == "xz") return a + int64_t(nx) * (f + int64_t(ny) * b);
-        return f + int64_t(nx) * (a + int64_t(ny) * b);
+        if (axis == "xy") return a + int64_t(cnx) * (b + int64_t(cny) * f);
+        if (axis == "xz") return a + int64_t(cnx) * (f + int64_t(cny) * b);
+        return f + int64_t(cnx) * (a + int64_t(cny) * b);
     };
+    // lattice coordinates of coarse-grid point (a, b) on the plane, within the tunnel
     auto world = [&](double a, double b) {
-        const double fc = f + 0.5;
-        if (axis == "xy") return q3(sim.toWorld(a, b, fc));
-        if (axis == "xz") return q3(sim.toWorld(a, fc, b));
-        return q3(sim.toWorld(fc, a, b));
+        const double fc = (f + 0.5) * cf;
+        const double la = std::min(a * cf, double(axis == "yz" ? sim.dims[1] : sim.dims[0]));
+        const double lb = std::min(b * cf, double(axis == "xy" ? sim.dims[1] : sim.dims[2]));
+        if (axis == "xy") return q3(sim.toWorld(la, lb, fc));
+        if (axis == "xz") return q3(sim.toWorld(la, fc, lb));
+        return q3(sim.toWorld(fc, la, lb));
     };
     const double inv = 1 / (3 * 0.5 * AIR_U_LAT * AIR_U_LAT);
     std::vector<QVector3D> col(size_t(A) * B);
     for (int b = 0; b < B; b++)
         for (int a = 0; a < A; a++) {
             const int64_t c = cell(a, b);
-            if (sim.solid[c]) { col[a + size_t(A) * b] = QVector3D(45 / 255.f, 50 / 255.f, 60 / 255.f); continue; }
-            double t;
-            if (pressure) t = ((snap->avgRho[c] - 1) * inv + 1.2) / 2.2;
-            else t = std::sqrt(double(snap->avgU[3 * c]) * snap->avgU[3 * c] + double(snap->avgU[3 * c + 1]) * snap->avgU[3 * c + 1] +
-                               double(snap->avgU[3 * c + 2]) * snap->avgU[3 * c + 2]) / (1.6 * AIR_U_LAT);
+            const float* v = &field[4 * c];
+            if (v[0] == -2.0f) { col[a + size_t(A) * b] = QVector3D(45 / 255.f, 50 / 255.f, 60 / 255.f); continue; }
+            const double t = pressure ? (v[0] * inv + 1.2) / 2.2 : std::sqrt(double(v[1]) * v[1] + double(v[2]) * v[2] + double(v[3]) * v[3]) / (1.6 * AIR_U_LAT);
             col[a + size_t(A) * b] = colorRamp(false, float(t));
         }
-    // a quad per cell with its own colour (cell-sized pixels, like a nearest-neighbour texture);
-    // fine grids are drawn in square blocks of cells so the slice stays under ~250k quads
+    // a quad per coarse cell with its own colour (like a nearest-neighbour texture); fine grids are
+    // drawn in square blocks so the slice stays under ~250k quads
     const int k = std::max(1, int(std::ceil(std::sqrt(double(A) * B / 250e3))));
     Geometry g;
     g.kind = Geometry::Triangles;
@@ -827,6 +930,7 @@ void AirflowPanel::activate() {
     drawWindArrow();
     buildDomain();
     shownSteps_ = -1;
+    shownFields_ = nullptr;
     applyColoring(true);
     buildSlice();
     buildStreamlines();

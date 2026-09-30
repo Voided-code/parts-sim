@@ -87,6 +87,14 @@ void wallModelData(const GridSpec& spec, const std::vector<float>& q, const std:
             best = dot;
             bj = j;
         }
+        // on the part the model also needs MODEL_CLEAR cells of fluid along c_j (flow.js wallModelData)
+        const bool belt = rec.groundMask[r] && rec.dist[r] == 0.5f;
+        for (int k = 2; bj && !belt && k <= MODEL_CLEAR; k++) {
+            const int xx = x + k * CX[bj], yy = y + k * CY[bj], zz = g.periodicZ ? ((z + k * CZ[bj]) % nz + nz) % nz : z + k * CZ[bj];
+            if (xx < 0 || yy < 0 || zz < 0 || xx >= nx || yy >= ny || zz >= nz) break;
+            const uint8_t kd = g.kind[xx + int64_t(nx) * (yy + int64_t(ny) * zz)];
+            if (kd == WALL || kd == SOLID) bj = 0;
+        }
         rec.samp[r] = uint8_t(bj);
         if (bj) rec.y2[r] = float(rec.dist[r] + CX[bj] * nv[0] + CY[bj] * nv[1] + CZ[bj] * nv[2]);
     }
@@ -114,31 +122,42 @@ void wallModelData(const GridSpec& spec, const std::vector<float>& q, const std:
         const double A[3] = {(e1[1] * e2[2] - e1[2] * e2[1]) / 2, (e1[2] * e2[0] - e1[0] * e2[2]) / 2, (e1[0] * e2[1] - e1[1] * e2[0]) / 2};
         const double len = std::sqrt(A[0] * A[0] + A[1] * A[1] + A[2] * A[2]);
         if (!(len > 0)) continue;
-        double frac = 1;
-        const double cz = (v[0][2] + v[1][2] + v[2][2]) / 3;
-        double zc = cz;
-        if (g.periodicZ) {
-            const double z0 = std::min({v[0][2], v[1][2], v[2][2]}), z1 = std::max({v[0][2], v[1][2], v[2][2]});
-            frac = z1 > z0 ? std::max(0.0, std::min(z1, double(nz)) - std::max(z0, 0.0)) / (z1 - z0) : (z0 >= 0 && z0 < nz ? 1 : 0);
-            if (!frac) continue;
-            zc = std::min(nz - 0.5, std::max(0.5, cz));
-        }
-        // a point just outside the surface, and the nearest record around it
-        const double p[3] = {(v[0][0] + v[1][0] + v[2][0]) / 3 + 0.6 * A[0] / len, (v[0][1] + v[1][1] + v[2][1]) / 3 + 0.6 * A[1] / len, zc + 0.6 * A[2] / len};
-        const int cx = int(std::floor(p[0])), cy = int(std::floor(p[1])), czz = int(std::floor(p[2]));
-        int bestR = -1;
-        double bestD = std::numeric_limits<double>::infinity();
-        for (int dz = -1; dz <= 1; dz++)
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++) {
-                    const int zz = g.periodicZ ? (czz + dz + nz) % nz : czz + dz;
-                    const int64_t i = boxIndex(cx + dx, cy + dy, zz);
-                    if (i < 0 || at[i] < 0) continue;
-                    const double d = std::pow(cx + dx + 0.5 - p[0], 2) + std::pow(cy + dy + 0.5 - p[1], 2) + std::pow(czz + dz + 0.5 - p[2], 2);
-                    if (d < bestD) { bestD = d; bestR = at[i]; }
+        // the triangle's area is shared among the records along it: points on a grid of about half a
+        // cell over the triangle, each to the nearest record just outside it (a large CAD face would
+        // otherwise hang on one record); with a periodic span only the points inside it count
+        const double l1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]), l2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+        const int m1 = std::clamp(int(std::ceil(l1 / 0.5)), 1, 4096), m2 = std::clamp(int(std::ceil(l2 / 0.5)), 1, 4096);
+        int64_t inside = 0;
+        for (int i = 0; i < m1; i++)
+            for (int j = 0; j < m2; j++) inside += (i + 0.5) / m1 + (j + 0.5) / m2 < 1;
+        const bool centroid = inside == 0;
+        const double w = centroid ? 1 : 1.0 / double(inside);
+        auto assign = [&](double a, double b) {
+            double p[3];
+            for (int k = 0; k < 3; k++) p[k] = v[0][k] + a * e1[k] + b * e2[k] + 0.6 * A[k] / len;
+            if (g.periodicZ && (p[2] - 0.6 * A[2] / len < 0 || p[2] - 0.6 * A[2] / len >= nz)) return;
+            const int cx = int(std::floor(p[0])), cy = int(std::floor(p[1])), czz = int(std::floor(p[2]));
+            int bestR = -1;
+            double bestD = std::numeric_limits<double>::infinity();
+            for (int dz = -1; dz <= 1; dz++)
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        const int zz = g.periodicZ ? ((czz + dz) % nz + nz) % nz : czz + dz;
+                        const int64_t i = boxIndex(cx + dx, cy + dy, zz);
+                        if (i < 0 || at[i] < 0) continue;
+                        const double d = std::pow(cx + dx + 0.5 - p[0], 2) + std::pow(cy + dy + 0.5 - p[1], 2) + std::pow(czz + dz + 0.5 - p[2], 2);
+                        if (d < bestD) { bestD = d; bestR = at[i]; }
+                    }
+            if (bestR < 0) return;
+            for (int k = 0; k < 3; k++) rec.area[3 * bestR + k] += float(A[k] * w);
+        };
+        if (centroid) assign(1.0 / 3, 1.0 / 3);
+        else
+            for (int i = 0; i < m1; i++)
+                for (int j = 0; j < m2; j++) {
+                    const double a = (i + 0.5) / m1, b = (j + 0.5) / m2;
+                    if (a + b < 1) assign(a, b);
                 }
-        if (bestR < 0) continue;
-        for (int a = 0; a < 3; a++) rec.area[3 * bestR + a] += float(A[a] * frac);
     }
 }
 
