@@ -62,8 +62,9 @@ MeshSource boxMesh(double sx, double sy, double sz) {
 }
 
 // Ahmed body: rectangular sections with all four nose edges rounded (R 100) and a 25 degree slant
+// 222 mm long, measured along the slanted face (Ahmed et al. 1984)
 MeshSource ahmedBody() {
-    const double L = 1044, H = 288, W = 389, R = 100, sl = 222, tanA = std::tan(25 * M_PI / 180);
+    const double L = 1044, H = 288, W = 389, R = 100, sl = 222 * std::cos(25 * M_PI / 180), tanA = std::tan(25 * M_PI / 180);
     std::vector<double> xs;
     for (int i = 0; i <= 32; i++) xs.push_back(R * (1 - std::cos(i / 32.0 * M_PI / 2)));
     xs.push_back(L - sl);

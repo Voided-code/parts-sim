@@ -29,12 +29,14 @@ const patch = (part, test) => ({ tris: selectTris(part, test), clip: null });
 
 /**
  * Ahmed body (1044 x 288 x 389 mm): all four nose edges rounded with R = 100 mm, sharp
- * longitudinal edges and a 25 degree rear slant. Built as a loft of rectangular sections
- * (each nose edge is a quarter cylinder, so a section at depth x is inset by R - sqrt(R^2 - (R - x)^2)).
+ * longitudinal edges and a rear slant 222 mm long, measured along the slanted face (25 degrees by
+ * default; Ahmed et al. 1984). Built as a loft of rectangular sections (each nose edge is a quarter
+ * cylinder, so a section at depth x is inset by R - sqrt(R^2 - (R - x)^2)).
  */
-function ahmedBody() {
-  const L = 1044, H = 288, W = 389, R = 100, sl = 222;
-  const tan = Math.tan(THREE.MathUtils.degToRad(25));
+export function ahmedBody(slantDeg = 25) {
+  const L = 1044, H = 288, W = 389, R = 100;
+  const a = THREE.MathUtils.degToRad(slantDeg);
+  const sl = 222 * Math.cos(a), tan = Math.tan(a); // slant's length along the body and its slope
   const xs = [];
   for (let i = 0; i <= 32; i++) xs.push(R * (1 - Math.cos((i / 32) * (Math.PI / 2)))); // dense near the nose tip
   xs.push(L - sl, L);
@@ -238,9 +240,9 @@ export const SAMPLES = [
   {
     id: 'ahmed',
     name: 'Ahmed body (car)',
-    note: 'Standard car aerodynamics benchmark: rounded nose, 25° rear slant',
+    note: 'Standard car aerodynamics benchmark: rounded nose, 25° rear slant, 50 mm above a moving road',
     material: 'al-6061',
-    airflow: { yaw: 90, pitch: 0, speed: 40 },
+    airflow: { yaw: 90, pitch: 0, speed: 40, ground: 50 },
     make: () => ahmedBody(),
     setup: (part) => ({
       fixtures: [{ name: 'Underside', patches: [patch(part, (c, n, b) => c[1] < b.min[1] + EPS && n[1] < -0.9)] }],

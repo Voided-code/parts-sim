@@ -118,16 +118,15 @@ test('disposing an initializing worker terminates it and settles initialization'
   }
 });
 
-test('snapshot validation detects a single corrupt density between sampled cells', () => {
-  const study = studyForTest();
-  let recovered = false;
-  Object.assign(study, { N: 8, running: true, engine: 'CPU', recover: () => { recovered = true; } });
-  const macro = new Float32Array(32);
-  for (let c = 0; c < 8; c++) macro[4 * c] = 1;
-  macro[4] = NaN;
-  study.handleSnapshot(macro, 20, 1);
-  assert.equal(recovered, true);
-  assert.equal(study.results, undefined);
+test('an unstable flow stops the study and says so, without changing the physics', () => {
+  let status = '';
+  const study = new AirflowStudy({ flowGroup: new THREE.Group(), onFrame: () => () => {} }, { onStatus: (m) => { status = m; } });
+  Object.assign(study, { N: 8, dims: [8, 1, 1], running: true, engine: 'CPU', sim: { worker: { terminate() {}, postMessage() {} } }, nuLat: 1e-5 });
+  study.onForces({ steps: 10, me: [NaN, 0, 0], pressure: [0, 0, 0], friction: [0, 0, 0] }, 20);
+  assert.equal(study.running, false);
+  assert.equal(study.results, null);
+  assert.match(status, /unstable/);
+  assert.equal(study.nuLat, 1e-5);
   study.dispose();
 });
 

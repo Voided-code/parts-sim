@@ -1,7 +1,7 @@
 // "Airflow" tab: wind setup, LBM run control, aerodynamic results and flow visualisation.
 import * as THREE from 'three';
-import { AirflowStudy, windDirection, U_LAT, flowCapacity, planTunnel, FLOW_CELLS, FLOW_BYTES } from '../cfd/airflow.js';
-import { RAMP_STEPS } from '../cfd/lbm-cpu.js';
+import { AirflowStudy, windDirection, U_LAT, flowCapacity, planTunnel, FLOW_CELLS, FLOW_BYTES, TURBULENT_RE } from '../cfd/airflow.js';
+import { RAMP_STEPS } from '../cfd/flow.js';
 import { webgpuAvailable } from '../cfd/lbm-gpu.js';
 import { $, $$, h, num, force, stress } from './dom.js';
 import { renderLegend } from './legend.js';
@@ -62,7 +62,13 @@ export class AirflowPanel {
       b.addEventListener('click', () => { this.yaw = Number(b.dataset.yaw); this.pitch = Number(b.dataset.pitch); sync(); this.markDirty(); });
     }
     sync();
-    for (const id of ['#wind-speed', '#air-density', '#engine-select']) $(id).addEventListener('change', () => this.markDirty());
+    for (const id of ['#wind-speed', '#air-density', '#engine-select', '#ground-clearance', '#bl-select']) $(id).addEventListener('change', () => this.markDirty());
+    $('#chk-ground').addEventListener('change', (e) => {
+      $('#ground-controls').hidden = !e.target.checked;
+      this.updateCellsInfo();
+      this.markDirty();
+    });
+    $('#chk-autostop').addEventListener('change', (e) => { this.study.autoStop = e.target.checked; });
     // grid size on a log scale: every step of the slider is the same ratio of cells
     $('#flow-cells').addEventListener('input', (e) => {
       const cap = this.capacity();
@@ -106,6 +112,8 @@ export class AirflowPanel {
     const airDensity = Number($('#air-density').value);
     if (!Number.isFinite(speed) || speed <= 0) throw new Error('Wind speed must be a finite positive number.');
     if (!Number.isFinite(airDensity) || airDensity <= 0) throw new Error('Air density must be a finite positive number.');
+    const clearance = Number($('#ground-clearance').value);
+    if ($('#chk-ground').checked && !(Number.isFinite(clearance) && clearance >= 0)) throw new Error('Ground clearance must be zero or more.');
     return {
       dir: windDirection(this.yaw, this.pitch),
       speed,
@@ -113,6 +121,8 @@ export class AirflowPanel {
       cells: this.cells,
       engine: $('#engine-select').value,
       toMeters: this.app.toMeters,
+      ground: $('#chk-ground').checked ? clearance : null,
+      boundaryLayer: $('#bl-select').value,
     };
   }
 
@@ -138,7 +148,7 @@ export class AirflowPanel {
     let nx = Math.cbrt(this.cells);
     if (this.app.part) {
       try {
-        const plan = planTunnel(this.app.part, windDirection(this.yaw, this.pitch), this.cells);
+        const plan = planTunnel(this.app.part, windDirection(this.yaw, this.pitch), this.cells, { margins: 'app', ground: $('#chk-ground').checked ? Number($('#ground-clearance').value) || 0 : null });
         nx = plan.dims[0];
         parts.push(`Tunnel ${plan.dims.join(' × ')}, cells ${num(plan.h)} ${this.app.units} across.`);
       } catch { /* no finite part */ }
@@ -149,7 +159,7 @@ export class AirflowPanel {
     const engine = this.usesGPU() ? 'WebGPU' : 'CPU';
     if (this.lastMlups > 0 && this.lastEngine === engine) {
       const perSecond = (this.lastMlups * 1e6) / this.cells;
-      const develop = (RAMP_STEPS + (0.6 * nx) / U_LAT) / perSecond;
+      const develop = (RAMP_STEPS + (1.5 * nx) / U_LAT) / perSecond;
       parts.push(`At the last run's ${num(this.lastMlups)} MLUPS: about ${num(perSecond)} steps/s, developed flow after about ${num(develop, 2)} s.`);
     }
     parts.push(`Range here: ${count(cap.min)} to ${count(cap.max)} cells.`);
@@ -178,8 +188,12 @@ export class AirflowPanel {
       this.yaw = preset.yaw;
       this.pitch = preset.pitch;
       $('#wind-speed').value = preset.speed;
+      $('#chk-ground').checked = Number.isFinite(preset.ground);
+      $('#ground-controls').hidden = !$('#chk-ground').checked;
+      if (Number.isFinite(preset.ground)) $('#ground-clearance').value = preset.ground;
       this.syncWind();
     }
+    $('#ground-unit').textContent = this.app.units;
     $('#flow-card').hidden = true;
     $('#flow-display').hidden = true;
     this.updateCellsInfo(); // a new part means a new tunnel
@@ -194,7 +208,7 @@ export class AirflowPanel {
     else if (this.study.ready && !this.dirty) run.textContent = 'Resume';
     else run.textContent = this.study.ready ? 'Apply & run' : 'Run airflow';
     $('#btn-flow-reset').disabled = !this.study.ready || this.building;
-    $('#btn-wind-load').disabled = this.dirty || !this.study.results || this.study.developing;
+    $('#btn-wind-load').disabled = this.dirty || !this.study.results || this.study.developing || !this.study.surface;
   }
 
   async run() {
@@ -260,6 +274,9 @@ export class AirflowPanel {
     const r = s.results;
     const kpi = (label, value, sub) => h('div.kpi', {}, h('div.k-label', {}, label), h('div.k-value', {}, value), sub ? h('div.k-sub', {}, sub) : null);
     const u = this.app.units;
+    // "± x" for a 95% confidence interval, once the averages have one
+    const pm = (v, ci, fmt) => (r?.averaged && Number.isFinite(ci) ? `${fmt(v)} ± ${fmt(ci).replace(/^-/, '')}` : fmt(v));
+    const ci = (v) => (r?.averaged && Number.isFinite(v) ? `± ${force(Math.abs(v))} · ` : '');
     if (r) {
       const area = r.frontalArea / (this.app.toMeters * this.app.toMeters);
       // the part's own weight (from its material) against the aerodynamic force
@@ -269,18 +286,28 @@ export class AirflowPanel {
       const ratio = weight > 0 ? up / weight : 0;
       const verdict = ratio >= 1 ? h('span.status.bad', {}, 'the wind lifts it') : ratio >= 0.5 ? h('span.status.warn', {}, `lift is ${Math.round(ratio * 100)}% of its weight`) : `lift is ${Math.max(0, Math.round(ratio * 100))}% of its weight`;
       $('#flow-kpis').replaceChildren(
-        kpi('Drag force', force(r.drag), `Cd ${num(r.cd)}`),
-        kpi('Lift force', force(r.lift), `Cl ${num(r.cl)}`),
+        kpi('Drag force', force(r.drag), `${ci(r.dragCI)}Cd ${pm(r.cd, r.cdCI, (x) => num(x))}`),
+        kpi('Lift force', force(r.lift), `${ci(r.liftCI)}Cl ${pm(r.cl, r.clCI, (x) => num(x))}`),
         h('div.kpi', {}, h('div.k-label', {}, `Weight (${mat.name.split(' (')[0]})`), h('div.k-value', {}, force(weight)), h('div.k-sub', {}, verdict)),
-        kpi('Frontal area', `${num(area)} ${u}²`, `side force ${force(r.side)}`),
-        kpi('Reynolds number', num(s.reynolds), `simulated ≈ ${num(s.simReynolds)}`),
+        kpi('Frontal area', `${num(area)} ${u}²`, `side force ${pm(r.side, r.sideCI, force)}`),
+        kpi('Reynolds number', num(s.reynolds), s.simReynolds < 0.5 * s.reynolds ? `simulated ${num(s.simReynolds)}` : 'simulated at full value'),
       );
-    } else $('#flow-kpis').replaceChildren();
-    const phase = !s.macro ? 'starting' : s.developing ? 'developing flow' : `averaging (${s.samples} samples)`;
+      const notes = [];
+      notes.push(r.averaged ? 'Forces are time averages with their 95% confidence intervals, from the momentum the air exchanges with the part (pressure and skin friction).' : 'Forces now; their averages start once the flow has developed.');
+      notes.push(s.wallModel
+        ? `Boundary layer: turbulent (wall model, Re ${num(s.reynoldsLength)} along the part${s.reynoldsLength < TURBULENT_RE ? ', set by hand' : ''}).`
+        : `Boundary layer: resolved by the grid (laminar${s.reynoldsLength >= TURBULENT_RE ? ', set by hand; the real one is turbulent' : ''}).`);
+      if (s.simReynolds < 0.5 * s.reynolds) notes.push(`The grid holds the flow at a lower Reynolds number (${num(s.simReynolds)}) than real air (${num(s.reynolds)}): expect the drag of rounded shapes to differ.`);
+      $('#flow-notes').textContent = notes.join(' ');
+    } else {
+      $('#flow-kpis').replaceChildren();
+      $('#flow-notes').textContent = '';
+    }
+    const phase = !s.steps ? 'starting' : s.developing ? 'developing flow' : s.converged ? `converged (${s.samples} samples)` : `averaging (${s.samples} samples)`;
     $('#flow-state').textContent = s.ready
-      ? `${this.dirty ? 'Settings changed; apply to update results. ' : ''}${s.engine} · ${s.dims.join('×')} cells · step ${s.steps.toLocaleString()} · ${num(s.mlups || 0)} MLUPS · ${phase}. Forces are pressure-only (skin friction is not resolved).`
+      ? `${this.dirty ? 'Settings changed; apply to update results. ' : ''}${s.engine} · ${s.dims.join('×')} cells · step ${s.steps.toLocaleString()} · ${num(s.mlups || 0)} MLUPS · ${phase}.`
       : '';
-    if (!s.avgRho) {
+    if (!s.surface) {
       this.cp = null;
       this.cpRange = null;
       if (this.app.tab === 'airflow') this.app.viewer.setScalars(null);
@@ -292,7 +319,7 @@ export class AirflowPanel {
     if (this.app.tab !== 'airflow') return;
     const v = this.app.viewer;
     const s = this.study;
-    if ($('#chk-cp').checked && s.avgRho) {
+    if ($('#chk-cp').checked && s.surface) {
       if (force || performance.now() - this.lastCp > 900 || !this.cp) {
         this.cp = s.surfaceCp();
         this.lastCp = performance.now();
@@ -321,7 +348,7 @@ export class AirflowPanel {
         min: this.cpRange[0], max: this.cpRange[1], format: (x) => num(x, 2),
       });
     }
-    const speedShown = (s.macro && ($('#chk-particles').checked || $('#chk-streamlines').checked)) || ($('#chk-slice').checked && s.sliceQuantity === 'speed');
+    const speedShown = (s.fields && ($('#chk-particles').checked || $('#chk-streamlines').checked)) || ($('#chk-slice').checked && s.sliceQuantity === 'speed');
     if (speedShown && s.ready) specs.push({ title: 'Air speed', sub: 'particles, streamlines, slice', min: 0, max: 1.6 * U, format: (x) => `${num(x)} m/s` });
     if ($('#chk-slice').checked && s.sliceQuantity === 'pressure' && s.ready) {
       specs.push({ title: 'Slice pressure (Cp)', min: -1.2, max: 1, format: (x) => num(x, 2) });
@@ -377,7 +404,7 @@ export class AirflowPanel {
   useAsLoad() {
     const s = this.study;
     if (this.dirty) return this.app.status('Apply the changed airflow settings before transferring the wind load.', 'warn');
-    if (!s.results || !s.avgRho) return this.app.status('Run the airflow first.', 'error');
+    if (!s.results || !s.surface) return this.app.status('Run the airflow first.', 'error');
     if (s.developing) return this.app.status('The flow is still developing - wait until it says “averaging”, then try again.', 'warn');
     const F = s.triangleForces();
     const net = new THREE.Vector3();

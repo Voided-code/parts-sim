@@ -355,6 +355,18 @@
               <label>Speed <span class="unit">m/s</span><input type="number" id="wind-speed" value="20" min="0.1" step="1" /></label>
               <label>Air density <span class="unit">kg/m³</span><input type="number" id="air-density" value="1.225" step="0.01" /></label>
             </div>
+            <label class="check" title="A road under the part that moves with the wind, as for a car driving on it"><input type="checkbox" id="chk-ground" /> Road under the part (moving ground)</label>
+            <div class="prop-grid" id="ground-controls" hidden>
+              <label>Ground clearance <span class="unit" id="ground-unit">mm</span><input type="number" id="ground-clearance" value="0" min="0" step="1" /></label>
+            </div>
+            <div class="field">
+              <label for="bl-select">Boundary layer</label>
+              <select id="bl-select" title="How the thin layer of air next to the surface is treated">
+                <option value="auto">Automatic (turbulent above Re 5×10⁵)</option>
+                <option value="turbulent">Turbulent (wall model)</option>
+                <option value="laminar">Laminar (resolved by the grid)</option>
+              </select>
+            </div>
           </div>
           <div class="card">
             <h3>Solver</h3>
@@ -372,6 +384,7 @@
             </div>
             <p class="muted small" id="flow-cells-info"></p>
             <p class="muted small" id="gpu-info"></p>
+            <label class="check" title="Pause once the forces' 95% confidence interval is within about 1%"><input type="checkbox" id="chk-autostop" checked /> Stop when the forces have settled</label>
           </div>
           <div class="run-row">
             <button class="btn primary big" id="btn-flow-run">Run airflow</button>
@@ -380,6 +393,7 @@
           <div class="card" id="flow-card" hidden>
             <h3>Aerodynamics</h3>
             <div class="kpis" id="flow-kpis"></div>
+            <p class="muted small" id="flow-notes"></p>
             <p class="muted small" id="flow-state"></p>
           </div>
           <div class="card" id="flow-display" hidden>
