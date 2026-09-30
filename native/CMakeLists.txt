@@ -95,6 +95,9 @@ add_library(partssim_core STATIC
   src/fea/study_runner.cpp
   src/cfd/lbm.cpp
   src/cfd/lbm_gpu.cpp
+  src/cfd/flow.cpp
+  src/cfd/flow_cpu.cpp
+  src/cfd/flow_gpu.cpp
   src/cfd/airflow.cpp
   src/gpu/gpu.cpp
   src/gpu/gpu_fea.cpp
@@ -131,6 +134,7 @@ ps_test(test_model)
 ps_test(test_gpu)
 ps_test(test_studies)
 ps_test(test_lbm)
+ps_test(test_flow)
 # performance benchmark (run by hand: build/bench [filter])
 add_executable(bench tests/bench.cpp)
 target_link_libraries(bench PRIVATE partssim_core)

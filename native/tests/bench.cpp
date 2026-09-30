@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "cfd/flow.hpp"
 #include "cfd/lbm.hpp"
 #include "core/voxelize.hpp"
 #include "fea/eigen.hpp"
@@ -340,11 +341,112 @@ static std::string kitReport(std::string& log) {
     return j.obj();
 }
 
+// the v1 engine (cfd/flow.hpp): steps for about `seconds` in submissions of ~40 ms (step() sizes them)
+static std::pair<int64_t, double> timedFlow(flow::Solver& sim, double seconds) {
+    sim.step(20);
+    int64_t steps = 0;
+    const auto t0 = Clock::now();
+    while (since(t0) < seconds) {
+        sim.step(50);
+        steps += 50;
+    }
+    return {steps, since(t0)};
+}
+
+static std::string kitReportV1(std::string& log) {
+    Json j;
+    j.str("format", "parts-sim-native-bench/1");
+#ifdef PARTS_SIM_VERSION
+    j.str("version", PARTS_SIM_VERSION);
+#endif
+    j.str("solver", "v1");
+    j.str("gpu", gpuAvailable() ? gpuName() : "none");
+    j.str("backendRequest", std::getenv("PARTS_SIM_GPU_BACKEND") ? std::getenv("PARTS_SIM_GPU_BACKEND") : "default");
+    j.num("threads", ThreadPool::instance().size());
+    j.num("shaderF16", gpuShaderF16() ? 1 : 0);
+    auto say = [&](const char* fmt, auto... a) {
+        char b[200];
+        std::snprintf(b, sizeof b, fmt, a...);
+        log += b;
+        std::fputs(b, stdout);
+        std::fflush(stdout);
+    };
+    std::string ladder = "[";
+    const double bytes16 = 2 * 19 * 2 + 1, bytes32 = 2 * 19 * 4 + 1;  // in place: 19 read and written, the kind byte
+    if (gpuAvailable()) {
+        const double cap = std::min(0.95 * double(flow::gpuMaxCells()), 300e6);
+        for (double n = 1e6; n <= cap; n *= 2) {
+            Json r;
+            try {
+                const auto g = flow::syntheticGrid(n);
+                flow::Params p;
+                p.nuLat = 1e-5;
+                auto sim = flow::makeGpu(g, p);
+                const auto [steps, secs] = timedFlow(*sim, 4);
+                const double cells = double(g.N), mlups = cells * steps / secs / 1e6, bytes = gpuShaderF16() ? bytes16 : bytes32;
+                r.num("cells", cells).raw("dims", "[" + std::to_string(g.dims[0]) + "," + std::to_string(g.dims[1]) + "," + std::to_string(g.dims[2]) + "]");
+                r.num("steps", double(steps)).num("seconds", secs).num("mlups", mlups).num("bytesPerCellStep", bytes).num("gbs", mlups * bytes / 1e3);
+                say("ladder %.0fM: %.0f MLUPS (%.0f GB/s)\n", cells / 1e6, mlups, mlups * bytes / 1e3);
+            } catch (const std::exception& e) {
+                r.num("cells", n).str("error", e.what());
+                ladder += (ladder.size() > 1 ? "," : "") + r.obj();
+                say("ladder %.0fM: %s\n", n / 1e6, e.what());
+                break;
+            }
+            ladder += (ladder.size() > 1 ? "," : "") + r.obj();
+        }
+        // kernel variants at 32M cells: workgroup shapes, 16/32-bit storage, both collision models
+        std::string tune = "[";
+        const auto g = flow::syntheticGrid(std::min(32e6, cap));
+        struct V { int wgx, wgy; bool half, rr; };
+        for (const V v : {V{64, 1, true, true}, V{128, 1, true, true}, V{256, 1, true, true}, V{32, 2, true, true}, V{32, 4, true, true}, V{64, 2, true, true},
+                          V{64, 4, true, true}, V{16, 4, true, true}, V{16, 8, true, true}, V{64, 1, false, true}, V{64, 1, true, false}}) {
+            Json r;
+            r.num("wgx", v.wgx).num("wgy", v.wgy).num("half", v.half).str("collision", v.rr ? "rr" : "bgk");
+            try {
+                flow::Params p;
+                p.nuLat = v.rr ? 1e-5 : 0.002;
+                p.rr = v.rr;
+                p.half = v.half;
+                p.wgx = v.wgx;
+                p.wgy = v.wgy;
+                auto sim = flow::makeGpu(g, p);
+                const auto [steps, secs] = timedFlow(*sim, 3);
+                const double mlups = double(g.N) * steps / secs / 1e6;
+                r.num("cells", double(g.N)).num("mlups", mlups).num("gbs", mlups * (v.half && gpuShaderF16() ? bytes16 : bytes32) / 1e3);
+                say("tune %dx%d %s %s: %.0f MLUPS\n", v.wgx, v.wgy, v.half ? "16-bit" : "32-bit", v.rr ? "rr" : "bgk", mlups);
+            } catch (const std::exception& e) {
+                r.str("error", e.what());
+            }
+            tune += (tune.size() > 1 ? "," : "") + r.obj();
+        }
+        j.raw("tune", tune + "]");
+    }
+    j.raw("ladder", ladder + "]");
+    // the CPU solver on all cores
+    {
+        const auto g = flow::syntheticGrid(4e6);
+        flow::Params p;
+        p.nuLat = 1e-5;
+        auto sim = flow::makeCpu(g, p);
+        sim->sampleEvery = 0;
+        sim->step(5);
+        const auto t0 = Clock::now();
+        int steps = 0;
+        while (since(t0) < 4) { sim->step(5); steps += 5; }
+        const double mlups = double(g.N) * steps / since(t0) / 1e6;
+        j.raw("cpu", Json().num("cells", double(g.N)).num("mlups", mlups).obj());
+        say("cpu %.0fM: %.0f MLUPS\n", double(g.N) / 1e6, mlups);
+    }
+    return j.obj();
+}
+
 int main(int argc, char** argv) {
-    // bench --json <file> kit: the benchmark kit's report
+    // bench --json <file> kit [v0.6|v1]: the benchmark kit's report (the v1 engine by default)
     if (argc > 3 && std::string(argv[1]) == "--json" && std::string(argv[3]) == "kit") {
         std::string log;
-        const std::string json = kitReport(log);
+        const bool legacy = argc > 4 && std::string(argv[4]) == "v0.6";
+        const std::string json = legacy ? kitReport(log) : kitReportV1(log);
         if (FILE* f = std::fopen(argv[2], "wb")) {
             std::fwrite(json.data(), 1, json.size(), f);
             std::fclose(f);
