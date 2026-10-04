@@ -1,6 +1,7 @@
 // The .psim file (native reader and writer): the same cases as test/psim.test.js, plus the JS-written fixture.
 // Compile with -fsanitize=address,undefined to run it under the sanitizers (see native/README.md).
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -543,7 +544,9 @@ TEST("fuzz: random damage never produces anything but a psim::Error, and never h
     Rng rng(2026);
     const auto t0 = std::chrono::steady_clock::now();
     int accepted = 0;
-    for (int k = 0; k < 600; k++) {
+    const char* env = std::getenv("PSIM_FUZZ_CASES");  // a longer run by hand, e.g. under the sanitizers
+    const int cases = env ? std::atoi(env) : 600;
+    for (int k = 0; k < cases; k++) {
         Bytes copy = base;
         const int edits = 1 + int(rng.next() * 6);
         for (int e = 0; e < edits; e++) {
@@ -567,8 +570,8 @@ TEST("fuzz: random damage never produces anything but a psim::Error, and never h
             CHECK(false);
         }
     }
-    CHECK(pstest::ms(t0) < 25000);
-    CHECK(accepted < 600);
+    CHECK(env || pstest::ms(t0) < 25000);
+    CHECK(accepted < cases);
 }
 
 TEST("fuzz: damage inside the decompressed sections (checksums valid)") {
@@ -578,7 +581,9 @@ TEST("fuzz: damage inside the decompressed sections (checksums valid)") {
     const Bytes base = writePsim(c, fixedOptions());
     const Table t = readTable(base);
     int rejected = 0;
-    for (int k = 0; k < 400; k++) {
+    const char* env = std::getenv("PSIM_FUZZ_CASES");
+    const int cases = env ? std::atoi(env) / 2 : 400;
+    for (int k = 0; k < cases; k++) {
         const TableEntry& e = t.entries[size_t(rng.next() * t.entries.size())];
         if (e.id == "THMB") continue;
         Bytes raw = readSection(base.data(), base.size(), e);

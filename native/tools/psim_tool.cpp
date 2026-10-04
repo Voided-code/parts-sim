@@ -4,7 +4,7 @@
 //   psim_tool inspect <file>           the same table as `node scripts/psim.mjs inspect`
 //   psim_tool dump <file>              a stable, line-based text of the decoded content (see scripts/psim.mjs dump)
 //   psim_tool make-fixture <out> [--brep]   writes the content of test/helpers/psim-content.mjs sampleContent()
-//   psim_tool bench <file>             times a read and a write of the file's content
+//   psim_tool bench <file> [out.psim]  times a read and a write of the file's content (and keeps the written file)
 //
 // `dump` prints exactly what `node scripts/psim.mjs dump` prints for the same file, so the two apps can be
 // compared with diff. Numbers are printed with %.9g.
@@ -275,7 +275,7 @@ int cmdMakeFixture(const std::string& out, bool brep) {
 
 double nowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-int cmdBench(const std::string& path) {
+int cmdBench(const std::string& path, const std::string& outPath) {
     const Bytes bytes = loadFile(path);
     File f;
     double bestRead = 1e30;
@@ -296,6 +296,7 @@ int cmdBench(const std::string& path) {
         bestWrite = std::min(bestWrite, nowMs() - t0);
     }
     std::printf("%s: file %zu bytes; read %.1f ms; write %.1f ms -> %zu bytes\n", path.c_str(), bytes.size(), bestRead, bestWrite, out.size());
+    if (!outPath.empty()) saveFile(outPath, out);
     return 0;
 }
 
@@ -309,7 +310,7 @@ int main(int argc, char** argv) {
         if (cmd == "inspect" && argc > 2) return cmdInspect(file);
         if (cmd == "dump" && argc > 2) return cmdDump(file);
         if (cmd == "make-fixture" && argc > 2) return cmdMakeFixture(file, argc > 3 && std::string(argv[3]) == "--brep");
-        if (cmd == "bench" && argc > 2) return cmdBench(file);
+        if (cmd == "bench" && argc > 2) return cmdBench(file, argc > 3 ? argv[3] : "");
     } catch (const Error& e) {
         std::fprintf(stderr, "%s: %s\n", file.c_str(), e.what());
         return 1;
@@ -317,6 +318,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s: %s\n", file.c_str(), e.what());
         return 1;
     }
-    std::fprintf(stderr, "usage: psim_tool verify|inspect|dump|bench <file>\n       psim_tool make-fixture <out.psim> [--brep]\n");
+    std::fprintf(stderr, "usage: psim_tool verify|inspect|dump <file>\n       psim_tool bench <file> [out.psim]\n       psim_tool make-fixture <out.psim> [--brep]\n");
     return cmd.empty() ? 0 : 2;
 }
