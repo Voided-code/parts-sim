@@ -1258,6 +1258,96 @@ public:
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); view_.playing = false; }
 
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        const Result& r = *r_;
+        psim::Arrays out;
+        Value m = jobj();
+        auto put = [&](const char* k, double v) { m.obj[k] = jnum(v); };
+        put("nVert", part().nVert);
+        m.obj["units"] = jstr(r.units.toStdString());
+        m.obj["material"] = materialToJson(r.material);
+        put("height", r.height); put("speed", r.run.speed); put("mass", r.run.mass); put("peak", r.peak); put("peakAt", r.peakAt);
+        put("peakForce", r.run.peakForce); put("contactTime", r.run.contactTime); put("duration", r.run.duration); put("steps", r.run.steps);
+        put("dt", r.run.dt);
+        m.obj["rebounded"] = jbool(r.run.rebounded);
+        put("autoScale", r.autoScale);
+        put("nTimes", double(r.run.times.size()));
+        int peakFrame = int(r.frames.size()) - 1;
+        if (r.peakAt >= 0 && size_t(r.peakAt) < r.run.tPeak.size())
+            for (size_t i = 0; i < r.frames.size(); i++) if (r.frames[i].t >= r.run.tPeak[r.peakAt]) { peakFrame = int(i); break; }
+        put("peakFrame", std::max(0, peakFrame));
+        Value ft = jarr(), ff = jarr();
+        for (const auto& f : r.frames) { ft.arr.push_back(jnum(f.t)); ff.arr.push_back(jnum(f.force)); }
+        m.obj["frameTimes"] = ft;
+        m.obj["frameForces"] = ff;
+        m.obj["engine"] = jstr(r.run.engine);
+        m.obj["gpuNote"] = jstr(r.run.gpuNote);
+        out.meta = m;
+        auto add = [&](const std::string& name, const std::vector<float>& d, psim::Enc enc, uint32_t stride) {
+            psim::Array a;
+            a.name = name; a.enc = enc; a.f = d; a.stride = stride;
+            out.list.push_back(std::move(a));
+        };
+        add("drop.vmMax", r.run.vmMax, psim::Enc::Q16, 1);
+        add("drop.times", r.run.times, psim::Enc::F32, 1);
+        add("drop.forces", r.run.forces, psim::Enc::F32, 1);
+        for (size_t i = 0; i < r.frames.size(); i++) {
+            add("drop.frame." + std::to_string(i) + ".u", r.frames[i].u, psim::Enc::Q16, 3);
+            add("drop.frame." + std::to_string(i) + ".vm", r.frames[i].vm, psim::Enc::Q16, 1);
+        }
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        const size_t nV = size_t(part().nVert);
+        if (numOr(m["nVert"], -1) != double(nV)) throw std::runtime_error("The drop test in the file was computed for a different part.");
+        auto get = [&](const std::string& name, size_t n, bool any) -> const std::vector<float>& {
+            const psim::Array* a = arrays.find(name);
+            if (!a || (!any && a->f.size() != n)) throw std::runtime_error("The drop test in the file does not fit this part.");
+            return a->f;
+        };
+        Result r;
+        r.run.vmMax = get("drop.vmMax", nV, false);
+        r.run.times = get("drop.times", 0, true);
+        r.run.forces = get("drop.forces", 0, true);
+        const auto& ft = m["frameTimes"].arr;
+        const auto& ff = m["frameForces"].arr;
+        for (size_t i = 0; i < ft.size(); i++) {
+            DropFrame f;
+            f.t = numOr(ft[i], 0);
+            f.force = numOr(ff.size() > i ? ff[i] : Value{}, 0);
+            f.u = get("drop.frame." + std::to_string(i) + ".u", 3 * nV, false);
+            f.vm = get("drop.frame." + std::to_string(i) + ".vm", nV, false);
+            r.frames.push_back(std::move(f));
+        }
+        if (r.frames.empty()) throw std::runtime_error("The drop test in the file has no frames.");
+        r.run.speed = numOr(m["speed"], 0); r.run.mass = numOr(m["mass"], 0); r.run.peakForce = numOr(m["peakForce"], 0);
+        r.run.contactTime = numOr(m["contactTime"], 0); r.run.duration = numOr(m["duration"], 0); r.run.dt = numOr(m["dt"], 0);
+        r.run.steps = int(numOr(m["steps"], 0));
+        r.run.rebounded = boolOr(m["rebounded"], false);
+        r.run.engine = strOr(m["engine"]);
+        r.run.gpuNote = strOr(m["gpuNote"]);
+        r.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material;
+        r.units = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+        r.height = numOr(m["height"], 1);
+        r.peak = numOr(m["peak"], 0);
+        r.peakAt = int(numOr(m["peakAt"], -1));
+        r.autoScale = numOr(m["autoScale"], 1);
+        const int pf = std::clamp(int(numOr(m["peakFrame"], double(r.frames.size()) - 1)), 0, int(r.frames.size()) - 1);
+        r.run.tPeak.assign(nV, 0.f);
+        if (r.peakAt >= 0 && size_t(r.peakAt) < nV) r.run.tPeak[r.peakAt] = float(r.frames[pf].t);
+        height_ = r.height;
+        view_.frame = pf;
+        view_.exaggerate = r.autoScale;
+        view_.plot = "peak";
+        view_.playing = false;
+        r_ = std::move(r);
+        invalidate();
+    }
+
     bool options(QVBoxLayout* l) override {
         l->addWidget(heading(tr("DROP OPTIONS")));
         auto* speed = note("");
