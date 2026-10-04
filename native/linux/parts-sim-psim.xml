@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-parts-sim">
+    <comment>Parts Sim file</comment>
+    <glob pattern="*.psim"/>
+    <magic priority="60">
+      <match type="string" offset="1" value="PSIM"/>
+    </magic>
+    <icon name="parts-sim"/>
+  </mime-type>
+</mime-info>

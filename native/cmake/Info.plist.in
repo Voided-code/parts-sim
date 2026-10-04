@@ -19,6 +19,17 @@
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
+      <key>CFBundleTypeName</key><string>Parts Sim File</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array><string>org.partssim.psim</string></array>
+      <key>CFBundleTypeExtensions</key>
+      <array><string>psim</string></array>
+      <key>CFBundleTypeMIMETypes</key>
+      <array><string>application/x-parts-sim</string></array>
+    </dict>
+    <dict>
       <key>CFBundleTypeName</key><string>SolidWorks Part or Assembly</string>
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>LSHandlerRank</key><string>Alternate</string>
@@ -38,6 +49,22 @@
       <key>LSHandlerRank</key><string>Alternate</string>
       <key>CFBundleTypeExtensions</key>
       <array><string>stl</string><string>obj</string><string>ply</string><string>glb</string><string>gltf</string><string>3mf</string></array>
+    </dict>
+  </array>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.partssim.psim</string>
+      <key>UTTypeDescription</key><string>Parts Sim File</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>psim</string></array>
+        <key>public.mime-type</key>
+        <array><string>application/x-parts-sim</string></array>
+      </dict>
     </dict>
   </array>
 </dict>
