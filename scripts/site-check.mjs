@@ -4,6 +4,7 @@
 //              test-artifacts/web/, button rules asserted
 //   isolation  /app/ gets cross-origin isolation from its service worker, or says it runs on one thread
 //   smoke      scripts/browser-smoke.mjs against the served /app/
+//   psim       scripts/psim-smoke.mjs against the served /app/: a .psim file saved and opened on the website
 // With no argument all four run. Browser parts need CHROME=<path to Chrome for Testing>.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
@@ -16,7 +17,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const site = join(root, '_site');
 const shots = join(root, 'test-artifacts/web');
 const want = process.argv.slice(2);
-const run = (name) => want.length === 0 || want.includes(name);
+const run = (name) => want.includes(name) || (want.length === 0 && name !== "psim");
 mkdirSync(shots, { recursive: true });
 
 function walk(dir, found = []) {
@@ -194,6 +195,19 @@ async function checkIsolation() {
   }
 }
 
+async function checkPsim() {
+  const { server, url } = await serveSite(site);
+  try {
+    const status = await new Promise((done) => {
+      const child = spawn(process.execPath, [join(root, 'scripts/psim-smoke.mjs')], { stdio: 'inherit', env: { ...process.env, PARTS_SIM_URL: `${url}app/` } });
+      child.on('exit', done);
+    });
+    assert.equal(status, 0, 'psim-smoke failed against the built /app/');
+  } finally {
+    server.close();
+  }
+}
+
 async function checkSmoke() {
   const { server, url } = await serveSite(site);
   try {
@@ -212,4 +226,5 @@ if (run('links')) checkLinks();
 if (run('downloads')) await checkDownloads();
 if (run('isolation')) await checkIsolation();
 if (run('smoke')) await checkSmoke();
+if (want.includes('psim')) await checkPsim();
 console.log('site checks passed');
