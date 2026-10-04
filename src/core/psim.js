@@ -110,7 +110,7 @@ const zigzag = (v) => ((v << 1) ^ (v >> 31)) >>> 0;
 const unzigzag = (u) => (u >>> 1) ^ -(u & 1);
 
 /** Writes `values` (unsigned, `width` bytes each) as byte planes at `out[o...]`. Returns the new offset. */
-function putPlanes(out, o, values, width) {
+export function putPlanes(out, o, values, width) {
   const n = values.length;
   for (let b = 0; b < width; b++) {
     const shift = 8 * b;
@@ -169,7 +169,7 @@ const LEVELS = { q16: 65536, q8: 256 };
 const WIDTH = { q16: 2, q8: 1, f32: 4, i32: 4, u8: 1 };
 
 /** Prediction residuals of quantised codes, in place order x fastest. Returns zig-zag residuals. */
-function predictEncode(codes, L, dims) {
+export function predictEncode(codes, L, dims) {
   const n = codes.length;
   const res = new Uint16Array(n);
   const half = L >> 1;
