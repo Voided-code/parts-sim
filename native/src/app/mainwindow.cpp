@@ -56,7 +56,7 @@ double unitToMeters(const QString& u) {
 QString extensionsFilter() {
     QStringList pats;
     for (const auto& e : supportedExtensions()) pats << "*." + QString::fromStdString(e) << "*." + QString::fromStdString(e).toUpper();
-    return QObject::tr("CAD and mesh files (%1);;STEP / IGES (*.step *.stp *.iges *.igs *.brep);;SolidWorks (*.sldprt *.sldasm);;Meshes (*.stl *.obj *.3mf *.ply *.glb)")
+    return QObject::tr("Parts Sim and CAD files (*.psim %1);;Parts Sim files (*.psim);;CAD and mesh files (%1);;STEP / IGES (*.step *.stp *.iges *.igs *.brep);;SolidWorks (*.sldprt *.sldasm);;Meshes (*.stl *.obj *.3mf *.ply *.glb)")
         .arg(pats.join(' '));
 }
 
@@ -81,8 +81,8 @@ void MainWindow::buildUi() {
     tb->setMovable(false);
     tb->setObjectName("mainToolbar");
     tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
-    auto* open = tb->addAction(tr("Import part…"), this, [this] {
-        const auto files = QFileDialog::getOpenFileNames(this, tr("Import part"), QString(), extensionsFilter());
+    auto* open = tb->addAction(tr("Open…"), this, [this] {
+        const auto files = QFileDialog::getOpenFileNames(this, tr("Open a part or a .psim file"), QString(), extensionsFilter());
         if (!files.isEmpty()) openFiles(files);
     });
     open->setShortcut(QKeySequence::Open);
@@ -128,6 +128,12 @@ void MainWindow::buildUi() {
     viewportHost_ = new QWidget(split);
     auto* vl = new QVBoxLayout(viewportHost_);
     vl->setContentsMargins(0, 0, 0, 0);
+    banner_ = new QFrame(viewportHost_);
+    banner_->setObjectName("fileBanner");
+    banner_->setStyleSheet("#fileBanner{background:#27406b;border-bottom:1px solid #4a6aa0;} #fileBanner QLabel{color:#fff;}");
+    banner_->setFixedHeight(40);
+    banner_->hide();
+    vl->addWidget(banner_);
     viewer = new Viewport(viewportHost_);
     vl->addWidget(viewer);
     legend = new Legend(viewer);
@@ -223,11 +229,12 @@ void MainWindow::buildUi() {
 void MainWindow::buildMenus() {
     auto* file = menuBar()->addMenu(tr("&File"));
     file->addAction(tr("Open…"), QKeySequence::Open, this, [this] {
-        const auto files = QFileDialog::getOpenFileNames(this, tr("Import part"), QString(), extensionsFilter());
+        const auto files = QFileDialog::getOpenFileNames(this, tr("Open a part or a .psim file"), QString(), extensionsFilter());
         if (!files.isEmpty()) openFiles(files);
     });
     auto* sm = file->addMenu(tr("Open Sample"));
     for (const auto& s : samples()) sm->addAction(QString::fromStdString(s.name), this, [this, id = s.id] { loadSample(QString::fromStdString(id)); });
+    file->addAction(tr("Save as .psim…"), QKeySequence::Save, this, [this] { showSaveDialog(); });
     file->addSeparator();
     file->addAction(tr("Save Screenshot…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S), this, [this] { saveScreenshot(); });
     file->addSeparator();
@@ -379,8 +386,16 @@ bool MainWindow::loadPart(const MeshSource& src, const QString& u, const QString
         status(tr("Could not process the mesh: %1").arg(e.what()), "error");
         return false;
     }
+    return installPart(p, u, info, setup, keepTab);
+}
+
+bool MainWindow::installPart(std::shared_ptr<Part> p, const QString& u, const QString& info, const SampleSetup* setup, bool keepTab) {
     if (picker->active()) picker->finish(false);
     structural->deactivate();
+    loadedFile.reset();
+    sourceBytes.clear();
+    sourceName.clear();
+    if (banner_) banner_->hide();
     part = p;
     partInfo = info;
     if (!u.isEmpty()) setUnits(u, false);
@@ -403,6 +418,8 @@ void MainWindow::loadGeneratedPart(MeshSource src, const QString& info) {
 
 void MainWindow::openFiles(const QStringList& paths) {
     if (paths.isEmpty()) return;
+    for (const auto& p : paths)
+        if (p.endsWith(".psim", Qt::CaseInsensitive)) { openPsim(p); return; }
     // an assembly opens with its parts found in the same folder
     QString primary = paths.first();
     for (const auto& p : paths)
@@ -434,6 +451,14 @@ void MainWindow::openFiles(const QStringList& paths) {
     }
     busy->hideBusy();
     if (!loadPart(src, QString::fromStdString(src.units), QString::fromStdString(src.info), nullptr, true)) return;
+    {
+        static const QStringList cadExt = {"step", "stp", "iges", "igs", "brep", "sldprt", "sldasm"};
+        QFile f(primary);
+        if (cadExt.contains(QFileInfo(primary).suffix().toLower()) && f.size() < (256ll << 20) && f.open(QIODevice::ReadOnly)) {
+            sourceBytes = f.readAll();
+            sourceName = name;
+        }
+    }
     QStringList notes;
     for (const auto& w : src.warnings) notes << QString::fromStdString(w);
     const std::string matId = matchMaterial(src.material);

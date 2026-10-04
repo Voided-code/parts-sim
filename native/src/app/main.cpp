@@ -98,6 +98,27 @@ void runScript(ps::MainWindow* w, QStringList steps) {
     auto next = [w, steps](int delay) { QTimer::singleShot(delay, w, [w, steps] { runScript(w, steps); }); };
     if (cmd == "sample") w->loadSample(arg);
     else if (cmd == "open") w->openFiles({arg});
+    else if (cmd == "savepsim") {
+        // savepsim:<path>[:geometry=exact][:noresults][:nosetup] - write the current state as a .psim file
+        QStringList parts = arg.split(':');
+        ps::PsimSaveOptions o;
+        while (parts.size() > 1 && (parts.last().startsWith("geometry=") || parts.last() == "noresults" || parts.last() == "nosetup")) {
+            const QString opt = parts.takeLast();
+            if (opt == "geometry=exact") o.exact = true;
+            else if (opt == "noresults") { o.allResults = false; o.results.clear(); }
+            else if (opt == "nosetup") o.setup = false;
+        }
+        if (!w->savePsim(parts.join(':'), o)) return scriptFailure("Could not save the .psim file. " + w->statusText());
+        std::printf("psim save: %.0f ms\n", w->psimSaveMs);
+        std::fflush(stdout);
+    } else if (cmd == "psimtime") {
+        std::printf("psim open: %.0f ms, save: %.0f ms\n", w->psimOpenMs, w->psimSaveMs);
+        std::fflush(stdout);
+    } else if (cmd == "fileinfo") {
+        if (!w->loadedFile) return scriptFailure("No file is open.");
+        std::printf("psim file: %s, %zu bytes, format %d\n", qPrintable(w->loadedFile->name), w->loadedFile->size, w->loadedFile->version);
+        std::fflush(stdout);
+    } else if (cmd == "rerun") w->rerunLoaded();
     else if (cmd == "tab") w->setTab(arg);
     else if (cmd == "study") w->structural->selectStudy(arg);
     else if (cmd == "run") {
@@ -153,6 +174,10 @@ void runScript(ps::MainWindow* w, QStringList steps) {
         if (arg == "part") {
             if (!w->part || w->part->nVert <= 0 || w->part->nTri <= 0)
                 return scriptFailure("No part was loaded. " + w->statusText());
+        } else if (arg == "psim") {
+            if (!w->psimShowingResults()) return scriptFailure("No .psim file with results is loaded. " + w->statusText());
+            std::printf("PARTS_SIM_PSIM_OK %s\n", qPrintable(w->structural->resultSummary()));
+            std::fflush(stdout);
         } else if (arg == "static") {
             if (!w->part || !w->structural->hasSuccessfulStaticResult())
                 return scriptFailure("No successful current static result. " + w->statusText());

@@ -4,6 +4,7 @@
 
 #include <QWidget>
 #include <memory>
+#include "core/psim.hpp"
 #include <optional>
 #include <vector>
 
@@ -56,6 +57,15 @@ public:
     void addOnFace(Item::Type type, int face, double value);
     void setTransient(bool on);
     std::shared_ptr<JobControl> job;
+
+    // ---- .psim files (JS: thermal-panel.js exportState / importState / exportResult / importResult) ----
+    json::Value exportState() const;
+    void importState(const json::Value& s);
+    std::optional<psim::Arrays> exportResult() const;
+    void importResult(const json::Value& meta, const psim::Arrays& arrays);
+    json::Value exportView() const;
+    void importView(const json::Value& v);
+    bool hasResult() const { return result_.has_value(); }
 
 private:
     void buildUi();

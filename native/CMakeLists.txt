@@ -164,6 +164,7 @@ if(PARTS_SIM_APP)
     qt_add_executable(PartsSim WIN32 MACOSX_BUNDLE
       src/app/main.cpp
       src/app/mainwindow.cpp
+      src/app/mainwindow_psim.cpp
       src/app/viewport.cpp
       src/app/widgets.cpp
       src/app/jobs.cpp

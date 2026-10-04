@@ -1,4 +1,5 @@
 #include "structuralpanel.hpp"
+#include "psimjson.hpp"
 
 #include <QButtonGroup>
 #include <QCheckBox>
@@ -487,6 +488,7 @@ void StructuralPanel::reset(const SampleSetup* setup) {
 }
 
 void StructuralPanel::markStale() {
+    app_->psimEdited();
     if (job) cancelJob();
     const bool has = result_ || brk_ || (study_ > 0 && studies[study_ - 1]->hasResult());
     if (has) {
@@ -1288,7 +1290,9 @@ void StructuralPanel::mapResult(const StaticResult& res, const Prepared& prep) {
     r.voxelSize = m.grid.h;
     r.resolution = m.resolution;
     r.wallThickness = m.wallThickness;
+    const std::map<QString, double> now = {{"maxVM", r.maxVM}, {"maxDisp", r.maxDisp}, {"minFos", r.minFos}};
     result_ = std::move(r);
+    app_->psimRunDone("static", now);
 }
 
 // ---------- display ----------
@@ -1839,6 +1843,226 @@ void StructuralPanel::showBreakStep() {
     } else v->clearMarker();
     renderBreakKpis();
     drawOverlays();
+}
+
+
+// ---------- .psim files ----------
+
+json::Value StructuralPanel::exportSetup() const {
+    using namespace pj;
+    Value o = jobj();
+    o.obj["study"] = jstr(studyInfos()[study_].id.toStdString());
+    o.obj["resolution"] = jnum(resolution_);
+    Value rf = jobj();
+    rf.obj[studyInfos()[study_].id.toStdString()] = jnum(resolution_);
+    o.obj["resFor"] = rf;
+    o.obj["gravity"] = jbool(gravity_->isChecked());
+    o.obj["engine"] = jstr(engine_->currentIndex() == 2 ? "cpu" : "auto");
+    Value fx = jarr();
+    for (const auto& f : fixtures) {
+        Value e = jobj();
+        e.obj["name"] = jstr(f.name);
+        Value ps = jarr();
+        for (const auto& p : f.patches) ps.arr.push_back(patchToJson(p));
+        e.obj["patches"] = ps;
+        fx.arr.push_back(e);
+    }
+    o.obj["fixtures"] = fx;
+    Value ld = jarr();
+    for (size_t i = 0; i < loads.size(); i++) {
+        const Load& l = loads[i];
+        Value e = jobj();
+        e.obj["name"] = jstr(l.name);
+        e.obj["type"] = jstr(l.type == Load::Force ? "force" : l.type == Load::Pressure ? "pressure" : "wind");
+        e.obj["magnitude"] = jnum(l.magnitude);
+        e.obj["dir"] = vec3(l.dir);
+        e.obj["userDir"] = jbool(!isNewForce_.count(int(i)));
+        if (l.type == Load::Wind) {
+            std::vector<double> net(3, 0.0);
+            for (size_t k = 0; k + 2 < l.forces.size(); k += 3)
+                for (int d = 0; d < 3; d++) net[d] += l.forces[k + d];
+            e.obj["net"] = vec(net);
+        } else {
+            Value ps = jarr();
+            for (const auto& p : l.patches) ps.arr.push_back(patchToJson(p));
+            e.obj["patches"] = ps;
+        }
+        ld.arr.push_back(e);
+    }
+    o.obj["loads"] = ld;
+    o.obj["options"] = jobj();
+    return o;
+}
+
+std::vector<psim::Array> StructuralPanel::windArrays() const {
+    std::vector<psim::Array> out;
+    for (size_t i = 0; i < loads.size(); i++) {
+        if (loads[i].type != Load::Wind || loads[i].forces.empty()) continue;
+        psim::Array a;
+        a.name = "load." + std::to_string(i) + ".forces";
+        a.enc = psim::Enc::Q16;
+        a.f = loads[i].forces;
+        out.push_back(std::move(a));
+    }
+    return out;
+}
+
+void StructuralPanel::importMaterial(const json::Value& m) { app_->setMaterial(pj::materialFromJson(m)); }
+
+void StructuralPanel::importSetup(const json::Value& s, const psim::Arrays* arrays) {
+    using namespace pj;
+    const int nTri = app_->part->nTri;
+    std::vector<Fixture> newFixtures;
+    for (const auto& f : s["fixtures"].arr) {
+        Fixture fx;
+        fx.name = strOr(f["name"], "Fixed");
+        for (const auto& p : f["patches"].arr) {
+            Patch q = patchFromJson(p, nTri);
+            if (!q.tris.empty()) fx.patches.push_back(std::move(q));
+        }
+        newFixtures.push_back(std::move(fx));
+    }
+    std::vector<Load> newLoads;
+    std::set<int> userDir;
+    for (size_t i = 0; i < s["loads"].arr.size(); i++) {
+        const Value& l = s["loads"].arr[i];
+        Load ld;
+        ld.name = strOr(l["name"], "Force");
+        const std::string type = strOr(l["type"]);
+        ld.magnitude = numOr(l["magnitude"], 0);
+        ld.dir = {0, -1, 0};
+        if (l["dir"].size() == 3) ld.dir = {numOr(l["dir"][0], 0), numOr(l["dir"][1], -1), numOr(l["dir"][2], 0)};
+        if (type == "wind") {
+            ld.type = Load::Wind;
+            const psim::Array* a = arrays ? arrays->find("load." + std::to_string(i) + ".forces") : nullptr;
+            if (!a || a->f.size() != size_t(3) * nTri) throw std::runtime_error("The wind load in the file has no forces for this part.");
+            ld.forces = a->f;
+        } else if (type == "force" || type == "pressure") {
+            ld.type = type == "force" ? Load::Force : Load::Pressure;
+            for (const auto& p : l["patches"].arr) {
+                Patch q = patchFromJson(p, nTri);
+                if (!q.tris.empty()) ld.patches.push_back(std::move(q));
+            }
+        } else throw std::runtime_error("The file has a load of an unknown type (" + type + ").");
+        if (boolOr(l["userDir"], false)) userDir.insert(int(i));
+        newLoads.push_back(std::move(ld));
+    }
+    fixtures = std::move(newFixtures);
+    loads = std::move(newLoads);
+    selectedLoad = loads.empty() ? -1 : 0;
+    isNewForce_.clear();
+    for (size_t i = 0; i < loads.size(); i++)
+        if (loads[i].type == Load::Force && !userDir.count(int(i))) isNewForce_.insert(int(i));
+    gravity_->setChecked(boolOr(s["gravity"], false));
+    engine_->setCurrentIndex(strOr(s["engine"]) == "cpu" ? 2 : 0);
+    const std::string id = strOr(s["study"], "static");
+    selectStudy(QString::fromStdString(id));
+    double res = numOr(s["resFor"][id], numOr(s["resolution"], resolution_));
+    resolution_ = int(std::clamp(std::round(res), 16.0, 480.0));
+    if (app_->part) targetVoxels_ = voxelFactor_ * estimateVoxels(*app_->part, resolution_);
+    syncVoxelControls();
+    updateMeshInfo();
+    renderLists();
+}
+
+void StructuralPanel::restoreStudy(const QString& id) {
+    selectStudy(id);
+    applyDisplay();
+}
+
+std::optional<psim::Arrays> StructuralPanel::exportStatic() const {
+    using namespace pj;
+    if (!result_) return std::nullopt;
+    const Result& r = *result_;
+    psim::Arrays out;
+    Value m = jobj();
+    auto put = [&](const char* k, double v) { m.obj[k] = jnum(v); };
+    put("maxVM", r.maxVM); put("maxDisp", r.maxDisp); put("minP1", r.minP1); put("maxP1", r.maxP1); put("minP3", r.minP3); put("maxP3", r.maxP3);
+    put("minFos", r.minFos); put("weakest", r.weakest); put("lambda", r.minFos); put("lamYield", r.lamYield); put("lamBreak", r.lamBreak);
+    put("totalF", r.totalF); put("autoScale", r.autoScale); put("iterations", r.iterations); put("voxels", r.voxels);
+    put("solvedShare", r.solvedShare); put("lostLoad", r.lostLoad); put("thinVoxels", r.thinVoxels); put("voxelSize", r.voxelSize);
+    put("resolution", r.resolution); put("wallThickness", r.wallThickness);
+    m.obj["material"] = materialToJson(r.material);
+    m.obj["units"] = jstr(r.units.toStdString());
+    m.obj["incomplete"] = jbool(r.incomplete);
+    m.obj["unreliable"] = jbool(r.unreliable);
+    m.obj["converged"] = jbool(r.converged);
+    out.meta = m;
+    auto field = [&](const char* name, const std::vector<float>& d, uint32_t stride) {
+        psim::Array a;
+        a.name = std::string("static.") + name;
+        a.enc = psim::Enc::Q16;
+        a.f = d;
+        a.stride = stride;
+        out.list.push_back(std::move(a));
+    };
+    field("vm", r.vm, 1); field("p1", r.p1, 1); field("p3", r.p3, 1); field("fos", r.fos, 1); field("u", r.u, 3);
+    return out;
+}
+
+void StructuralPanel::importStatic(const json::Value& m, const psim::Arrays& arrays) {
+    using namespace pj;
+    const size_t nV = size_t(app_->part->nVert);
+    auto get = [&](const char* name, size_t n) -> const std::vector<float>& {
+        const psim::Array* a = arrays.find(std::string("static.") + name);
+        if (!a || a->f.size() != n) throw std::runtime_error(std::string("The static result in the file does not fit this part (") + name + ").");
+        return a->f;
+    };
+    Result r;
+    r.vm = get("vm", nV); r.p1 = get("p1", nV); r.p3 = get("p3", nV); r.fos = get("fos", nV); r.u = get("u", 3 * nV);
+    r.dmag.assign(nV, 0.f);
+    for (size_t v = 0; v < nV; v++)
+        r.dmag[v] = std::isnan(r.u[3 * v]) ? NAN : std::sqrt(r.u[3 * v] * r.u[3 * v] + r.u[3 * v + 1] * r.u[3 * v + 1] + r.u[3 * v + 2] * r.u[3 * v + 2]);
+    auto n = [&](const char* k, double d = 0) { return m[k].type == Value::Number ? m[k].num : d; };
+    r.maxVM = n("maxVM"); r.maxDisp = n("maxDisp"); r.minP1 = n("minP1"); r.maxP1 = n("maxP1"); r.minP3 = n("minP3"); r.maxP3 = n("maxP3");
+    r.minFos = n("minFos", INFINITY); r.lamYield = n("lamYield", INFINITY); r.lamBreak = n("lamBreak", INFINITY);
+    r.weakest = int(n("weakest", -1)); r.totalF = n("totalF"); r.autoScale = n("autoScale", 1);
+    r.iterations = int(n("iterations")); r.voxels = int(n("voxels", 1));
+    r.solvedShare = n("solvedShare", 1); r.lostLoad = n("lostLoad"); r.thinVoxels = int(n("thinVoxels"));
+    r.voxelSize = n("voxelSize"); r.resolution = int(n("resolution")); r.wallThickness = n("wallThickness");
+    r.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app_->material;
+    r.units = QString::fromStdString(strOr(m["units"], app_->units.toStdString()));
+    r.incomplete = boolOr(m["incomplete"], false);
+    r.unreliable = boolOr(m["unreliable"], false);
+    r.converged = boolOr(m["converged"], true);
+    result_ = std::move(r);
+    anim_.reset();
+    stale_ = false;
+    if (study_ == 0) display_ = "results";
+    resultsCard_->setVisible(study_ == 0);
+}
+
+json::Value StructuralPanel::exportView() const {
+    using namespace pj;
+    Value v = jobj();
+    v.obj["plot"] = jstr(view.plot.toStdString());
+    v.obj["scalePct"] = jnum(view.scalePct);
+    v.obj["level"] = jstr(view.level.toStdString());
+    v.obj["bands"] = jbool(view.bands);
+    v.obj["heat"] = jbool(view.heat);
+    v.obj["bcs"] = jbool(view.bcs);
+    v.obj["marker"] = jbool(view.marker);
+    v.obj["breakStress"] = jbool(view.breakStress);
+    v.obj["breakStep"] = jnum(brk_ ? brk_->current : 0);
+    return v;
+}
+
+void StructuralPanel::importView(const json::Value& v) {
+    using namespace pj;
+    const QString plot = QString::fromStdString(strOr(v["plot"]));
+    if (QStringList{"vm", "disp", "fos", "p1", "p3"}.contains(plot)) {
+        view.plot = plot;
+        const int i = plot_->findData(plot);
+        if (i >= 0) plot_->setCurrentIndex(i);
+    }
+    if (isNum(v["scalePct"])) { view.scalePct = int(std::clamp(v["scalePct"].num, 0.0, 100.0)); scale_->setValue(view.scalePct); }
+    view.bands = boolOr(v["bands"], view.bands);
+    view.heat = boolOr(v["heat"], view.heat);
+    view.bcs = boolOr(v["bcs"], view.bcs);
+    view.marker = boolOr(v["marker"], view.marker);
+    view.breakStress = boolOr(v["breakStress"], view.breakStress);
+    const QString level = QString::fromStdString(strOr(v["level"]));
+    if (result_ && QStringList{"applied", "yield", "break"}.contains(level)) setLevel(level, false);
 }
 
 }  // namespace ps
