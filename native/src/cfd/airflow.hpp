@@ -103,6 +103,19 @@ struct AirSnapshot {
     AirResults results;
 };
 
+/** A stored result (.psim RAIR section) to show without a solver: see AirflowSim::loadFrozen. */
+struct FrozenResult {
+    AirResults results;
+    double reynolds = 0, reynoldsLength = 0, simReynolds = 0, nuAir = 0, nuLat = 0, q = 0, frontal = 0, groundGap = -1, mlups = 0;
+    bool wallModel = false, converged = false, developing = false;
+    int64_t steps = 0;
+    std::string engine;
+    std::array<int, 3> dims{0, 0, 0};
+    double h = 0;
+    flow::Fields fields;        // avg (and inst = avg); rho - 1 = -2 marks cells without fluid
+    std::vector<float> cp;      // surface pressure coefficient per part vertex
+};
+
 class AirflowSim {
 public:
     AirflowSim() = default;
@@ -117,7 +130,16 @@ public:
     /** Restart the flow from rest (keeps the tunnel). */
     void reset();
     bool running() const { return running_; }
-    bool ready() const { return solver_ != nullptr; }
+    bool ready() const { return solver_ != nullptr || frozen; }
+    /**
+     * Show a stored result: the tunnel is planned again from the part with the stored cell size (it must give the
+     * stored dims) and meshed for the solid cells; the flow fields, forces and surface Cp come from the file.
+     * No solver, no GPU. Throws std::runtime_error when the file does not fit the part.
+     */
+    void loadFrozen(std::shared_ptr<const Part> part, const AirflowOptions& o, FrozenResult f);
+    bool frozen = false;
+    double frontalCells() const { return frontal_; }   // frontal area in cells^2
+    double dynamicPressure() const { return q_; }      // Pa
 
     /** Latest snapshot (null before the first). */
     std::shared_ptr<const AirSnapshot> snapshot() const;
@@ -164,6 +186,7 @@ private:
     void publish(bool notify);
 
     std::unique_ptr<flow::Solver> solver_;
+    std::vector<float> frozenCp_;
     std::thread thread_;
     std::atomic<bool> running_{false};
     mutable std::mutex snapMutex_;

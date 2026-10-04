@@ -1771,10 +1771,14 @@ void StructuralPanel::showBreakStep() {
     auto& b = *brk_;
     alert_->hide();
     Viewport* v = app_->viewer;
-    const StructuralModel& m = *b.model;
+    const StructuralModel* mp_ = b.model.get();
+    const std::array<int, 3> gdims = b.loaded ? b.gdims : mp_->grid.dims;
+    const Vec3 gorigin = b.loaded ? b.gorigin : mp_->grid.origin;
+    const double gh = b.loaded ? b.gh : mp_->grid.h;
     const int k = std::min(b.current, int(b.steps.size()) - 1);
     const BreakStep& s = b.steps[k];
-    if (!b.mapped[k]) {
+    if (!b.mapped[k] && !b.loaded) {
+        const StructuralModel& m = *mp_;
         const auto W = m.vertexWeights(s.activeNode);
         Break::Mapped mp;
         mp.u = interpolate(W, s.u.data(), 3, 1 / b.toMeters);
@@ -1786,6 +1790,12 @@ void StructuralPanel::showBreakStep() {
         b.scale = d0 > 0 ? std::min(1000.0, std::max(1.0, 0.05 * app_->part->bbox.diag / d0)) : 1;
     }
     const double scale = deformationScale(b.scale);
+    if (b.loaded && b.hash.empty()) {
+        const double cell = gh * 2;
+        const auto& V = app_->part->vertices;
+        for (int i = 0; i < app_->part->nVert; i++)
+            b.hash[{int(std::floor(V[3 * size_t(i)] / cell)), int(std::floor(V[3 * size_t(i) + 1] / cell)), int(std::floor(V[3 * size_t(i) + 2] / cell))}].push_back(i);
+    }
     const double uts = b.material.uts * 1e6;
     ColorSpec cs;
     cs.min = 0;
@@ -1797,11 +1807,36 @@ void StructuralPanel::showBreakStep() {
     // cracked and detached voxels up to this step, moved with the deformation
     auto positions = [&](const std::vector<int>& list) {
         std::vector<float> out;
-        const int nx = m.grid.dims[0], ny = m.grid.dims[1];
+        const int nx = gdims[0], ny = gdims[1];
         for (int e : list) {
             const int i = e % nx, j = (e / nx) % ny, kk = e / (nx * ny);
             double ux = 0, uy = 0, uz = 0;
             int c = 0;
+            if (b.loaded) {
+                // the nearest part vertex carries the voxel
+                const double x = gorigin[0] + (i + 0.5) * gh, y = gorigin[1] + (j + 0.5) * gh, z = gorigin[2] + (kk + 0.5) * gh, cell = gh * 2;
+                const int cx = int(std::floor(x / cell)), cy = int(std::floor(y / cell)), cz = int(std::floor(z / cell));
+                int best = -1;
+                double bd = INFINITY;
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dz = -1; dz <= 1; dz++) {
+                            auto it = b.hash.find({cx + dx, cy + dy, cz + dz});
+                            if (it == b.hash.end()) continue;
+                            for (int v : it->second) {
+                                const float* P = &app_->part->vertices[3 * size_t(v)];
+                                const double d = (P[0] - x) * (P[0] - x) + (P[1] - y) * (P[1] - y) + (P[2] - z) * (P[2] - z);
+                                if (d < bd) { bd = d; best = v; }
+                            }
+                        }
+                const auto& u = b.mapped[k]->u;
+                const bool ok = best >= 0 && !std::isnan(u[3 * size_t(best)]);
+                out.push_back(float(x + (ok ? u[3 * size_t(best)] * scale : 0)));
+                out.push_back(float(y + (ok ? u[3 * size_t(best) + 1] * scale : 0)));
+                out.push_back(float(z + (ok ? u[3 * size_t(best) + 2] * scale : 0)));
+                continue;
+            }
+            const StructuralModel& m = *mp_;
             for (int a = 0; a < 8; a++) {
                 const int64_t n = m.node(i + (a & 1), j + ((a >> 1) & 1), kk + ((a >> 2) & 1));
                 if (!s.activeNode[n]) continue;
@@ -1809,9 +1844,9 @@ void StructuralPanel::showBreakStep() {
                 c++;
             }
             const double f = c ? scale / (c * b.toMeters) : 0;
-            out.push_back(float(m.grid.origin[0] + (i + 0.5) * m.grid.h + ux * f));
-            out.push_back(float(m.grid.origin[1] + (j + 0.5) * m.grid.h + uy * f));
-            out.push_back(float(m.grid.origin[2] + (kk + 0.5) * m.grid.h + uz * f));
+            out.push_back(float(gorigin[0] + (i + 0.5) * gh + ux * f));
+            out.push_back(float(gorigin[1] + (j + 0.5) * gh + uy * f));
+            out.push_back(float(gorigin[2] + (kk + 0.5) * gh + uz * f));
         }
         return out;
     };
@@ -1821,8 +1856,8 @@ void StructuralPanel::showBreakStep() {
         gone.insert(gone.end(), b.steps[j].detached.begin(), b.steps[j].detached.end());
     }
     std::vector<Geometry> cr;
-    cr.push_back(shapes::cubes(positions(crack), float(m.grid.h * 1.02), rgb(CRACK_COLOR)));
-    cr.push_back(shapes::cubes(positions(gone), float(m.grid.h * 0.98), QVector3D(0.48f, 0.52f, 0.58f), 0.3f));
+    cr.push_back(shapes::cubes(positions(crack), float(gh * 1.02), rgb(CRACK_COLOR)));
+    cr.push_back(shapes::cubes(positions(gone), float(gh * 0.98), QVector3D(0.48f, 0.52f, 0.58f), 0.3f));
     v->setLayer("cracks", std::move(cr));
     const QString load = b.totalF > 1e-9 ? force(s.lambda * b.totalF) : QString("%1 × loads").arg(num(s.lambda));
     if (view.breakStress) {
@@ -1965,8 +2000,17 @@ void StructuralPanel::importSetup(const json::Value& s, const psim::Arrays* arra
     renderLists();
 }
 
+Study* StructuralPanel::studyById(const QString& id) const {
+    for (const auto& st : studies)
+        if (st->id() == id) return st.get();
+    return nullptr;
+}
+
 void StructuralPanel::restoreStudy(const QString& id) {
     selectStudy(id);
+    display_ = study_ == 0 ? (result_ ? "results" : brk_ && !brk_->steps.empty() ? "break" : "setup")
+                           : studies[study_ - 1]->hasResult() ? "study" : "setup";
+    renderStudyOptions();
     applyDisplay();
 }
 
@@ -2063,6 +2107,103 @@ void StructuralPanel::importView(const json::Value& v) {
     view.breakStress = boolOr(v["breakStress"], view.breakStress);
     const QString level = QString::fromStdString(strOr(v["level"]));
     if (result_ && QStringList{"applied", "yield", "break"}.contains(level)) setLevel(level, false);
+}
+
+
+std::optional<psim::Arrays> StructuralPanel::exportBreak() {
+    using namespace pj;
+    if (!brk_ || brk_->steps.empty() || (!brk_->loaded && !brk_->model)) return std::nullopt;
+    Break& b = *brk_;
+    psim::Arrays out;
+    Value steps = jarr();
+    for (size_t i = 0; i < b.steps.size(); i++) {
+        const BreakStep& s = b.steps[i];
+        if (!b.mapped[i]) {
+            const auto W = b.model->vertexWeights(s.activeNode);
+            Break::Mapped mp;
+            mp.u = interpolate(W, s.u.data(), 3, 1 / b.toMeters);
+            mp.vm = interpolate(W, s.nodeVM.data());
+            b.mapped[i] = std::move(mp);
+        }
+        psim::Array vm, u, cr, de;
+        vm.name = "break.vm." + std::to_string(i); vm.enc = psim::Enc::Q16; vm.f = b.mapped[i]->vm;
+        u.name = "break.u." + std::to_string(i); u.enc = psim::Enc::Q16; u.f = b.mapped[i]->u; u.stride = 3;
+        cr.name = "break.cracked." + std::to_string(i); cr.enc = psim::Enc::I32; cr.i.assign(s.cracked.begin(), s.cracked.end());
+        de.name = "break.detached." + std::to_string(i); de.enc = psim::Enc::I32; de.i.assign(s.detached.begin(), s.detached.end());
+        for (auto* a : {&vm, &u, &cr, &de}) out.list.push_back(std::move(*a));
+        Value e = jobj();
+        e.obj["step"] = jnum(s.step);
+        e.obj["lambda"] = jnum(s.lambda);
+        e.obj["maxDisp"] = jnum(s.maxDisp);
+        steps.arr.push_back(e);
+    }
+    Value m = jobj();
+    m.obj["steps"] = steps;
+    m.obj["totalF"] = jnum(b.totalF);
+    m.obj["material"] = materialToJson(b.material);
+    m.obj["toMeters"] = jnum(b.toMeters);
+    m.obj["reason"] = b.reason.isEmpty() ? Value{} : jstr(b.reason.toStdString());
+    m.obj["done"] = jbool(b.done);
+    m.obj["scale"] = b.scale > 0 ? jnum(b.scale) : Value{};
+    Value g = jobj();
+    const std::array<int, 3> gd = b.loaded ? b.gdims : b.model->grid.dims;
+    const Vec3 go = b.loaded ? b.gorigin : b.model->grid.origin;
+    g.obj["dims"] = vec({double(gd[0]), double(gd[1]), double(gd[2])});
+    g.obj["origin"] = vec3(go);
+    g.obj["h"] = jnum(b.loaded ? b.gh : b.model->grid.h);
+    g.obj["resolution"] = jnum(b.loaded ? b.gres : b.model->resolution);
+    m.obj["grid"] = g;
+    out.meta = m;
+    return out;
+}
+
+void StructuralPanel::importBreak(const json::Value& m, const psim::Arrays& arrays) {
+    using namespace pj;
+    const size_t nV = size_t(app_->part->nVert);
+    const Value& g = m["grid"];
+    if (g["dims"].size() != 3 || g["origin"].size() != 3 || !(numOr(g["h"], 0) > 0)) throw std::runtime_error("The break test in the file has no voxel grid.");
+    Break b;
+    b.loaded = true;
+    for (int k = 0; k < 3; k++) { b.gdims[k] = int(numOr(g["dims"][k], 1)); b.gorigin[k] = numOr(g["origin"][k], 0); }
+    b.gh = g["h"].num;
+    b.gres = int(numOr(g["resolution"], 0));
+    auto need = [&](const std::string& name, size_t n, bool any) -> const psim::Array& {
+        const psim::Array* a = arrays.find(name);
+        if (!a || (!any && a->size() != n)) throw std::runtime_error("The break test in the file does not fit this part.");
+        return *a;
+    };
+    const auto& st = m["steps"].arr;
+    for (size_t i = 0; i < st.size(); i++) {
+        BreakStep s;
+        s.step = int(numOr(st[i]["step"], double(i + 1)));
+        s.lambda = numOr(st[i]["lambda"], 0);
+        s.maxDisp = numOr(st[i]["maxDisp"], 0);
+        const auto& cr = need("break.cracked." + std::to_string(i), 0, true).i;
+        const auto& de = need("break.detached." + std::to_string(i), 0, true).i;
+        s.cracked.assign(cr.begin(), cr.end());
+        s.detached.assign(de.begin(), de.end());
+        s.voxels = 0;
+        b.steps.push_back(std::move(s));
+        Break::Mapped mp;
+        mp.vm = need("break.vm." + std::to_string(i), nV, false).f;
+        mp.u = need("break.u." + std::to_string(i), 3 * nV, false).f;
+        b.mapped.push_back(std::move(mp));
+    }
+    if (b.steps.empty()) throw std::runtime_error("The break test in the file has no steps.");
+    b.totalF = numOr(m["totalF"], 0);
+    b.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app_->material;
+    b.toMeters = numOr(m["toMeters"], 0.001);
+    b.reason = QString::fromStdString(strOr(m["reason"]));
+    b.done = true;
+    b.scale = numOr(m["scale"], 0);
+    brk_ = std::move(b);
+    if (study_ == 0 && !result_) display_ = "break";
+    breakCard_->setVisible(study_ == 0);
+    breakStep_->blockSignals(true);
+    breakStep_->setMaximum(int(brk_->steps.size()) - 1);
+    breakStep_->setValue(0);
+    breakStep_->blockSignals(false);
+    renderBreakKpis();
 }
 
 }  // namespace ps

@@ -1,4 +1,5 @@
 #include "studies.hpp"
+#include "psimjson.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -329,6 +330,85 @@ public:
     bool hasResult() const override { return r_ && !r_->steps.empty(); }
     void clear() override { r_.reset(); view_.playing = false; }
 
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_ || r_->steps.empty()) return std::nullopt;
+        psim::Arrays out;
+        auto stepMeta = [](const NonlinearStep& s) {
+            Value e = jobj();
+            e.obj["lam"] = jnum(s.lam); e.obj["D"] = jnum(s.D); e.obj["maxVM"] = jnum(s.maxVM); e.obj["maxPE"] = jnum(s.maxPE);
+            e.obj["maxDisp"] = jnum(s.maxDisp); e.obj["iterations"] = jnum(s.iterations);
+            return e;
+        };
+        auto put = [&](const std::string& prefix, const NonlinearStep& s) {
+            for (auto [n, data, stride] : {std::tuple<const char*, const std::vector<float>*, uint32_t>{"u", &s.u, 3}, {"vm", &s.vm, 1}, {"pe", &s.pe, 1}}) {
+                psim::Array a;
+                a.name = prefix + "." + n;
+                a.enc = psim::Enc::Q16;
+                a.f = *data;
+                a.stride = stride;
+                out.list.push_back(std::move(a));
+            }
+        };
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(r_->units.toStdString());
+        m.obj["material"] = materialToJson(r_->material);
+        m.obj["totalF"] = jnum(r_->totalF);
+        m.obj["reason"] = jstr(r_->reason.toStdString());
+        m.obj["engine"] = jstr("");
+        m.obj["gpuNote"] = jstr("");
+        m.obj["plastic"] = jbool(o_.plastic);
+        Value opts = jobj();
+        opts.obj["large"] = jbool(o_.large);
+        opts.obj["plastic"] = jbool(o_.plastic);
+        opts.obj["mode"] = jstr(r_->untilFailure ? "failure" : "applied");
+        opts.obj["steps"] = jnum(o_.steps);
+        m.obj["opts"] = opts;
+        Value steps = jarr();
+        for (size_t i = 0; i < r_->steps.size(); i++) {
+            steps.arr.push_back(stepMeta(r_->steps[i]));
+            put("nonlinear.step." + std::to_string(i), r_->steps[i]);
+        }
+        m.obj["steps"] = steps;
+        if (r_->unloaded) { m.obj["unloaded"] = stepMeta(*r_->unloaded); put("nonlinear.unloaded", *r_->unloaded); }
+        else m.obj["unloaded"] = Value{};
+        out.meta = m;
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        const size_t nV = size_t(part().nVert);
+        if (numOr(m["nVert"], -1) != double(nV)) throw std::runtime_error("The nonlinear result in the file was computed for a different part.");
+        auto load = [&](const Value& e, const std::string& prefix) {
+            NonlinearStep s;
+            s.lam = numOr(e["lam"], 0); s.D = numOr(e["D"], 0); s.maxVM = numOr(e["maxVM"], 0); s.maxPE = numOr(e["maxPE"], 0);
+            s.maxDisp = numOr(e["maxDisp"], 0); s.iterations = int(numOr(e["iterations"], 0));
+            for (auto [n, data, len] : {std::tuple<const char*, std::vector<float>*, size_t>{"u", &s.u, 3 * nV}, {"vm", &s.vm, nV}, {"pe", &s.pe, nV}}) {
+                const psim::Array* a = arrays.find(prefix + "." + n);
+                if (!a || a->f.size() != len) throw std::runtime_error("The nonlinear result in the file does not fit this part.");
+                *data = a->f;
+            }
+            return s;
+        };
+        Result r;
+        for (size_t i = 0; i < m["steps"].arr.size(); i++) r.steps.push_back(load(m["steps"].arr[i], "nonlinear.step." + std::to_string(i)));
+        if (r.steps.empty()) throw std::runtime_error("The nonlinear result in the file has no steps.");
+        if (m["unloaded"].type == Value::Object) { r.unloaded = load(m["unloaded"], "nonlinear.unloaded"); r.unloaded->unloaded = true; }
+        r.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material;
+        r.totalF = numOr(m["totalF"], 0);
+        r.units = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+        r.reason = QString::fromStdString(strOr(m["reason"]));
+        r.done = true;
+        r.untilFailure = strOr(m["opts"]["mode"]) == "failure";
+        r_ = std::move(r);
+        view_.step = int(r_->steps.size()) - 1;
+        view_.unloaded = false;
+        view_.playing = false;
+        invalidate();
+    }
+
     bool options(QVBoxLayout* l) override {
         const Material& mat = app()->material;
         l->addWidget(heading(tr("NONLINEAR OPTIONS")));
@@ -644,6 +724,66 @@ public:
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
 
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        psim::Arrays out;
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(units_.toStdString());
+        m.obj["material"] = materialToJson(app()->material);
+        m.obj["diag"] = jnum(diag_);
+        m.obj["free"] = jbool(r_->free);
+        m.obj["converged"] = jbool(r_->converged);
+        m.obj["iterations"] = jnum(r_->iterations);
+        m.obj["totalMass"] = jnum(r_->totalMass);
+        m.obj["engine"] = jstr(r_->engine);
+        m.obj["gpuNote"] = jstr(r_->gpuNote);
+        Value modes = jarr();
+        for (size_t i = 0; i < r_->modes.size(); i++) {
+            Value e = jobj();
+            e.obj["freq"] = jnum(r_->modes[i].freq);
+            e.obj["eff"] = vec({r_->modes[i].eff[0], r_->modes[i].eff[1], r_->modes[i].eff[2]});
+            modes.arr.push_back(e);
+            psim::Array a;
+            a.name = "modal.shape." + std::to_string(i);
+            a.enc = psim::Enc::Q16;
+            a.f = r_->modes[i].shape;
+            a.stride = 3;
+            out.list.push_back(std::move(a));
+        }
+        m.obj["modes"] = modes;
+        out.meta = m;
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (numOr(m["nVert"], -1) != part().nVert) throw std::runtime_error("The frequency result in the file was computed for a different part.");
+        ModalRun r;
+        for (size_t i = 0; i < m["modes"].arr.size(); i++) {
+            const Value& e = m["modes"].arr[i];
+            const psim::Array* a = arrays.find("modal.shape." + std::to_string(i));
+            if (!a || a->f.size() != 3 * size_t(part().nVert)) throw std::runtime_error("The frequency result in the file does not fit this part.");
+            ModalMode mode;
+            mode.freq = numOr(e["freq"], 0);
+            for (int d = 0; d < 3; d++) mode.eff[d] = numOr(e["eff"][d], 0);
+            mode.shape = a->f;
+            r.modes.push_back(std::move(mode));
+        }
+        r.free = boolOr(m["free"], false);
+        r.converged = boolOr(m["converged"], true);
+        r.iterations = int(numOr(m["iterations"], 0));
+        r.totalMass = numOr(m["totalMass"], 0);
+        r.engine = strOr(m["engine"]);
+        r.gpuNote = strOr(m["gpuNote"]);
+        r_ = std::move(r);
+        units_ = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+        diag_ = part().bbox.diag;
+        view_.mode = 0;
+        invalidate();
+    }
+
     bool options(QVBoxLayout* l) override {
         l->addWidget(heading(tr("FREQUENCY OPTIONS")));
         l->addWidget(field(tr("Number of modes"), numberBox(nev_, 1, 20, 1, 0, [this](double v) { nev_ = int(v); panel_->markStale(); })));
@@ -730,6 +870,63 @@ public:
     QString id() const override { return "buckling"; }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
+
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        psim::Arrays out;
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(app()->units.toStdString());
+        m.obj["material"] = materialToJson(material_);
+        m.obj["diag"] = jnum(diag_);
+        m.obj["totalF"] = jnum(totalF_);
+        m.obj["maxVM"] = jnum(maxVM_);
+        m.obj["maxFactor"] = jnum(r_->maxFactor);
+        m.obj["converged"] = jbool(r_->converged);
+        m.obj["iterations"] = jnum(r_->iterations);
+        m.obj["engine"] = jstr(r_->engine);
+        m.obj["gpuNote"] = jstr(r_->gpuNote);
+        Value f = jarr();
+        for (size_t i = 0; i < r_->modes.size(); i++) {
+            f.arr.push_back(jnum(r_->modes[i].factor));
+            psim::Array a;
+            a.name = "buckling.shape." + std::to_string(i);
+            a.enc = psim::Enc::Q16;
+            a.f = r_->modes[i].shape;
+            a.stride = 3;
+            out.list.push_back(std::move(a));
+        }
+        m.obj["factors"] = f;
+        out.meta = m;
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (numOr(m["nVert"], -1) != part().nVert) throw std::runtime_error("The buckling result in the file was computed for a different part.");
+        BucklingRun r;
+        for (size_t i = 0; i < m["factors"].arr.size(); i++) {
+            const psim::Array* a = arrays.find("buckling.shape." + std::to_string(i));
+            if (!a || a->f.size() != 3 * size_t(part().nVert)) throw std::runtime_error("The buckling result in the file does not fit this part.");
+            BucklingRun::Mode mode;
+            mode.factor = m["factors"].arr[i].type == Value::Number ? m["factors"].arr[i].num : INFINITY;
+            mode.shape = a->f;
+            r.modes.push_back(std::move(mode));
+        }
+        r.maxFactor = m["maxFactor"].type == Value::Number ? m["maxFactor"].num : INFINITY;
+        r.converged = boolOr(m["converged"], true);
+        r.iterations = int(numOr(m["iterations"], 0));
+        r.engine = strOr(m["engine"]);
+        r.gpuNote = strOr(m["gpuNote"]);
+        r_ = std::move(r);
+        material_ = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material;
+        totalF_ = numOr(m["totalF"], 0);
+        maxVM_ = numOr(m["maxVM"], 0);
+        diag_ = part().bbox.diag;
+        view_.mode = 0;
+        invalidate();
+    }
 
     bool options(QVBoxLayout* l) override {
         l->addWidget(heading(tr("BUCKLING OPTIONS")));
@@ -833,6 +1030,44 @@ public:
     QString id() const override { return "fatigue"; }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
+
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        psim::Arrays out;
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(app()->units.toStdString());
+        m.obj["material"] = materialToJson(r_->material);
+        m.obj["totalF"] = jnum(0);
+        m.obj["engine"] = jstr(r_->m.engine);
+        m.obj["gpuNote"] = jstr(r_->m.gpuNote);
+        out.meta = m;
+        for (auto [name, data] : {std::pair<const char*, const std::vector<float>*>{"vm", &r_->m.vm}, {"p1", &r_->m.p1}, {"p3", &r_->m.p3}}) {
+            psim::Array a;
+            a.name = std::string("fatigue.") + name;
+            a.enc = psim::Enc::Q16;
+            a.f = *data;
+            out.list.push_back(std::move(a));
+        }
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (numOr(m["nVert"], -1) != part().nVert) throw std::runtime_error("The fatigue result in the file was computed for a different part.");
+        Mapped mp;
+        for (auto [name, data] : {std::pair<const char*, std::vector<float>*>{"vm", &mp.vm}, {"p1", &mp.p1}, {"p3", &mp.p3}}) {
+            const psim::Array* a = arrays.find(std::string("fatigue.") + name);
+            if (!a || a->f.size() != size_t(part().nVert)) throw std::runtime_error("The fatigue result in the file does not fit this part.");
+            *data = a->f;
+        }
+        mp.engine = strOr(m["engine"]);
+        mp.gpuNote = strOr(m["gpuNote"]);
+        r_ = Result{std::move(mp), m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material, {}};
+        invalidate();
+        r_->fat = fatigueField(r_->m.vm, r_->m.p1, r_->m.p3, r_->material, o_.finish.toStdString(), o_.R, o_.cycles, o_.scale);
+    }
 
     bool options(QVBoxLayout* l) override {
         const Material& mat = app()->material;
@@ -1022,6 +1257,96 @@ public:
     QString id() const override { return "drop"; }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); view_.playing = false; }
+
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        const Result& r = *r_;
+        psim::Arrays out;
+        Value m = jobj();
+        auto put = [&](const char* k, double v) { m.obj[k] = jnum(v); };
+        put("nVert", part().nVert);
+        m.obj["units"] = jstr(r.units.toStdString());
+        m.obj["material"] = materialToJson(r.material);
+        put("height", r.height); put("speed", r.run.speed); put("mass", r.run.mass); put("peak", r.peak); put("peakAt", r.peakAt);
+        put("peakForce", r.run.peakForce); put("contactTime", r.run.contactTime); put("duration", r.run.duration); put("steps", r.run.steps);
+        put("dt", r.run.dt);
+        m.obj["rebounded"] = jbool(r.run.rebounded);
+        put("autoScale", r.autoScale);
+        put("nTimes", double(r.run.times.size()));
+        int peakFrame = int(r.frames.size()) - 1;
+        if (r.peakAt >= 0 && size_t(r.peakAt) < r.run.tPeak.size())
+            for (size_t i = 0; i < r.frames.size(); i++) if (r.frames[i].t >= r.run.tPeak[r.peakAt]) { peakFrame = int(i); break; }
+        put("peakFrame", std::max(0, peakFrame));
+        Value ft = jarr(), ff = jarr();
+        for (const auto& f : r.frames) { ft.arr.push_back(jnum(f.t)); ff.arr.push_back(jnum(f.force)); }
+        m.obj["frameTimes"] = ft;
+        m.obj["frameForces"] = ff;
+        m.obj["engine"] = jstr(r.run.engine);
+        m.obj["gpuNote"] = jstr(r.run.gpuNote);
+        out.meta = m;
+        auto add = [&](const std::string& name, const std::vector<float>& d, psim::Enc enc, uint32_t stride) {
+            psim::Array a;
+            a.name = name; a.enc = enc; a.f = d; a.stride = stride;
+            out.list.push_back(std::move(a));
+        };
+        add("drop.vmMax", r.run.vmMax, psim::Enc::Q16, 1);
+        add("drop.times", r.run.times, psim::Enc::F32, 1);
+        add("drop.forces", r.run.forces, psim::Enc::F32, 1);
+        for (size_t i = 0; i < r.frames.size(); i++) {
+            add("drop.frame." + std::to_string(i) + ".u", r.frames[i].u, psim::Enc::Q16, 3);
+            add("drop.frame." + std::to_string(i) + ".vm", r.frames[i].vm, psim::Enc::Q16, 1);
+        }
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        const size_t nV = size_t(part().nVert);
+        if (numOr(m["nVert"], -1) != double(nV)) throw std::runtime_error("The drop test in the file was computed for a different part.");
+        auto get = [&](const std::string& name, size_t n, bool any) -> const std::vector<float>& {
+            const psim::Array* a = arrays.find(name);
+            if (!a || (!any && a->f.size() != n)) throw std::runtime_error("The drop test in the file does not fit this part.");
+            return a->f;
+        };
+        Result r;
+        r.run.vmMax = get("drop.vmMax", nV, false);
+        r.run.times = get("drop.times", 0, true);
+        r.run.forces = get("drop.forces", 0, true);
+        const auto& ft = m["frameTimes"].arr;
+        const auto& ff = m["frameForces"].arr;
+        for (size_t i = 0; i < ft.size(); i++) {
+            DropFrame f;
+            f.t = numOr(ft[i], 0);
+            f.force = numOr(ff.size() > i ? ff[i] : Value{}, 0);
+            f.u = get("drop.frame." + std::to_string(i) + ".u", 3 * nV, false);
+            f.vm = get("drop.frame." + std::to_string(i) + ".vm", nV, false);
+            r.frames.push_back(std::move(f));
+        }
+        if (r.frames.empty()) throw std::runtime_error("The drop test in the file has no frames.");
+        r.run.speed = numOr(m["speed"], 0); r.run.mass = numOr(m["mass"], 0); r.run.peakForce = numOr(m["peakForce"], 0);
+        r.run.contactTime = numOr(m["contactTime"], 0); r.run.duration = numOr(m["duration"], 0); r.run.dt = numOr(m["dt"], 0);
+        r.run.steps = int(numOr(m["steps"], 0));
+        r.run.rebounded = boolOr(m["rebounded"], false);
+        r.run.engine = strOr(m["engine"]);
+        r.run.gpuNote = strOr(m["gpuNote"]);
+        r.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material;
+        r.units = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+        r.height = numOr(m["height"], 1);
+        r.peak = numOr(m["peak"], 0);
+        r.peakAt = int(numOr(m["peakAt"], -1));
+        r.autoScale = numOr(m["autoScale"], 1);
+        const int pf = std::clamp(int(numOr(m["peakFrame"], double(r.frames.size()) - 1)), 0, int(r.frames.size()) - 1);
+        r.run.tPeak.assign(nV, 0.f);
+        if (r.peakAt >= 0 && size_t(r.peakAt) < nV) r.run.tPeak[r.peakAt] = float(r.frames[pf].t);
+        height_ = r.height;
+        view_.frame = pf;
+        view_.exaggerate = r.autoScale;
+        view_.plot = "peak";
+        view_.playing = false;
+        r_ = std::move(r);
+        invalidate();
+    }
 
     bool options(QVBoxLayout* l) override {
         l->addWidget(heading(tr("DROP OPTIONS")));

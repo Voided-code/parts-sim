@@ -127,6 +127,7 @@ void runScript(ps::MainWindow* w, QStringList steps) {
         else w->structural->runStudy();
     } else if (cmd == "windload") w->airflow->useAsLoad();
     else if (cmd == "cells") w->airflow->setCells(arg.toDouble());
+    else if (cmd == "airengine") w->airflow->setEngine(arg == "gpu" ? 1 : arg == "cpu" ? 2 : 0);
     else if (cmd == "aero") {
         std::printf("aero: %s\n", qPrintable(w->airflow->aeroSummary()));
         std::fflush(stdout);

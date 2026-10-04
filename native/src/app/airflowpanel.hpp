@@ -1,6 +1,7 @@
 // Airflow tab: wind setup, flow run control, aerodynamic results and flow visualisation
 // (particles, streamlines, slice plane, surface pressure), and the wind load for the bend test.
 #pragma once
+#include "core/psim.hpp"
 
 #include <QWidget>
 #include <atomic>
@@ -46,6 +47,15 @@ public:
     void useAsLoad();
     /** Automation: set the grid size (cells). */
     void setCells(double n);
+    void setEngine(int index);
+    // ---- .psim files (JS: airflow-panel.js exportState / importState / loadResults, airflow.js exportResults) ----
+    json::Value exportState() const;
+    void importState(const json::Value& s);
+    std::optional<psim::Arrays> exportResults() const;
+    /** Show a stored result (frozen: no solver). Throws std::runtime_error when it does not fit. */
+    void loadResults(const json::Value& meta, const psim::Arrays& arrays, const json::Value* state);
+    /** Run again with the current settings (the Re-run button of a loaded file). */
+    void rerun() { dirty_ = true; run(); }
     /** Script diagnostics: step count and force coefficients of the latest snapshot. */
     QString aeroSummary() const;
 

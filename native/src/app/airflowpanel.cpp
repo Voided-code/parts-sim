@@ -1,4 +1,5 @@
 #include "airflowpanel.hpp"
+#include "psimjson.hpp"
 
 #include <QButtonGroup>
 #include <QCheckBox>
@@ -322,6 +323,12 @@ void AirflowPanel::setCells(double n) {
     markDirty();
 }
 
+void AirflowPanel::setEngine(int index) {
+    engine_->setCurrentIndex(index);
+    syncCells();
+    markDirty();
+}
+
 bool AirflowPanel::gpuEngine() const { return engine_->currentIndex() != 2 && gpuAvailable(); }
 
 AirflowCapacity AirflowPanel::capacity() const { return airflowCapacity(gpuEngine()); }
@@ -373,6 +380,7 @@ void AirflowPanel::updateCellsInfo() {
 }
 
 void AirflowPanel::markDirty() {
+    app_->psimEdited();
     dirty_ = true;
     drawWindArrow();
     updateButtons();
@@ -452,7 +460,7 @@ void AirflowPanel::run() {
         update();
         return;
     }
-    if (dirty_ || !sim_ || !sim_->ready()) {
+    if (dirty_ || !sim_ || !sim_->ready() || sim_->frozen) {
         const AirflowOptions o = settings();
         stop();
         clearVisuals();
@@ -549,6 +557,8 @@ QString AirflowPanel::aeroSummary() const {
 void AirflowPanel::update() {
     updateButtons();
     auto s = sim_ ? sim_->snapshot() : nullptr;
+    if (s && !sim_->frozen && !s->developing)
+        app_->psimRunDone("airflow", {{"drag", s->results.drag}, {"lift", s->results.lift}, {"cd", s->results.cd}, {"cl", s->results.cl}});
     if (s) {
         const auto& r = s->results;
         const double tm = app_->toMeters();
@@ -974,6 +984,246 @@ void AirflowPanel::useAsLoad() {
     app_->structural->addWindLoad(F, net);
     app_->setTab("structural");
     app_->status(tr("Wind load added (%1 net). Add a fixture if needed, then run the bend test.").arg(force(std::sqrt(net[0] * net[0] + net[1] * net[1] + net[2] * net[2]))));
+}
+
+
+// ---------- .psim files ----------
+
+json::Value AirflowPanel::exportState() const {
+    using namespace pj;
+    Value o = jobj();
+    o.obj["yaw"] = jnum(yaw_);
+    o.obj["pitch"] = jnum(pitch_);
+    o.obj["speed"] = jnum(speed_->value());
+    o.obj["airDensity"] = jnum(density_->value());
+    o.obj["ground"] = jbool(groundChk_->isChecked());
+    o.obj["groundClearance"] = jnum(clearance_->value());
+    const int bl = boundary_->currentData().toInt();
+    o.obj["boundaryLayer"] = jstr(bl == int(BoundaryLayer::Turbulent) ? "turbulent" : bl == int(BoundaryLayer::Laminar) ? "laminar" : "auto");
+    o.obj["engine"] = jstr(engine_->currentIndex() == 2 ? "cpu" : "auto");
+    o.obj["cells"] = jnum(cells_);
+    o.obj["autoStop"] = jbool(autoStopChk_->isChecked());
+    Value show = jobj();
+    show.obj["cp"] = jbool(cpChk_->isChecked());
+    show.obj["particles"] = jbool(particlesChk_->isChecked());
+    show.obj["streamlines"] = jbool(streamChk_->isChecked());
+    show.obj["domain"] = jbool(domainChk_->isChecked());
+    show.obj["slice"] = jbool(sliceChk_->isChecked());
+    o.obj["show"] = show;
+    Value sl = jobj();
+    sl.obj["axis"] = jstr(sliceAxis_->currentData().toString().toStdString());
+    sl.obj["quantity"] = jstr(sliceQty_->currentData().toString().toStdString());
+    sl.obj["pos"] = jnum(slicePos_->value());
+    o.obj["slice"] = sl;
+    return o;
+}
+
+void AirflowPanel::importState(const json::Value& s) {
+    using namespace pj;
+    if (s.type != Value::Object) return;
+    auto block = [](QWidget* w) { w->blockSignals(true); };
+    auto unblock = [](QWidget* w) { w->blockSignals(false); };
+    if (isNum(s["yaw"])) yaw_ = int(std::clamp(std::round(s["yaw"].num), -180.0, 180.0));
+    if (isNum(s["pitch"])) pitch_ = int(std::clamp(std::round(s["pitch"].num), -90.0, 90.0));
+    if (isNum(s["speed"]) && s["speed"].num > 0) { block(speed_); speed_->setValue(s["speed"].num); unblock(speed_); }
+    if (isNum(s["airDensity"]) && s["airDensity"].num > 0) { block(density_); density_->setValue(s["airDensity"].num); unblock(density_); }
+    if (s["ground"].type == Value::Bool) { block(groundChk_); groundChk_->setChecked(s["ground"].b); unblock(groundChk_); groundRow_->setVisible(s["ground"].b); }
+    if (isNum(s["groundClearance"]) && s["groundClearance"].num >= 0) { block(clearance_); clearance_->setValue(s["groundClearance"].num); unblock(clearance_); }
+    const std::string bl = strOr(s["boundaryLayer"]);
+    if (bl == "auto" || bl == "turbulent" || bl == "laminar") boundary_->setCurrentIndex(bl == "auto" ? 0 : bl == "turbulent" ? 1 : 2);
+    if (strOr(s["engine"]) == "cpu") engine_->setCurrentIndex(2);
+    else if (strOr(s["engine"]) == "auto") engine_->setCurrentIndex(0);
+    if (isNum(s["cells"]) && s["cells"].num > 0) cells_ = std::clamp(s["cells"].num, capacity().minCells, capacity().maxCells);
+    auto box = [&](QCheckBox* c, const Value& v) { if (v.type == Value::Bool) { block(c); c->setChecked(v.b); unblock(c); } };
+    box(autoStopChk_, s["autoStop"]);
+    const Value& sh = s["show"];
+    box(cpChk_, sh["cp"]); box(particlesChk_, sh["particles"]); box(streamChk_, sh["streamlines"]); box(domainChk_, sh["domain"]); box(sliceChk_, sh["slice"]);
+    sliceControls_->setVisible(sliceChk_->isChecked());
+    const Value& sl = s["slice"];
+    const int ai = sliceAxis_->findData(QString::fromStdString(strOr(sl["axis"])));
+    if (ai >= 0) sliceAxis_->setCurrentIndex(ai);
+    const int qi = sliceQty_->findData(QString::fromStdString(strOr(sl["quantity"])));
+    if (qi >= 0) sliceQty_->setCurrentIndex(qi);
+    if (isNum(sl["pos"])) { block(slicePos_); slicePos_->setValue(int(std::clamp(sl["pos"].num, 0.0, 100.0))); unblock(slicePos_); }
+    syncWind();
+    syncCells();
+    updateCellsInfo();
+}
+
+std::optional<psim::Arrays> AirflowPanel::exportResults() const {
+    using namespace pj;
+    auto s = sim_ ? sim_->snapshot() : nullptr;
+    if (!s || !s->fields || s->fields->avg.empty() || !app_->part) return std::nullopt;
+    const AirflowSim& sim = *sim_;
+    const AirResults& r = s->results;
+    const flow::Fields& fl = *s->fields;
+    psim::Arrays out;
+    Value m = jobj();
+    m.obj["schema"] = jnum(1);
+    Value res = jobj();
+    auto put = [&](Value& o, const char* k, double v) { o.obj[k] = jnum(v); };
+    put(res, "drag", r.drag); put(res, "lift", r.lift); put(res, "side", r.side);
+    put(res, "dragCI", r.dragCI); put(res, "liftCI", r.liftCI); put(res, "sideCI", r.sideCI);
+    put(res, "frictionDrag", r.frictionDrag); put(res, "cd", r.cd); put(res, "cl", r.cl); put(res, "cdCI", r.cdCI); put(res, "clCI", r.clCI);
+    put(res, "frontalArea", r.frontalArea);
+    res.obj["force"] = vec3(r.force);
+    res.obj["averaged"] = jbool(r.averaged);
+    m.obj["results"] = res;
+    put(m, "reynolds", sim.reynolds); put(m, "reynoldsLength", sim.reynoldsLength); put(m, "simReynolds", sim.simReynolds);
+    put(m, "nuAir", sim.nuAir); put(m, "nuLat", sim.nuLat); put(m, "uLat", AIR_U_LAT);
+    m.obj["wallModel"] = jbool(sim.wallModel);
+    put(m, "groundGap", sim.groundGap); put(m, "q", sim.dynamicPressure()); put(m, "frontal", sim.frontalCells());
+    put(m, "steps", double(s->steps)); put(m, "samples", s->samples);
+    m.obj["converged"] = jbool(s->converged);
+    m.obj["developing"] = jbool(s->developing);
+    put(m, "mlups", std::isfinite(s->mlups) ? s->mlups : 0);
+    m.obj["engine"] = jstr(sim.engine);
+    m.obj["dims"] = vec({double(sim.dims[0]), double(sim.dims[1]), double(sim.dims[2])});
+    put(m, "h", sim.h);
+    put(m, "factor", fl.factor);
+    m.obj["fieldDims"] = vec({double(fl.dims[0]), double(fl.dims[1]), double(fl.dims[2])});
+    put(m, "fieldSamples", fl.samples);
+    put(m, "toMeters", sim.opts.toMeters);
+    put(m, "nVert", app_->part->nVert);
+    Value st = jobj();
+    const Vec3 d = sim.opts.dir;
+    st.obj["dir"] = vec3(d);
+    put(st, "yaw", std::atan2(d[0], -d[2]) * 180 / M_PI);
+    put(st, "pitch", std::asin(std::clamp(d[1], -1.0, 1.0)) * 180 / M_PI);
+    put(st, "speed", sim.opts.speed);
+    put(st, "airDensity", sim.opts.airDensity);
+    st.obj["ground"] = sim.opts.ground >= 0 ? jnum(sim.opts.ground) : Value{};
+    const int bl = int(sim.opts.boundaryLayer);
+    st.obj["boundaryLayer"] = jstr(bl == int(BoundaryLayer::Turbulent) ? "turbulent" : bl == int(BoundaryLayer::Laminar) ? "laminar" : "auto");
+    put(st, "cells", sim.opts.cells);
+    st.obj["engine"] = jstr(sim.opts.engine == 2 ? "cpu" : "auto");
+    m.obj["settings"] = st;
+    out.meta = m;
+    psim::Array cp;
+    cp.name = "airflow.cp";
+    cp.enc = psim::Enc::Q16;
+    cp.f = sim.surfaceCp(*s);
+    out.list.push_back(std::move(cp));
+    const size_t n = size_t(fl.dims[0]) * fl.dims[1] * fl.dims[2];
+    static const char* names[4] = {"rho", "ux", "uy", "uz"};
+    for (int k = 0; k < 4; k++) {
+        psim::Array a;
+        a.name = std::string("airflow.avg.") + names[k];
+        a.enc = psim::Enc::Q16;
+        a.dims = {uint32_t(fl.dims[0]), uint32_t(fl.dims[1]), uint32_t(fl.dims[2])};
+        a.f.resize(n);
+        for (size_t c = 0; c < n; c++) a.f[c] = fl.avg[4 * c] == -2.f ? NAN : fl.avg[4 * c + k];
+        out.list.push_back(std::move(a));
+    }
+    return out;
+}
+
+void AirflowPanel::loadResults(const json::Value& m, const psim::Arrays& arrays, const json::Value* state) {
+    using namespace pj;
+    auto bad = [](const std::string& why) { throw std::runtime_error("The stored airflow result is not usable: " + why + "."); };
+    if (!app_->part) bad("no part to show it on");
+    const Value& f = m["results"];
+    const Value& st = m["settings"];
+    if (f.type != Value::Object || st.type != Value::Object) bad("the header is incomplete");
+    if (st["dir"].size() != 3) bad("the wind direction");
+    AirflowOptions o;
+    o.dir = {numOr(st["dir"][0], 0), numOr(st["dir"][1], 0), numOr(st["dir"][2], 0)};
+    if (!(o.dir[0] * o.dir[0] + o.dir[1] * o.dir[1] + o.dir[2] * o.dir[2] > 0)) bad("the wind direction");
+    o.speed = numOr(st["speed"], 0);
+    o.airDensity = numOr(st["airDensity"], 0);
+    o.toMeters = numOr(m["toMeters"], 0);
+    FrozenResult fr;
+    fr.h = numOr(m["h"], 0);
+    if (!(o.speed > 0) || !(o.airDensity > 0) || !(o.toMeters > 0) || !(fr.h > 0)) bad("speed, density or scale");
+    auto triple = [&](const Value& v, std::array<int, 3>& out) {
+        if (v.size() != 3) return false;
+        for (int k = 0; k < 3; k++) {
+            if (!isNum(v[k]) || std::floor(v[k].num) != v[k].num || v[k].num < 1 || v[k].num > 1e5) return false;
+            out[k] = int(v[k].num);
+        }
+        return true;
+    };
+    if (!triple(m["dims"], fr.dims) || !triple(m["fieldDims"], fr.fields.dims)) bad("the grid sizes");
+    if (double(fr.dims[0]) * fr.dims[1] * fr.dims[2] > 2.5e8) bad("the grid is too large");
+    fr.fields.factor = int(numOr(m["factor"], 0));
+    if (fr.fields.factor < 1) bad("the coarse factor");
+    if (numOr(m["nVert"], -1) != app_->part->nVert) bad("it was computed for a different part");
+    if (f["force"].size() != 3) bad("the force vector");
+    o.ground = isNum(st["ground"]) && st["ground"].num >= 0 ? st["ground"].num : -1;
+    const std::string bl = strOr(st["boundaryLayer"], "auto");
+    o.boundaryLayer = bl == "turbulent" ? BoundaryLayer::Turbulent : bl == "laminar" ? BoundaryLayer::Laminar : BoundaryLayer::Auto;
+    o.cells = numOr(st["cells"], 1e6);
+    o.engine = strOr(st["engine"]) == "cpu" ? 2 : 0;
+    auto get = [&](const std::string& name, size_t n) -> const std::vector<float>& {
+        const psim::Array* a = arrays.find(name);
+        if (!a) bad("the array " + name + " is missing");
+        if (a->f.size() != n) bad("the array " + name + " has the wrong length");
+        return a->f;
+    };
+    fr.cp = get("airflow.cp", size_t(app_->part->nVert));
+    const size_t nc = size_t(fr.fields.dims[0]) * fr.fields.dims[1] * fr.fields.dims[2];
+    const auto& rho = get("airflow.avg.rho", nc);
+    const auto& ux = get("airflow.avg.ux", nc);
+    const auto& uy = get("airflow.avg.uy", nc);
+    const auto& uz = get("airflow.avg.uz", nc);
+    fr.fields.avg.assign(4 * nc, 0.f);
+    for (size_t c = 0; c < nc; c++) {
+        if (std::isnan(rho[c])) { fr.fields.avg[4 * c] = -2.f; continue; }
+        fr.fields.avg[4 * c] = rho[c]; fr.fields.avg[4 * c + 1] = ux[c]; fr.fields.avg[4 * c + 2] = uy[c]; fr.fields.avg[4 * c + 3] = uz[c];
+    }
+    fr.fields.samples = int(numOr(m["fieldSamples"], 0));
+    AirResults& r = fr.results;
+    auto nan = std::numeric_limits<double>::quiet_NaN();
+    r.drag = numOr(f["drag"], 0); r.lift = numOr(f["lift"], 0); r.side = numOr(f["side"], 0);
+    r.dragCI = f["dragCI"].type == Value::Number ? f["dragCI"].num : nan; r.liftCI = f["liftCI"].type == Value::Number ? f["liftCI"].num : nan;
+    r.sideCI = f["sideCI"].type == Value::Number ? f["sideCI"].num : nan;
+    r.frictionDrag = f["frictionDrag"].type == Value::Number ? f["frictionDrag"].num : nan;
+    r.cd = numOr(f["cd"], 0); r.cl = numOr(f["cl"], 0);
+    r.cdCI = f["cdCI"].type == Value::Number ? f["cdCI"].num : nan; r.clCI = f["clCI"].type == Value::Number ? f["clCI"].num : nan;
+    r.frontalArea = numOr(f["frontalArea"], 0);
+    r.force = {numOr(f["force"][0], 0), numOr(f["force"][1], 0), numOr(f["force"][2], 0)};
+    r.averaged = boolOr(f["averaged"], false);
+    fr.reynolds = numOr(m["reynolds"], 0); fr.reynoldsLength = numOr(m["reynoldsLength"], 0); fr.simReynolds = numOr(m["simReynolds"], 0);
+    fr.nuAir = numOr(m["nuAir"], 0); fr.nuLat = numOr(m["nuLat"], 0);
+    fr.wallModel = boolOr(m["wallModel"], false);
+    fr.groundGap = numOr(m["groundGap"], -1); fr.q = numOr(m["q"], 0); fr.frontal = numOr(m["frontal"], 0);
+    fr.steps = int64_t(numOr(m["steps"], 0)); fr.mlups = numOr(m["mlups"], 0);
+    fr.converged = boolOr(m["converged"], false); fr.developing = boolOr(m["developing"], false);
+    fr.engine = strOr(m["engine"], "stored");
+    if (fr.steps == 0) fr.steps = 1;
+
+    stop();
+    // the stored settings fill the inputs first, then the display choices of the file's setup
+    yaw_ = int(std::clamp(std::round(numOr(st["yaw"], yaw_)), -180.0, 180.0));
+    pitch_ = int(std::clamp(std::round(numOr(st["pitch"], pitch_)), -90.0, 90.0));
+    {
+        Value s2 = jobj();
+        s2.obj["speed"] = jnum(o.speed);
+        s2.obj["airDensity"] = jnum(o.airDensity);
+        s2.obj["ground"] = jbool(o.ground >= 0);
+        if (o.ground >= 0) s2.obj["groundClearance"] = jnum(o.ground);
+        s2.obj["boundaryLayer"] = jstr(bl);
+        s2.obj["cells"] = jnum(o.cells);
+        s2.obj["engine"] = jstr(o.engine == 2 ? "cpu" : "auto");
+        importState(s2);
+    }
+    if (state) importState(*state);
+    auto sim = std::make_shared<AirflowSim>();
+    sim->loadFrozen(app_->part, o, std::move(fr));
+    sim->autoStop = autoStopChk_->isChecked();
+    sim_ = sim;
+    dirty_ = false;
+    cp_.clear();
+    shownSteps_ = -1;
+    shownFields_ = nullptr;
+    initParticles();
+    buildDomain();
+    drawWindArrow();
+    flowCard_->show();
+    displayCard_->show();
+    updateButtons();
+    update();
+    renderLegends();
 }
 
 }  // namespace ps

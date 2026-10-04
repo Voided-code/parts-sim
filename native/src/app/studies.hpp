@@ -7,9 +7,11 @@
 #include <QString>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "core/psim.hpp"
 #include "widgets.hpp"
 
 class QVBoxLayout;
@@ -44,6 +46,11 @@ public:
     virtual void clear() = 0;
     virtual bool hasResult() const = 0;
     virtual void leave() {}
+    /** .psim files: the result as { meta, arrays } (empty when there is none or the study is not stored), and back. */
+    virtual std::optional<psim::Arrays> exportResult() const { return std::nullopt; }
+    virtual bool canImport() const { return false; }
+    /** Throws std::runtime_error with a message for the user when the stored result does not fit the part. */
+    virtual void importResult(const json::Value&, const psim::Arrays&) {}
 
 protected:
     /** Build the result card body (widgets that stay while the result is shown). */

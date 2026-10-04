@@ -58,10 +58,34 @@ def main():
     check("3 thermal save", rc == 0 and th.exists(), out)
     rc, out = app(a.exe, f"open:{th};idle;assert:psim;status;quit")
     check("3 thermal reopen", rc == 0 and "Opened th.psim" in out, out)
+    # 3b: the other studies round trip (save, JS verify, reopen shows results without a solve)
+    for study, extra in [("modal", ""), ("buckling", ""), ("fatigue", ""), ("nonlinear", "mesh:6000;"), ("break", "mesh:20000;")]:
+        f = t / (study + ".psim")
+        run = "break" if study == "break" else f"study:{study};run"
+        rc, out = app(a.exe, f"sample:{'lbracket' if study == 'break' else 'beam'};idle;engine:cpu;{extra}{run};idle;savepsim:{f};quit")
+        check(f"3b {study} save", rc == 0 and f.exists(), out)
+        check(f"3b JS verifies {study}", js("verify", f).returncode == 0, js("verify", f).stderr)
+        rc, out = app(a.exe, f"open:{f};idle;wait:800;assert:psim;status;quit")
+        check(f"3b {study} reopens from the file", rc == 0 and "results shown from the file" in out, out)
+    # 3c: airflow at ~50k cells on the CPU engine
+    af = t / "air.psim"
+    rc, out = app(a.exe, f"sample:ahmed;idle;tab:airflow;airengine:cpu;cells:50000;run;idle;airwait:300;idle;aero;savepsim:{af};quit")
+    cd = re.search(r"Cd (\S+) ", out)
+    check("3c airflow save", rc == 0 and af.exists() and cd, out)
+    check("3c JS verifies airflow", js("verify", af).returncode == 0, js("verify", af).stderr)
+    rc, out = app(a.exe, f"open:{af};idle;wait:1500;aero;assert:psim;quit")
+    cd2 = re.search(r"Cd (\S+) ", out)
+    check("3c airflow reopens with the same Cd, no solver", rc == 0 and cd and cd2 and cd.group(1) == cd2.group(1), out)
     # 4: JS-written files
     subprocess.run(["node", "scripts/psim-sample.mjs", t / "js", "hook"], cwd=ROOT, capture_output=True)
     files = list((t / "js").glob("*.psim")) + ([Path(a.js_file)] if a.js_file else [])
     for f in files:
+        if "app-airflow" in f.name or "airflow" in f.name:
+            rc, out = app(a.exe, f"open:{f};idle;wait:1500;aero;assert:psim;quit")
+            want = re.search(r"rair.meta.results.cd = (\S+)", js("dump", f).stdout)
+            got = re.search(r"Cd (\S+) ", out)
+            check(f"4 app opens {f.name} with the stored Cd", rc == 0 and want and got and abs(float(got.group(1)) - float(want.group(1))) < 5e-4, out)
+            continue
         d = js("dump", f).stdout
         want = re.search(r"rfea.meta.static.maxVM = (\S+)", d)
         again = t / ("re-" + f.name)
