@@ -83,6 +83,7 @@ struct Array {
     std::vector<float> f;
     std::vector<int32_t> i;
     std::vector<uint8_t> u;
+    uint32_t stride = 1;         // 2, 3 or 4 for q16/q8 arrays of vectors (no dims): predict from the same component of the previous vector
     std::vector<uint32_t> dims;  // empty, or {nx, ny, nz} with nx*ny*nz = size(), x fastest
     double err = 0;              // worst-case error of a quantised array (set by the reader and the writer)
     size_t size() const { return enc == Enc::I32 ? i.size() : enc == Enc::U8 ? u.size() : f.size(); }

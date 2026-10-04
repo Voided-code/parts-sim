@@ -98,8 +98,8 @@ Array qarray(const std::string& name, Enc enc, std::vector<float> data, std::vec
 
 Geometry tubeGeometry(bool brep) { return *sampleContent(brep).geometry; }
 
-Bytes loadFixture() {
-    std::ifstream in(std::string(PS_TEST_DATA) + "/../../../test/fixtures/psim/v1-tube.psim", std::ios::binary);
+Bytes loadFixture(const char* name = "v1-tube.psim") {
+    std::ifstream in(std::string(PS_TEST_DATA) + "/../../../test/fixtures/psim/" + name, std::ios::binary);
     return Bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
@@ -642,7 +642,7 @@ TEST("the file written by the JavaScript code reads, with the right counts and v
 }
 
 TEST("the native file has the same uncompressed sections as the JavaScript one") {
-    const Bytes js = loadFixture();
+    const Bytes js = loadFixture("v1-tube-stride.psim");
     const Bytes mine = writePsim(sampleContent(false), fixedOptions());
     const Table a = readTable(js), b = readTable(mine);
     CHECK(a.entries.size() == b.entries.size());
@@ -664,6 +664,66 @@ TEST("a read and a write of the sample take well under a second") {
     const File f = readPsim(b);
     CHECK(pstest::ms(t0) < 1000);
     CHECK(f.geometry->vertices.size() == g.vertices.size());
+}
+
+TEST("stride: vector fields round trip within the bound and shrink") {
+    Rng rng(5);
+    std::vector<float> u(3 * 500);
+    for (size_t i = 0; i < u.size(); i++) u[i] = float(0.01 * std::cos(double(i / 3) / 11) * (1 + (i % 3)) + 1e-5 * rng.next());
+    Array plain = qarray("u", Enc::Q16, u), strided = plain;
+    strided.stride = 3;
+    for (Enc enc : {Enc::Q16, Enc::Q8}) {
+        plain.enc = strided.enc = enc;
+        std::vector<Bound> b;
+        const Bytes bp = encodeArrays(jobj(), {plain}), bs = encodeArrays(jobj(), {strided}, &b);
+        const Arrays r = decodeArrays(bs.data(), bs.size());
+        CHECK(r.list[0].stride == 3);
+        for (size_t i = 0; i < u.size(); i++) CHECK(std::abs(r.list[0].f[i] - u[i]) <= b[0].absolute * (1 + 1e-6) + 1e-9);
+        if (enc == Enc::Q16) {
+            CHECK(decodeArrays(bp.data(), bp.size()).list[0].stride == 1);
+            CHECK(deflateRaw(bs.data(), bs.size()).size() < deflateRaw(bp.data(), bp.size()).size());  // 3 interleaved components: the vector predictor wins
+        }
+    }
+    // bad strides are refused when writing
+    Array bad = strided;
+    bad.stride = 5;
+    CHECK_THROWS(encodeArrays(jobj(), {bad}), "invalid");
+    bad.stride = 2;
+    bad.f.resize(501);
+    CHECK_THROWS(encodeArrays(jobj(), {bad}), "invalid");
+    bad = qarray("f", Enc::F32, {1, 2, 3, 4, 5, 6});
+    bad.stride = 3;
+    CHECK_THROWS(encodeArrays(jobj(), {bad}), "invalid");
+    bad = qarray("g", Enc::Q16, {1, 2, 3, 4, 5, 6}, {3, 2, 1});
+    bad.stride = 3;
+    CHECK_THROWS(encodeArrays(jobj(), {bad}), "invalid");
+    // and when reading
+    auto section = [](const std::string& head, size_t dataBytes) {
+        Bytes b(4 + head.size() + dataBytes, 0);
+        wr32(b.data(), uint32_t(head.size()));
+        std::memcpy(b.data() + 4, head.data(), head.size());
+        return b;
+    };
+    for (const char* extra : {"\"stride\":5", "\"stride\":0", "\"stride\":2.5", "\"stride\":\"3\"", "\"stride\":2", "\"stride\":3,\"dims\":[6,1,1]"}) {
+        const std::string head = std::string("{\"arrays\":[{\"name\":\"a\",\"enc\":\"q16\",\"n\":6,\"bytes\":12,\"min\":0,\"max\":1,") + extra + "}]}";
+        const Bytes b = section(head, 12);
+        const bool ok = std::string(extra) == "\"stride\":2";
+        CHECK(ok ? !throwsPsim([&] { decodeArrays(b.data(), b.size()); }, nullptr, nullptr, extra) : throwsPsim([&] { decodeArrays(b.data(), b.size()); }, "damaged", nullptr, extra));
+    }
+    const Bytes b5 = section("{\"arrays\":[{\"name\":\"a\",\"enc\":\"q16\",\"n\":5,\"bytes\":10,\"min\":0,\"max\":1,\"stride\":2}]}", 10);
+    CHECK_THROWS(decodeArrays(b5.data(), b5.size()), "damaged");
+}
+
+TEST("the stride fixture written by JavaScript reads (and the old one without stride)") {
+    const File f = readPsim(loadFixture("v1-tube-stride.psim"));
+    const Array* u = f.rfea->find("static.u");
+    CHECK(u && u->stride == 3 && u->f.size() == 3 * 40 * 24);
+    const File mine = sampleContent(false);
+    double bound = 0;
+    for (const auto& b : f.info["bounds"].arr) if (b["field"].str == "static.u") bound = b["absolute"].num;
+    CHECK(bound > 0);
+    for (size_t i = 0; i < u->f.size(); i++) CHECK_NEAR(u->f[i], mine.rfea->list[1].f[i], bound * 1.0001 + 1e-9);
+    CHECK(readPsim(loadFixture("v1-tube.psim")).rfea->find("static.u")->stride == 1);
 }
 
 TEST_MAIN
