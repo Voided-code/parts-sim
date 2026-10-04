@@ -99,6 +99,12 @@ ctest --output-on-failure
 | `test_gpu` | GPU multigrid-CG against the CPU solver |
 | `test_studies` | frequency, free-free modes, buckling, elastica, plastic collapse, heat conduction, fin, drop impact, modal superposition, fatigue, topology |
 | `test_lbm` | lattice-Boltzmann stability and drag, GPU against CPU, wall links, pressure forces |
+| `test_psim` | the `.psim` file (docs/psim-format.md): round trips, the file the JavaScript code wrote, truncated, bit-flipped, lying and fuzzed files |
+
+The `.psim` code (`src/core/psim.*`, no Qt) also builds `psim_tool` (`verify`, `inspect`, `dump`, `make-fixture`, `bench`).
+`python3 native/tests/psim_cross.py native/build/psim_tool` checks it against `node scripts/psim.mjs` in both directions.
+For a longer hand run under the sanitizers: compile `tests/test_psim.cpp src/core/psim.cpp src/util/json.cpp` with
+`-fsanitize=address,undefined -ffp-contract=off` and run it with `PSIM_FUZZ_CASES=40000`.
 
 The app has a small automation hook used for screenshot checks:
 
