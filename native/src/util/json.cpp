@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 
@@ -21,8 +22,10 @@ namespace {
 
 struct Parser {
     const std::string& s;
+    ParseOptions opt;
     size_t i = 0;
     int depth = 0;
+    size_t nodes = 0;
 
     [[noreturn]] void fail(const char* what) { throw std::runtime_error(std::string("Invalid JSON: ") + what); }
     void ws() { while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) i++; }
@@ -33,7 +36,8 @@ struct Parser {
     }
 
     Value value() {
-        if (++depth > 256) fail("nested too deeply");
+        if (++depth > opt.maxDepth) fail("nested too deeply");
+        if (opt.maxNodes && ++nodes > opt.maxNodes) fail("too many values");
         ws();
         if (i >= s.size()) fail("unexpected end");
         Value v;
@@ -74,7 +78,21 @@ struct Parser {
         } else if (lit("true")) { v.type = Value::Bool; v.b = true; }
         else if (lit("false")) { v.type = Value::Bool; }
         else if (lit("null")) {}
-        else {
+        else if (opt.strict) {
+            const size_t a = i;
+            auto digits = [&] { const size_t b = i; while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++; return i > b; };
+            if (i < s.size() && s[i] == '-') i++;
+            if (i < s.size() && s[i] == '0') i++;
+            else if (!digits()) fail("unexpected character");
+            if (i < s.size() && s[i] == '.') { i++; if (!digits()) fail("bad number"); }
+            if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+                i++;
+                if (i < s.size() && (s[i] == '+' || s[i] == '-')) i++;
+                if (!digits()) fail("bad number");
+            }
+            v.num = std::strtod(s.substr(a, i - a).c_str(), nullptr);
+            v.type = Value::Number;
+        } else {
             char* end = nullptr;
             v.num = std::strtod(s.c_str() + i, &end);
             if (end == s.c_str() + i) fail("unexpected character");
@@ -85,12 +103,28 @@ struct Parser {
         return v;
     }
 
+    // four hex digits after "\\u" (s[i] is the 'u'); leaves i on the last digit
+    unsigned hex4() {
+        if (i + 4 >= s.size()) fail("bad escape");
+        unsigned cp = 0;
+        for (int k = 1; k <= 4; k++) {
+            const char h = s[i + k];
+            const int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+            if (d < 0) fail("bad escape");
+            cp = cp * 16 + unsigned(d);
+        }
+        i += 4;
+        return cp;
+    }
+
     std::string string() {
         std::string out;
         i++;  // opening quote
         while (i < s.size() && s[i] != '"') {
+            if (opt.strict && (unsigned char)s[i] < 0x20) fail("control character in a string");
             if (s[i] == '\\' && i + 1 < s.size()) {
                 const char e = s[++i];
+                if (opt.strict && (e == 0 || !std::strchr("\"\\/bfnrtu", e))) fail("bad escape");
                 switch (e) {
                     case 'n': out += '\n'; break;
                     case 't': out += '\t'; break;
@@ -98,12 +132,20 @@ struct Parser {
                     case 'b': out += '\b'; break;
                     case 'f': out += '\f'; break;
                     case 'u': {
-                        if (i + 4 >= s.size()) fail("bad escape");
-                        unsigned cp = unsigned(std::strtoul(s.substr(i + 1, 4).c_str(), nullptr, 16));
-                        i += 4;
+                        unsigned cp = hex4();
+                        // a surrogate pair is one character above U+FFFF; a lone half is kept as U+FFFD
+                        if (cp >= 0xd800 && cp < 0xdc00 && i + 6 < s.size() && s[i + 1] == '\\' && s[i + 2] == 'u') {
+                            const size_t save = i;
+                            i += 2;
+                            const unsigned lo = hex4();
+                            if (lo >= 0xdc00 && lo < 0xe000) cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                            else i = save;
+                        }
+                        if (cp >= 0xd800 && cp < 0xe000) cp = 0xfffd;
                         if (cp < 0x80) out += char(cp);
                         else if (cp < 0x800) { out += char(0xc0 | (cp >> 6)); out += char(0x80 | (cp & 0x3f)); }
-                        else { out += char(0xe0 | (cp >> 12)); out += char(0x80 | ((cp >> 6) & 0x3f)); out += char(0x80 | (cp & 0x3f)); }
+                        else if (cp < 0x10000) { out += char(0xe0 | (cp >> 12)); out += char(0x80 | ((cp >> 6) & 0x3f)); out += char(0x80 | (cp & 0x3f)); }
+                        else { out += char(0xf0 | (cp >> 18)); out += char(0x80 | ((cp >> 12) & 0x3f)); out += char(0x80 | ((cp >> 6) & 0x3f)); out += char(0x80 | (cp & 0x3f)); }
                         break;
                     }
                     default: out += e;
@@ -163,8 +205,10 @@ void write(std::ostringstream& o, const Value& v, int indent, int level) {
 
 }  // namespace
 
-Value parse(const std::string& text) {
-    Parser p{text};
+Value parse(const std::string& text) { return parse(text, ParseOptions{}); }
+
+Value parse(const std::string& text, const ParseOptions& opts) {
+    Parser p{text, opts};
     Value v = p.value();
     p.ws();
     if (p.i != text.size()) p.fail("trailing characters");

@@ -5,6 +5,8 @@
 //   node scripts/psim.mjs to-stl <file> [out.stl] the part as binary STL
 //   node scripts/psim.mjs forces <file> [out.csv] forces and results as CSV
 //   node scripts/psim.mjs fixtures                writes test/fixtures/psim/*.psim (one per format version)
+//   node scripts/psim.mjs dump <file>             a stable line-based text of the decoded content; native/build/psim_tool dump
+//                                                 prints the same text, so the two apps can be compared with diff
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +21,105 @@ const kb = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)} MB` : `${(n / 1e3).toFixe
 function csvCell(v) {
   const s = String(v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// ---- dump: the same text as native/tools/psim_tool.cpp (numbers as C's %.9g)
+
+function fmtG(v) {
+  if (Number.isNaN(v)) return 'nan';
+  if (v === Infinity) return 'inf';
+  if (v === -Infinity) return '-inf';
+  if (v === 0) return Object.is(v, -0) ? '-0' : '0';
+  const [mant, exp] = v.toExponential(8).split('e');
+  const x = Number(exp);
+  if (x < -4 || x >= 9) {
+    const m = mant.includes('.') ? mant.replace(/0+$/, '').replace(/\.$/, '') : mant;
+    return `${m}e${x < 0 ? '-' : '+'}${String(Math.abs(x)).padStart(2, '0')}`;
+  }
+  const f = v.toFixed(8 - x);
+  return f.includes('.') ? f.replace(/0+$/, '').replace(/\.$/, '') : f;
+}
+
+const hex8 = (n) => (n >>> 0).toString(16).padStart(8, '0');
+const quote = (s) => `"${s.replace(/[\\"\n\r\t\u0000-\u001f]/g, (c) => (c === '"' ? '\\"' : c === '\\' ? '\\\\' : c === '\n' ? '\\n' : c === '\r' ? '\\r' : c === '\t' ? '\\t' : `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`))}"`;
+
+function fnvOf(words) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 16777619) >>> 0;
+  return h;
+}
+
+/** Bit patterns of floats with one not-a-number. */
+function floatWords(f32) {
+  const u = new Uint32Array(f32.buffer, f32.byteOffset, f32.length);
+  const out = new Uint32Array(f32.length);
+  for (let i = 0; i < f32.length; i++) out[i] = Number.isNaN(f32[i]) ? 0x7fc00000 : u[i];
+  return out;
+}
+
+function stats(values) {
+  let mn = 0, mx = 0, sum = 0, nonfinite = 0, first = true;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (!Number.isFinite(v)) { nonfinite++; continue; }
+    if (first) { mn = mx = v; first = false; }
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    sum += v;
+  }
+  return { mn, mx, sum, nonfinite };
+}
+
+function flatten(lines, prefix, v) {
+  if (v === null || v === undefined) lines.push(`${prefix} = null`);
+  else if (typeof v === 'boolean') lines.push(`${prefix} = ${v}`);
+  else if (typeof v === 'number') lines.push(`${prefix} = ${fmtG(v)}`);
+  else if (typeof v === 'string') lines.push(`${prefix} = ${quote(v)}`);
+  else if (Array.isArray(v)) {
+    if (!v.length) lines.push(`${prefix} = []`);
+    v.forEach((x, i) => flatten(lines, `${prefix}[${i}]`, x));
+  } else {
+    const keys = Object.keys(v).sort();
+    if (!keys.length) lines.push(`${prefix} = {}`);
+    for (const k of keys) flatten(lines, `${prefix}.${k}`, v[k]);
+  }
+}
+
+function dumpArrays(lines, tag, r) {
+  flatten(lines, `${tag}.meta`, r.meta);
+  for (const [name, a] of r.arrays) {
+    const s = stats(a.data);
+    const words = a.enc === 'i32' ? new Uint32Array(a.data.buffer, a.data.byteOffset, a.data.length) : a.enc === 'u8' ? a.data : floatWords(a.data);
+    lines.push(`${tag}.array ${name} enc=${a.enc} n=${a.data.length} dims=${a.dims ? a.dims.join(',') : '-'} min=${fmtG(s.mn)} max=${fmtG(s.mx)} sum=${fmtG(s.sum)} nonfinite=${s.nonfinite} fnv=${hex8(fnvOf(words))}`);
+  }
+}
+
+function dumpText(f) {
+  const lines = ['psim-dump 1', `format ${f.version} ${f.minReader}`];
+  for (const e of f.table) lines.push(`table ${e.id} codec=${e.codec} flags=${e.flags} raw=${e.raw} crc=${hex8(e.crc)}`);
+  if (f.skipped.length) lines.push(`skipped ${f.skipped.join(',')}`);
+  flatten(lines, 'info', f.info);
+  if (f.thumb) lines.push(`thumb bytes=${f.thumb.length} fnv=${hex8(fnvOf(f.thumb))}`);
+  if (f.geometry) {
+    const g = f.geometry;
+    const nV = g.vertices.length / 3;
+    lines.push(`geom.mode = ${g.exact ? 'exact' : 'quantised16'}`, `geom.brep = ${g.brepFaces ? 1 : 0}`, `geom.vertices = ${nV}`, `geom.triangles = ${g.tris.length / 3}`, `geom.faceCount = ${g.faceCount}`, `geom.faceAngle = ${fmtG(g.faceAngle)}`);
+    lines.push(`geom.bbox.min = ${g.bbox.min.map(fmtG).join(' ')}`, `geom.bbox.max = ${g.bbox.max.map(fmtG).join(' ')}`);
+    for (let d = 0; d < 3; d++) {
+      const axis = new Float32Array(nV);
+      for (let i = 0; i < nV; i++) axis[i] = g.vertices[3 * i + d];
+      const s = stats(axis);
+      lines.push(`geom.pos.${'xyz'[d]} = min=${fmtG(s.mn)} max=${fmtG(s.mx)} sum=${fmtG(s.sum)}`);
+    }
+    lines.push(`geom.vertexFnv = ${hex8(fnvOf(floatWords(g.vertices)))}`, `geom.triangleFnv = ${hex8(fnvOf(g.tris))}`);
+    if (g.brepFaces) lines.push(`geom.faceFnv = ${hex8(fnvOf(new Uint32Array(g.faceOf.buffer, g.faceOf.byteOffset, g.faceOf.length)))}`);
+  }
+  if (f.cad) lines.push(`cad bytes=${f.cad.length} fnv=${hex8(fnvOf(f.cad))}`);
+  if (f.setup) flatten(lines, 'setup', f.setup);
+  if (f.rfea) dumpArrays(lines, 'rfea', f.rfea);
+  if (f.rair) dumpArrays(lines, 'rair', f.rair);
+  if (f.view) flatten(lines, 'view', f.view);
+  return lines.join('\n') + '\n';
 }
 
 async function main() {
@@ -40,6 +141,8 @@ async function main() {
     if (f.setup) parts.push('setup');
     for (const k of ['rfea', 'rair']) if (f[k]) parts.push(`${k === 'rfea' ? 'structural/thermal' : 'airflow'} results (${f[k].arrays.size} arrays)`);
     console.log(`${file}: OK, ${parts.join(', ') || 'info only'}${f.skipped.length ? `; skipped unknown sections ${f.skipped.join(', ')}` : ''}`);
+  } else if (command === 'dump') {
+    process.stdout.write(dumpText(await readPsim(load(file))));
   } else if (command === 'to-stl') {
     const f = await readPsim(load(file), { want: ['INFO', 'GEOM'] });
     if (!f.geometry) throw new PsimError('The file has no geometry.');
@@ -81,7 +184,7 @@ async function main() {
     writeFileSync(resolve(dir, 'v1-tube.psim'), bytes);
     console.log(`test/fixtures/psim/v1-tube.psim: ${bytes.length} bytes`);
   } else {
-    console.log('usage: node scripts/psim.mjs inspect|verify|to-stl|forces|fixtures <file> [out]');
+    console.log('usage: node scripts/psim.mjs inspect|verify|dump|to-stl|forces|fixtures <file> [out]');
     process.exit(command ? 2 : 0);
   }
 }
