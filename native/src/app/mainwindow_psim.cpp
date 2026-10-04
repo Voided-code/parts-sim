@@ -96,6 +96,7 @@ psim::File MainWindow::gatherPsim(const PsimSaveOptions& o, QStringList* resultI
     // results
     std::vector<std::pair<QString, psim::Arrays>> results;
     if (auto r = structural->exportStatic()) results.push_back({"static", std::move(*r)});
+    if (auto r = structural->exportBreak()) results.push_back({"break", std::move(*r)});
     if (auto r = thermal->exportResult()) results.push_back({"thermal", std::move(*r)});
     std::optional<psim::Arrays> air = airflow->exportResults();
     if (resultIds) {
@@ -361,6 +362,7 @@ bool MainWindow::openPsim(const QString& path) {
                 structural->importStatic(m, *rfea);
                 lf.stored["static"] = {{"maxVM", numOr(m["maxVM"], NAN)}, {"maxDisp", numOr(m["maxDisp"], NAN)}, {"minFos", numOr(m["minFos"], NAN)}};
             });
+            else if (id == "break") guard("break test", [&] { structural->importBreak(m, *rfea); lf.stored["break"] = {{"firstCrack", numOr(m["steps"][0]["lambda"], NAN)}}; });
             else if (id == "thermal") guard("thermal result", [&] {
                 thermal->importResult(m, *rfea);
                 lf.stored["thermal"] = {{"min", numOr(m["min"], NAN)}, {"max", numOr(m["max"], NAN)}};

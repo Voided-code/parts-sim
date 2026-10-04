@@ -68,6 +68,8 @@ public:
     std::vector<psim::Array> windArrays() const;
     std::optional<psim::Arrays> exportStatic() const;
     void importStatic(const json::Value& meta, const psim::Arrays& arrays);
+    std::optional<psim::Arrays> exportBreak();
+    void importBreak(const json::Value& meta, const psim::Arrays& arrays);
     json::Value exportView() const;
     void importView(const json::Value& v);
     void restoreStudy(const QString& id);
@@ -183,6 +185,13 @@ private:
         bool done = false;
         QString reason;
         double scale = 0;
+        // a break test loaded from a .psim file has no voxel model, only its grid and the mapped fields
+        bool loaded = false;
+        std::array<int, 3> gdims{1, 1, 1};
+        Vec3 gorigin{0, 0, 0};
+        double gh = 0;
+        int gres = 0;
+        std::map<std::array<int, 3>, std::vector<int>> hash;  // part vertices by cell (nearest-vertex lookups)
     };
     std::optional<Break> brk_;
     bool playing_ = false;
