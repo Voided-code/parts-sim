@@ -952,6 +952,44 @@ public:
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
 
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        psim::Arrays out;
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(app()->units.toStdString());
+        m.obj["material"] = materialToJson(r_->material);
+        m.obj["totalF"] = jnum(0);
+        m.obj["engine"] = jstr(r_->m.engine);
+        m.obj["gpuNote"] = jstr(r_->m.gpuNote);
+        out.meta = m;
+        for (auto [name, data] : {std::pair<const char*, const std::vector<float>*>{"vm", &r_->m.vm}, {"p1", &r_->m.p1}, {"p3", &r_->m.p3}}) {
+            psim::Array a;
+            a.name = std::string("fatigue.") + name;
+            a.enc = psim::Enc::Q16;
+            a.f = *data;
+            out.list.push_back(std::move(a));
+        }
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (numOr(m["nVert"], -1) != part().nVert) throw std::runtime_error("The fatigue result in the file was computed for a different part.");
+        Mapped mp;
+        for (auto [name, data] : {std::pair<const char*, std::vector<float>*>{"vm", &mp.vm}, {"p1", &mp.p1}, {"p3", &mp.p3}}) {
+            const psim::Array* a = arrays.find(std::string("fatigue.") + name);
+            if (!a || a->f.size() != size_t(part().nVert)) throw std::runtime_error("The fatigue result in the file does not fit this part.");
+            *data = a->f;
+        }
+        mp.engine = strOr(m["engine"]);
+        mp.gpuNote = strOr(m["gpuNote"]);
+        r_ = Result{std::move(mp), m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material, {}};
+        invalidate();
+        r_->fat = fatigueField(r_->m.vm, r_->m.p1, r_->m.p3, r_->material, o_.finish.toStdString(), o_.R, o_.cycles, o_.scale);
+    }
+
     bool options(QVBoxLayout* l) override {
         const Material& mat = app()->material;
         l->addWidget(heading(tr("FATIGUE OPTIONS")));
