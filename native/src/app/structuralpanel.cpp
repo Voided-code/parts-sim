@@ -2000,8 +2000,17 @@ void StructuralPanel::importSetup(const json::Value& s, const psim::Arrays* arra
     renderLists();
 }
 
+Study* StructuralPanel::studyById(const QString& id) const {
+    for (const auto& st : studies)
+        if (st->id() == id) return st.get();
+    return nullptr;
+}
+
 void StructuralPanel::restoreStudy(const QString& id) {
     selectStudy(id);
+    display_ = study_ == 0 ? (result_ ? "results" : brk_ && !brk_->steps.empty() ? "break" : "setup")
+                           : studies[study_ - 1]->hasResult() ? "study" : "setup";
+    renderStudyOptions();
     applyDisplay();
 }
 

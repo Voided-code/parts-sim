@@ -1,4 +1,5 @@
 #include "studies.hpp"
+#include "psimjson.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -644,6 +645,66 @@ public:
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
 
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        psim::Arrays out;
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(units_.toStdString());
+        m.obj["material"] = materialToJson(app()->material);
+        m.obj["diag"] = jnum(diag_);
+        m.obj["free"] = jbool(r_->free);
+        m.obj["converged"] = jbool(r_->converged);
+        m.obj["iterations"] = jnum(r_->iterations);
+        m.obj["totalMass"] = jnum(r_->totalMass);
+        m.obj["engine"] = jstr(r_->engine);
+        m.obj["gpuNote"] = jstr(r_->gpuNote);
+        Value modes = jarr();
+        for (size_t i = 0; i < r_->modes.size(); i++) {
+            Value e = jobj();
+            e.obj["freq"] = jnum(r_->modes[i].freq);
+            e.obj["eff"] = vec({r_->modes[i].eff[0], r_->modes[i].eff[1], r_->modes[i].eff[2]});
+            modes.arr.push_back(e);
+            psim::Array a;
+            a.name = "modal.shape." + std::to_string(i);
+            a.enc = psim::Enc::Q16;
+            a.f = r_->modes[i].shape;
+            a.stride = 3;
+            out.list.push_back(std::move(a));
+        }
+        m.obj["modes"] = modes;
+        out.meta = m;
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (numOr(m["nVert"], -1) != part().nVert) throw std::runtime_error("The frequency result in the file was computed for a different part.");
+        ModalRun r;
+        for (size_t i = 0; i < m["modes"].arr.size(); i++) {
+            const Value& e = m["modes"].arr[i];
+            const psim::Array* a = arrays.find("modal.shape." + std::to_string(i));
+            if (!a || a->f.size() != 3 * size_t(part().nVert)) throw std::runtime_error("The frequency result in the file does not fit this part.");
+            ModalMode mode;
+            mode.freq = numOr(e["freq"], 0);
+            for (int d = 0; d < 3; d++) mode.eff[d] = numOr(e["eff"][d], 0);
+            mode.shape = a->f;
+            r.modes.push_back(std::move(mode));
+        }
+        r.free = boolOr(m["free"], false);
+        r.converged = boolOr(m["converged"], true);
+        r.iterations = int(numOr(m["iterations"], 0));
+        r.totalMass = numOr(m["totalMass"], 0);
+        r.engine = strOr(m["engine"]);
+        r.gpuNote = strOr(m["gpuNote"]);
+        r_ = std::move(r);
+        units_ = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+        diag_ = part().bbox.diag;
+        view_.mode = 0;
+        invalidate();
+    }
+
     bool options(QVBoxLayout* l) override {
         l->addWidget(heading(tr("FREQUENCY OPTIONS")));
         l->addWidget(field(tr("Number of modes"), numberBox(nev_, 1, 20, 1, 0, [this](double v) { nev_ = int(v); panel_->markStale(); })));
@@ -730,6 +791,63 @@ public:
     QString id() const override { return "buckling"; }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
+
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_) return std::nullopt;
+        psim::Arrays out;
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(app()->units.toStdString());
+        m.obj["material"] = materialToJson(material_);
+        m.obj["diag"] = jnum(diag_);
+        m.obj["totalF"] = jnum(totalF_);
+        m.obj["maxVM"] = jnum(maxVM_);
+        m.obj["maxFactor"] = jnum(r_->maxFactor);
+        m.obj["converged"] = jbool(r_->converged);
+        m.obj["iterations"] = jnum(r_->iterations);
+        m.obj["engine"] = jstr(r_->engine);
+        m.obj["gpuNote"] = jstr(r_->gpuNote);
+        Value f = jarr();
+        for (size_t i = 0; i < r_->modes.size(); i++) {
+            f.arr.push_back(jnum(r_->modes[i].factor));
+            psim::Array a;
+            a.name = "buckling.shape." + std::to_string(i);
+            a.enc = psim::Enc::Q16;
+            a.f = r_->modes[i].shape;
+            a.stride = 3;
+            out.list.push_back(std::move(a));
+        }
+        m.obj["factors"] = f;
+        out.meta = m;
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (numOr(m["nVert"], -1) != part().nVert) throw std::runtime_error("The buckling result in the file was computed for a different part.");
+        BucklingRun r;
+        for (size_t i = 0; i < m["factors"].arr.size(); i++) {
+            const psim::Array* a = arrays.find("buckling.shape." + std::to_string(i));
+            if (!a || a->f.size() != 3 * size_t(part().nVert)) throw std::runtime_error("The buckling result in the file does not fit this part.");
+            BucklingRun::Mode mode;
+            mode.factor = m["factors"].arr[i].type == Value::Number ? m["factors"].arr[i].num : INFINITY;
+            mode.shape = a->f;
+            r.modes.push_back(std::move(mode));
+        }
+        r.maxFactor = m["maxFactor"].type == Value::Number ? m["maxFactor"].num : INFINITY;
+        r.converged = boolOr(m["converged"], true);
+        r.iterations = int(numOr(m["iterations"], 0));
+        r.engine = strOr(m["engine"]);
+        r.gpuNote = strOr(m["gpuNote"]);
+        r_ = std::move(r);
+        material_ = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material;
+        totalF_ = numOr(m["totalF"], 0);
+        maxVM_ = numOr(m["maxVM"], 0);
+        diag_ = part().bbox.diag;
+        view_.mode = 0;
+        invalidate();
+    }
 
     bool options(QVBoxLayout* l) override {
         l->addWidget(heading(tr("BUCKLING OPTIONS")));

@@ -255,6 +255,7 @@ public:
     const void* studyContentOwner = nullptr;
     std::vector<std::unique_ptr<Study>> studies;
     int studyIndex() const { return study_; }
+    Study* studyById(const QString& id) const;
     Study* currentStudy() const { return study_ > 0 ? studies[study_ - 1].get() : nullptr; }
     bool isStale() const { return stale_; }
     /** True only while a completed, converged linear static result is current and displayed. */
