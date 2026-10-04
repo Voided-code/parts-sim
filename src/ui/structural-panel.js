@@ -1338,7 +1338,7 @@ export class StructuralPanel {
     if (!r) return null;
     const meta = {};
     for (const [k, v] of Object.entries(r)) if (!ArrayBuffer.isView(v) && k !== 'reaction') meta[k] = v;
-    const field = (name) => ({ name: `static.${name}`, data: r[name], enc: 'q16' });
+    const field = (name) => ({ name: `static.${name}`, data: r[name], enc: 'q16', ...(name === 'u' ? { stride: 3 } : {}) });
     return { meta, arrays: ['vm', 'p1', 'p3', 'fos', 'u'].map(field) };
   }
 
@@ -1371,7 +1371,7 @@ export class StructuralPanel {
         for (let q = 0; q < u.length; q++) u[q] /= b.toMeters;
         s.mapped = { vm: m.interpolate(W, s.nodeVM), u };
       }
-      arrays.push({ name: `break.vm.${i}`, data: s.mapped.vm, enc: 'q16' }, { name: `break.u.${i}`, data: s.mapped.u, enc: 'q16' },
+      arrays.push({ name: `break.vm.${i}`, data: s.mapped.vm, enc: 'q16' }, { name: `break.u.${i}`, data: s.mapped.u, enc: 'q16', stride: 3 },
         { name: `break.cracked.${i}`, data: Int32Array.from(s.cracked), enc: 'i32' }, { name: `break.detached.${i}`, data: Int32Array.from(s.detached), enc: 'i32' });
       return { step: s.step, lambda: s.lambda, maxDisp: s.maxDisp };
     });

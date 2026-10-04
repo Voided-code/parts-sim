@@ -37,7 +37,7 @@ export function sampleContent({ brep = false } = {}) {
     thumb: Uint8Array.of(0xff, 0xd8, 0xff, 0xd9),
     geometry,
     setup: { units: 'mm', structural: { study: 'static', fixtures: [{ name: 'F', patches: [{ tris: [0, 12], clip: null }] }] } },
-    rfea: { meta: { results: ['static'], static: { maxVM: 1.5e6, lamBreak: Infinity, minFos: NaN } }, arrays: [{ name: 'static.vm', data: vm, enc: 'q16' }, { name: 'static.u', data: u, enc: 'q16' }] },
+    rfea: { meta: { results: ['static'], static: { maxVM: 1.5e6, lamBreak: Infinity, minFos: NaN } }, arrays: [{ name: 'static.vm', data: vm, enc: 'q16' }, { name: 'static.u', data: u, enc: 'q16', stride: 3 }] },
     rair: { meta: { airflow: { cd: 0.3 } }, arrays: [{ name: 'airflow.avg.ux', data: Float32Array.from({ length: 6 * 5 * 4 }, (_, i) => Math.sin(i / 9)), enc: 'q16', dims: [6, 5, 4] }] },
     view: { tab: 'structural' },
   };

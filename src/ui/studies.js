@@ -359,7 +359,7 @@ class NonlinearStudy extends Study {
     if (!r?.done || !r.reason || !r.steps.length) return null;
     const nV = this.part.nVert, arrays = [];
     const one = (s, id) => {
-      arrays.push({ name: `nonlinear.${id}.u`, data: s.u, enc: 'q16' }, { name: `nonlinear.${id}.vm`, data: s.vm, enc: 'q16' }, { name: `nonlinear.${id}.pe`, data: s.pe, enc: 'q16' });
+      arrays.push({ name: `nonlinear.${id}.u`, data: s.u, enc: 'q16', stride: 3 }, { name: `nonlinear.${id}.vm`, data: s.vm, enc: 'q16' }, { name: `nonlinear.${id}.pe`, data: s.pe, enc: 'q16' });
       return { lam: s.lam, D: s.D, maxVM: s.maxVM, maxPE: s.maxPE, maxDisp: s.maxDisp, iterations: s.iterations };
     };
     const steps = r.steps.map((s, i) => one(s, `step.${i}`));
@@ -540,7 +540,7 @@ class ModalStudy extends Study {
       nVert: this.part.nVert, units: r.units, material: plain(r.material), diag: r.diag, free: !!r.free, converged: !!r.converged, iterations: r.iterations ?? null,
       totalMass: r.totalMass ?? null, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null, modes: r.modes.map((m) => ({ freq: m.freq, eff: Array.from(m.eff) })),
     };
-    return { meta, arrays: r.modes.map((m, i) => ({ name: `modal.shape.${i}`, data: m.shape, enc: 'q16' })) };
+    return { meta, arrays: r.modes.map((m, i) => ({ name: `modal.shape.${i}`, data: m.shape, enc: 'q16', stride: 3 })) };
   }
 
   importResult(meta, arrays) {
@@ -663,7 +663,7 @@ class BucklingStudy extends Study {
       nVert: this.part.nVert, units: r.units, material: plain(r.material), diag: r.diag, totalF: r.totalF, maxVM: r.maxVM, maxFactor: r.maxFactor ?? null,
       converged: !!r.converged, iterations: r.iterations ?? null, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null, factors: r.modes.map((m) => m.factor),
     };
-    return { meta, arrays: r.modes.map((m, i) => ({ name: `buckling.shape.${i}`, data: m.shape, enc: 'q16' })) };
+    return { meta, arrays: r.modes.map((m, i) => ({ name: `buckling.shape.${i}`, data: m.shape, enc: 'q16', stride: 3 })) };
   }
 
   importResult(meta, arrays) {
@@ -959,7 +959,7 @@ class DropStudy extends Study {
       { name: 'drop.times', data: r.times, enc: 'f32' },
       { name: 'drop.forces', data: r.forces, enc: 'f32' },
     ];
-    r.frames.forEach((fr, i) => arrays.push({ name: `drop.frame.${i}.u`, data: fr.u, enc: 'q16' }, { name: `drop.frame.${i}.vm`, data: fr.vm, enc: 'q16' }));
+    r.frames.forEach((fr, i) => arrays.push({ name: `drop.frame.${i}.u`, data: fr.u, enc: 'q16', stride: 3 }, { name: `drop.frame.${i}.vm`, data: fr.vm, enc: 'q16' }));
     const peakFrame = r.frames.findIndex((fr) => fr.t >= r.tPeak[r.peakAt]);
     const meta = {
       nVert: this.part.nVert, units: r.units, material: plain(r.material), height: this.opts.height, speed: r.speed, mass: r.mass,

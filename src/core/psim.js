@@ -169,7 +169,7 @@ const LEVELS = { q16: 65536, q8: 256 };
 const WIDTH = { q16: 2, q8: 1, f32: 4, i32: 4, u8: 1 };
 
 /** Prediction residuals of quantised codes, in place order x fastest. Returns zig-zag residuals. */
-export function predictEncode(codes, L, dims) {
+export function predictEncode(codes, L, dims, stride = 1) {
   const n = codes.length;
   const res = new Uint16Array(n);
   const half = L >> 1;
@@ -180,8 +180,7 @@ export function predictEncode(codes, L, dims) {
     res[i] = r >= 0 ? 2 * r : -2 * r - 1;
   };
   if (!dims) {
-    let prev = 0;
-    for (let i = 0; i < n; i++) { put(i, prev); prev = codes[i]; }
+    for (let i = 0; i < n; i++) put(i, i >= stride ? codes[i - stride] : 0);
     return res;
   }
   const [nx, ny, nz] = dims;
@@ -204,7 +203,7 @@ export function predictEncode(codes, L, dims) {
   return res;
 }
 
-function predictDecode(res, L, dims, Type) {
+function predictDecode(res, L, dims, Type, stride = 1) {
   const n = res.length;
   const codes = new Type(n);
   const get = (i, p) => {
@@ -214,8 +213,7 @@ function predictDecode(res, L, dims, Type) {
     codes[i] = c;
   };
   if (!dims) {
-    let prev = 0;
-    for (let i = 0; i < n; i++) { get(i, prev); prev = codes[i]; }
+    for (let i = 0; i < n; i++) get(i, i >= stride ? codes[i - stride] : 0);
     return codes;
   }
   const [nx, ny, nz] = dims;
@@ -259,6 +257,11 @@ export function encodeArrays(meta, arrays) {
     const n = data.length;
     const entry = { name, enc, n };
     if (a.dims) { checkDims(a.dims, n); entry.dims = a.dims; }
+    const stride = a.stride ?? 1;
+    if (stride !== 1) {
+      if (!(enc === 'q16' || enc === 'q8') || a.dims || ![2, 3, 4].includes(stride) || n % stride) fail('An array has a stride its encoding cannot use.');
+      entry.stride = stride;
+    }
     let blob;
     if (enc === 'f32') {
       const bits = new Uint32Array(new Float32Array(data).buffer);
@@ -285,7 +288,7 @@ export function encodeArrays(meta, arrays) {
         const v = data[i];
         codes[i] = Number.isFinite(v) ? (span > 0 ? 1 + Math.round(((v - min) / span) * (L - 2)) : 1) : 0;
       }
-      const res = predictEncode(codes, L, a.dims);
+      const res = predictEncode(codes, L, a.dims, stride);
       blob = new Uint8Array(WIDTH[enc] * n);
       putPlanes(blob, 0, res, WIDTH[enc]);
       entry.min = min;
@@ -326,6 +329,8 @@ export function decodeArrays(bytes) {
     if (e.bytes !== WIDTH[e.enc] * e.n) fail('An array entry has the wrong byte count.', 'damaged');
     if (o + e.bytes > bytes.length) fail('An array runs past the end of its section.', 'damaged');
     if (e.dims) checkDims(e.dims, e.n);
+    const stride = e.stride ?? 1;
+    if (!Number.isInteger(stride) || stride < 1 || stride > 4 || (stride > 1 && (e.dims || e.n % stride))) fail('An array entry has an invalid stride.', 'damaged');
     let data;
     if (e.enc === 'f32') {
       data = new Float32Array(new Uint32Array(getPlanes(bytes, o, e.n, 4)).buffer);
@@ -339,7 +344,7 @@ export function decodeArrays(bytes) {
       const L = LEVELS[e.enc];
       if (!Number.isFinite(e.min) || !Number.isFinite(e.max)) fail('A quantised array has no valid range.', 'damaged');
       const res = getPlanes(bytes, o, e.n, WIDTH[e.enc]);
-      const codes = predictDecode(res, L, e.dims, e.enc === 'q16' ? Uint16Array : Uint8Array);
+      const codes = predictDecode(res, L, e.dims, e.enc === 'q16' ? Uint16Array : Uint8Array, stride);
       data = new Float32Array(e.n);
       const k = (e.max - e.min) / (L - 2);
       for (let i = 0; i < e.n; i++) data[i] = codes[i] === 0 ? NaN : e.min + (codes[i] - 1) * k;

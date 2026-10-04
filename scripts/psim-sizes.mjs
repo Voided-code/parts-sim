@@ -14,12 +14,13 @@ const bytesOf = (typed) => new Uint8Array(typed.buffer, typed.byteOffset, typed.
 
 async function geometryLadder() {
   console.log('\nGeometry (KiB). Binary STL of the same built part = 84 + 50 bytes per triangle.');
-  row(['part'.padEnd(10), 'verts'.padStart(8), 'tris'.padStart(8), 'STL'.padStart(9), 'JSON'.padStart(9), 'binary'.padStart(9), '+quantise'.padStart(9), '+predict'.padStart(9), '+shuffle'.padStart(9), '+deflate'.padStart(9), 'exact+defl'.padStart(10), 'quant %STL', 'exact %STL']);
+  row(['part'.padEnd(10), 'verts'.padStart(8), 'tris'.padStart(8), 'STL'.padStart(9), 'JSON'.padStart(9), 'binary'.padStart(9), '+quantise'.padStart(9), '+predict+Z'.padStart(10), 'binary+Z'.padStart(9), '+shuf+Z'.padStart(9), 'exact+Z'.padStart(9), 'quant %STL', 'exact %STL']);
   for (const s of SAMPLES) {
     const p = buildPart({ ...s.make(), name: s.name });
     const stl = 84 + 50 * p.nTri;
     const json = new TextEncoder().encode(JSON.stringify({ v: Array.from(p.vertices), t: Array.from(p.tris) })).length;
     const binary = 4 * p.vertices.length + 4 * p.tris.length;
+    const rawBin = new Uint8Array(binary); rawBin.set(bytesOf(p.vertices), 0); rawBin.set(bytesOf(p.tris), 4 * p.vertices.length);
     const quant = 2 * p.vertices.length + 4 * p.tris.length;
     // positions: 16-bit codes as they come, then delta coded (still interleaved), then byte planes (the format)
     const g = { vertices: p.vertices, tris: p.tris, faceOf: null, brepFaces: false, faceCount: p.faceCount, faceAngle: 20 };
@@ -27,7 +28,7 @@ async function geometryLadder() {
     const q = encodeGeometry(g, 'quantised').bytes;
     const e = encodeGeometry(g, 'exact').bytes;
     const [qz, ez] = [await z(q), await z(e)];
-    row([s.id.padEnd(10), String(p.nVert).padStart(8), String(p.nTri).padStart(8), kb(stl), kb(json), kb(binary), kb(quant), kb(predictOnly), kb(q.length), kb(qz), kb(ez), `${((100 * qz) / stl).toFixed(1)}%`.padStart(10), `${((100 * ez) / stl).toFixed(1)}%`.padStart(10)]);
+    row([s.id.padEnd(10), String(p.nVert).padStart(8), String(p.nTri).padStart(8), kb(stl), kb(json), kb(binary), kb(quant), kb(predictOnly), kb(await z(rawBin)), kb(qz), kb(ez), `${((100 * qz) / stl).toFixed(1)}%`.padStart(10), `${((100 * ez) / stl).toFixed(1)}%`.padStart(10)]);
   }
 }
 
@@ -77,7 +78,8 @@ async function fieldLadder(file) {
       const codes = new Uint16Array(n);
       for (let i = 0; i < n; i++) codes[i] = Number.isFinite(a.data[i]) ? (span > 0 ? 1 + Math.round(((a.data[i] - min) / span) * 65534) : 1) : 0;
       const qz = await z(bytesOf(codes));
-      const res = predictEncode(codes, 65536, a.dims);
+      const stride = /(^|\.)(u|shape)(\.|$)/.test(name) ? 3 : 1; // 3-vectors: predict from the same component of the previous vertex
+      const res = predictEncode(codes, 65536, a.dims, stride);
       const pz = await z(bytesOf(res));
       const planes = new Uint8Array(2 * n);
       putPlanes(planes, 0, res, 2);

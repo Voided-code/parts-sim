@@ -204,6 +204,7 @@ cannot hold infinity or not-a-number, so these are written as `{"$num":"inf"}`, 
     `c = 0` means "no value" (NaN or a solid cell). When `max = min`, every finite value is `c = 1`. The error is at most
     `(max - min) / (2 * (L - 2))`. The codes are then predicted and written as zig-zag residuals in byte planes.
 - `err`: written for `q16` and `q8`: the largest error of the array, `(max - min) / (2 * (L - 2))`. Readers may ignore it.
+- `stride`: optional, 2, 3 or 4, for `q16` and `q8` arrays without `dims` whose values come in groups (a displacement or a mode shape has three values per vertex: x y z). The prediction is then the value `stride` places back (the same component of the previous vertex) instead of the previous value, and `n` must be a multiple of `stride`. Without it (stride 1), the prediction is the previous value. On a displacement field this makes the array about half the size.
 - `dims`: present for 3-D grids (`nx * ny * nz = n`, x fastest). The prediction is the 3-D Lorenzo predictor
   `p = a[x-1] + a[y-1] + a[z-1] - a[x-1,y-1] - a[x-1,z-1] - a[y-1,z-1] + a[x-1,y-1,z-1]` (missing neighbours count as
   0). Without `dims` the prediction is the previous value. The residual `code - p` is taken modulo `L`, as a signed

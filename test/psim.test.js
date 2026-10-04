@@ -298,9 +298,22 @@ test('fuzz: random damage never produces anything but a PsimError, and never han
   assert.ok(accepted < 600);
 });
 
-test('a file written by format version 1 still reads (fixture)', async () => {
+test('arrays: a stride-3 field round trips within its bound and codes smaller than without', () => {
+  const n = 3 * 500;
+  const data = Float32Array.from({ length: n }, (_, i) => Math.cos(Math.floor(i / 3) / 40) * (1 + (i % 3)));
+  const plain = encodeArrays({}, [{ name: 'u', data, enc: 'q16' }]);
+  const strided = encodeArrays({}, [{ name: 'u', data, enc: 'q16', stride: 3 }]);
+  const back = decodeArrays(strided.bytes).arrays.get('u').data;
+  for (let i = 0; i < n; i++) assert.ok(Math.abs(back[i] - data[i]) <= strided.bounds[0].absolute * 1.0001 + 1e-9);
+  assert.deepEqual(Array.from(back), Array.from(decodeArrays(plain.bytes).arrays.get('u').data), 'same values, only the prediction differs');
+  assert.throws(() => encodeArrays({}, [{ name: 'x', data: new Float32Array(10), enc: 'q16', stride: 3 }]), PsimError);
+  assert.throws(() => encodeArrays({}, [{ name: 'x', data: new Float32Array(12), enc: 'f32', stride: 3 }]), PsimError);
+});
+
+for (const name of ['v1-tube.psim', 'v1-tube-stride.psim']) {
+test(`a file written by format version 1 still reads (fixture ${name})`, async () => {
   const { readFile } = await import('node:fs/promises');
-  const bytes = new Uint8Array(await readFile(new URL('./fixtures/psim/v1-tube.psim', import.meta.url)));
+  const bytes = new Uint8Array(await readFile(new URL(`./fixtures/psim/${name}`, import.meta.url)));
   const f = await readPsim(bytes);
   assert.equal(f.version, 1);
   assert.equal(f.info.name, 'Tube');
@@ -308,3 +321,4 @@ test('a file written by format version 1 still reads (fixture)', async () => {
   assert.equal(f.rfea.arrays.get('static.vm').data.length, 40 * 24);
   assert.equal(readTable(bytes).table.length, 7);
 });
+}

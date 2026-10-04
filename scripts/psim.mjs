@@ -181,8 +181,8 @@ async function main() {
     const dir = resolve(root, 'test/fixtures/psim');
     mkdirSync(dir, { recursive: true });
     const bytes = await writePsim(sampleContent(), { created: CREATED });
-    writeFileSync(resolve(dir, 'v1-tube.psim'), bytes);
-    console.log(`test/fixtures/psim/v1-tube.psim: ${bytes.length} bytes`);
+    writeFileSync(resolve(dir, 'v1-tube-stride.psim'), bytes);
+    console.log(`test/fixtures/psim/v1-tube-stride.psim: ${bytes.length} bytes`);
   } else {
     console.log('usage: node scripts/psim.mjs inspect|verify|dump|to-stl|forces|fixtures <file> [out]');
     process.exit(command ? 2 : 0);
