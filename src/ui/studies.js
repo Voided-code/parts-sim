@@ -89,6 +89,39 @@ function range(values) {
   return { lo, hi, arg };
 }
 
+// ---- saving and loading results (.psim) ----
+
+const plain = (x) => (x === undefined ? undefined : structuredClone(x));
+const isObj = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+
+/** Copies the keys of `target` that `src` holds with the same type (and pass `rules[key]`, a list or a test). */
+function adopt(target, src, keys, rules = {}) {
+  if (!isObj(src)) return;
+  for (const k of keys) {
+    const v = src[k];
+    if (typeof v !== typeof target[k]) continue;
+    if (typeof v === 'number' && !Number.isFinite(v)) continue;
+    const rule = rules[k];
+    if (Array.isArray(rule) ? !rule.includes(v) : rule && !rule(v)) continue;
+    target[k] = v;
+  }
+}
+
+/** One stored array of a result, checked against the length this part needs. */
+function arr(arrays, name, n) {
+  const a = arrays?.get(name);
+  if (!a || !a.data) throw new Error(`The file's study result has no "${name}".`);
+  if (a.data.length !== n) throw new Error(`The file's study result does not fit this part: "${name}" has ${a.data.length} values, expected ${n}.`);
+  return a.data;
+}
+
+function checkMeta(meta, nVert, id) {
+  if (!isObj(meta)) throw new Error(`The file's ${id} result is damaged (no header).`);
+  if (meta.nVert !== nVert) throw new Error(`The file's ${id} result is for a part with ${meta.nVert} vertices, this part has ${nVert}.`);
+}
+
+const finiteList = (l) => Array.isArray(l) && l.every((x) => typeof x === 'number');
+
 const freqText = (f) => (f >= 1000 ? `${num(f / 1000)} kHz` : `${num(f)} Hz`);
 const timeText = (t) => (t >= 1 ? `${num(t)} s` : t >= 1e-3 ? `${num(t * 1e3)} ms` : `${num(t * 1e6)} µs`);
 const SUP = '⁰¹²³⁴⁵⁶⁷⁸⁹';
@@ -117,6 +150,36 @@ class Study {
 
   options() { return null; }
   clear() { this.result = null; }
+
+  // ---- .psim: view keys that are plain data (not the animation state) and checks for them
+  viewKeys = [];
+  optRules = {};
+  viewRules = {};
+
+  exportOptions() {
+    const view = {};
+    for (const k of this.viewKeys) view[k] = this.view[k];
+    return { opts: plain(this.opts) ?? {}, view };
+  }
+
+  importOptions(o) {
+    if (!isObj(o)) return;
+    adopt(this.opts, o.opts, Object.keys(this.opts ?? {}), this.optRules);
+    adopt(this.view, o.view, this.viewKeys, this.viewRules);
+    this.fitView();
+  }
+
+  /** Keeps the view settings inside the result after they were loaded. */
+  fitView() {}
+
+  /** The result as { meta, arrays } for a .psim file, or null when there is none to store. */
+  exportResult() { return null; }
+
+  /** Sets the result from decoded data without solving or drawing; the caller then calls show(). */
+  importResult() {}
+
+  /** One short line about the result for the file info panel. */
+  fileNote() { return ''; }
 
   async prepareRun(opts = {}) {
     const p = this.panel;
@@ -279,6 +342,57 @@ class NonlinearStudy extends Study {
     this.app.status(`${why} (${r.steps.length} steps ${this.engineNote(res)}).`, res.reason === 'reached' ? '' : 'warn');
   }
 
+  viewKeys = ['plot', 'step', 'exaggerate', 'unloaded'];
+  optRules = { mode: ['applied', 'failure'], steps: (v) => v >= 2 && v <= 60 };
+  viewRules = { plot: ['vm', 'disp', 'pe'], exaggerate: (v) => v >= 1 && v <= 50 };
+
+  fitView() {
+    const r = this.result, v = this.view;
+    v.playing = false;
+    if (!r) return;
+    v.step = Math.max(-1, Math.min(r.steps.length - 1, Math.round(v.step)));
+    if (v.unloaded && !r.unloaded) v.unloaded = false;
+  }
+
+  exportResult() {
+    const r = this.result;
+    if (!r?.done || !r.reason || !r.steps.length) return null;
+    const nV = this.part.nVert, arrays = [];
+    const one = (s, id) => {
+      arrays.push({ name: `nonlinear.${id}.u`, data: s.u, enc: 'q16' }, { name: `nonlinear.${id}.vm`, data: s.vm, enc: 'q16' }, { name: `nonlinear.${id}.pe`, data: s.pe, enc: 'q16' });
+      return { lam: s.lam, D: s.D, maxVM: s.maxVM, maxPE: s.maxPE, maxDisp: s.maxDisp, iterations: s.iterations };
+    };
+    const steps = r.steps.map((s, i) => one(s, `step.${i}`));
+    const unloaded = r.unloaded ? one(r.unloaded, 'unloaded') : null;
+    const meta = {
+      nVert: nV, units: r.units, material: plain(r.material), totalF: r.totalF, reason: r.reason, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null,
+      plastic: !!r.plastic, opts: plain(r.opts), steps, unloaded,
+    };
+    return { meta, arrays };
+  }
+
+  importResult(meta, arrays) {
+    const nV = this.part.nVert;
+    checkMeta(meta, nV, 'nonlinear');
+    if (!Array.isArray(meta.steps) || !meta.steps.length || !isObj(meta.material)) throw new Error('The file\'s nonlinear result is damaged (no steps).');
+    const read = (m, id, kind) => ({ ...m, kind, u: arr(arrays, `nonlinear.${id}.u`, 3 * nV), vm: arr(arrays, `nonlinear.${id}.vm`, nV), pe: arr(arrays, `nonlinear.${id}.pe`, nV) });
+    const steps = meta.steps.map((m, i) => read(m, `step.${i}`, 'step'));
+    const unloaded = isObj(meta.unloaded) ? read(meta.unloaded, 'unloaded', 'unloaded') : null;
+    this.result = {
+      steps, unloaded, material: meta.material, totalF: meta.totalF, units: meta.units, done: true, opts: { ...this.opts, ...(isObj(meta.opts) ? meta.opts : {}) },
+      reason: meta.reason, engine: meta.engine ?? undefined, gpuNote: meta.gpuNote ?? undefined, plastic: !!meta.plastic,
+    };
+    this.stale = false;
+    this.view.step = steps.length - 1;
+    this.view.unloaded = false;
+    this.view.playing = false;
+  }
+
+  fileNote(r = this.result) {
+    const last = r?.steps?.[r.steps.length - 1];
+    return last ? `${r.steps.length} load steps to ×${num(last.lam)}, ${r.reason}` : '';
+  }
+
   current() {
     const r = this.result;
     if (!r || !r.steps.length) return null;
@@ -410,6 +524,46 @@ class ModalStudy extends Study {
     this.app.status(`${res.modes.length} natural frequencies ${this.engineNote(res)}${res.free ? ' (free-floating: rigid-body modes skipped)' : ''}: ${f.join(', ')}.${res.converged ? '' : ' Some modes did not fully converge.'}`, res.converged ? '' : 'warn');
   }
 
+  viewKeys = ['mode', 'amp', 'animate'];
+  optRules = { nev: (v) => v >= 1 && v <= 20 };
+  viewRules = { amp: (v) => v >= 0.01 && v <= 0.3 };
+
+  fitView() {
+    const n = this.result?.modes.length;
+    if (n) this.view.mode = Math.max(0, Math.min(n - 1, Math.round(this.view.mode)));
+  }
+
+  exportResult() {
+    const r = this.result;
+    if (!r?.modes?.length) return null;
+    const meta = {
+      nVert: this.part.nVert, units: r.units, material: plain(r.material), diag: r.diag, free: !!r.free, converged: !!r.converged, iterations: r.iterations ?? null,
+      totalMass: r.totalMass ?? null, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null, modes: r.modes.map((m) => ({ freq: m.freq, eff: Array.from(m.eff) })),
+    };
+    return { meta, arrays: r.modes.map((m, i) => ({ name: `modal.shape.${i}`, data: m.shape, enc: 'q16' })) };
+  }
+
+  importResult(meta, arrays) {
+    const nV = this.part.nVert;
+    checkMeta(meta, nV, 'frequency');
+    if (!Array.isArray(meta.modes) || !meta.modes.length || !isObj(meta.material) || !(meta.diag > 0)) throw new Error('The file\'s frequency result is damaged (no modes).');
+    const modes = meta.modes.map((m, i) => {
+      if (!finiteList(m.eff) || m.eff.length !== 3 || typeof m.freq !== 'number') throw new Error('The file\'s frequency result is damaged (bad mode).');
+      return { freq: m.freq, eff: m.eff, shape: arr(arrays, `modal.shape.${i}`, 3 * nV) };
+    });
+    this.result = {
+      modes, free: !!meta.free, converged: !!meta.converged, iterations: meta.iterations ?? undefined, totalMass: meta.totalMass ?? undefined,
+      engine: meta.engine ?? undefined, gpuNote: meta.gpuNote ?? undefined, units: meta.units, material: meta.material, diag: meta.diag,
+    };
+    this.stale = false;
+    this.view.mode = 0;
+  }
+
+  fileNote(r = this.result) {
+    const m = r?.modes;
+    return m?.length ? `${m.length} modes, ${freqText(m[0].freq)} to ${freqText(m[m.length - 1].freq)}` : '';
+  }
+
   show() {
     const r = this.result;
     if (!r || this.app.tab !== 'structural' || this.panel.study !== this.id) return;
@@ -491,6 +645,43 @@ class BucklingStudy extends Study {
     this.app.status(Number.isFinite(bl)
       ? `Lowest buckling load factor ${num(bl)} ${this.engineNote(res)}: it buckles at about ${force(bl * this.result.totalF)}.`
       : `No buckling below ${this.beyond()} ${this.engineNote(res)}.`, Number.isFinite(bl) && bl < 1 ? 'error' : '');
+  }
+
+  viewKeys = ['mode', 'amp', 'animate'];
+  optRules = { nev: (v) => v >= 1 && v <= 8 };
+  viewRules = { amp: (v) => v >= 0.01 && v <= 0.3 };
+
+  fitView() {
+    const n = this.result?.modes.length;
+    if (n) this.view.mode = Math.max(0, Math.min(n - 1, Math.round(this.view.mode)));
+  }
+
+  exportResult() {
+    const r = this.result;
+    if (!r?.modes?.length) return null;
+    const meta = {
+      nVert: this.part.nVert, units: r.units, material: plain(r.material), diag: r.diag, totalF: r.totalF, maxVM: r.maxVM, maxFactor: r.maxFactor ?? null,
+      converged: !!r.converged, iterations: r.iterations ?? null, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null, factors: r.modes.map((m) => m.factor),
+    };
+    return { meta, arrays: r.modes.map((m, i) => ({ name: `buckling.shape.${i}`, data: m.shape, enc: 'q16' })) };
+  }
+
+  importResult(meta, arrays) {
+    const nV = this.part.nVert;
+    checkMeta(meta, nV, 'buckling');
+    if (!finiteList(meta.factors) || !meta.factors.length || !isObj(meta.material) || !(meta.diag > 0)) throw new Error('The file\'s buckling result is damaged (no modes).');
+    this.result = {
+      modes: meta.factors.map((factor, i) => ({ factor, shape: arr(arrays, `buckling.shape.${i}`, 3 * nV) })),
+      maxFactor: meta.maxFactor ?? undefined, converged: !!meta.converged, iterations: meta.iterations ?? undefined, engine: meta.engine ?? undefined, gpuNote: meta.gpuNote ?? undefined,
+      units: meta.units, material: meta.material, totalF: meta.totalF, diag: meta.diag, maxVM: meta.maxVM,
+    };
+    this.stale = false;
+    this.view.mode = 0;
+  }
+
+  fileNote(r = this.result) {
+    const f = r?.modes?.[0]?.factor;
+    return r?.modes?.length ? (Number.isFinite(f) ? `${r.modes.length} modes, lowest load factor ${num(f)}` : 'no buckling') : '';
   }
 
   // "no buckling" means none below the searched range (it yields long before)
@@ -604,9 +795,46 @@ class FatigueStudy extends Study {
   recompute() {
     const r = this.result;
     if (!r) return;
-    const m = r.mapped;
-    r.fat = fatigueField(m.vm, m.p1, m.p3, { material: r.material, finish: this.opts.finish, R: this.opts.R, cycles: this.opts.cycles, scale: this.opts.scale });
+    this.computeFat();
     this.show();
+  }
+
+  computeFat() {
+    const r = this.result, m = r.mapped;
+    r.fat = fatigueField(m.vm, m.p1, m.p3, { material: r.material, finish: this.opts.finish, R: this.opts.R, cycles: this.opts.cycles, scale: this.opts.scale });
+  }
+
+  viewKeys = ['plot'];
+  optRules = { loading: ['zero', 'reversed', 'custom'], finish: FINISHES.map((f) => f[0]), cycles: (v) => v >= 1, scale: (v) => v >= 0, R: (v) => v >= -5 && v <= 0.99 };
+  viewRules = { plot: ['life', 'damage', 'fos'] };
+
+  // the damage, life and safety factor follow from the stresses and the options, so they are not stored
+  importOptions(o) {
+    super.importOptions(o);
+    if (this.result) this.computeFat();
+  }
+
+  exportResult() {
+    const r = this.result;
+    if (!r?.mapped) return null;
+    const m = r.mapped;
+    const meta = { nVert: this.part.nVert, units: r.units, material: plain(r.material), totalF: r.totalF, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null };
+    return { meta, arrays: [{ name: 'fatigue.vm', data: m.vm, enc: 'q16' }, { name: 'fatigue.p1', data: m.p1, enc: 'q16' }, { name: 'fatigue.p3', data: m.p3, enc: 'q16' }] };
+  }
+
+  importResult(meta, arrays) {
+    const nV = this.part.nVert;
+    checkMeta(meta, nV, 'fatigue');
+    if (!isObj(meta.material)) throw new Error('The file\'s fatigue result is damaged (no material).');
+    const mapped = { vm: arr(arrays, 'fatigue.vm', nV), p1: arr(arrays, 'fatigue.p1', nV), p3: arr(arrays, 'fatigue.p3', nV) };
+    this.result = { mapped, material: meta.material, units: meta.units, totalF: meta.totalF, engine: meta.engine ?? undefined, gpuNote: meta.gpuNote ?? undefined };
+    this.stale = false;
+    this.computeFat();
+  }
+
+  fileNote(r = this.result) {
+    const f = r?.fat;
+    return f ? `shortest life ${cyclesText(f.minLife)} cycles, safety factor ${num(f.minFos)}` : '';
   }
 
   show() {
@@ -711,6 +939,62 @@ class DropStudy extends Study {
     const mat = r.material;
     const verdict = hi >= mat.uts * 1e6 ? 'it breaks' : hi >= mat.yield * 1e6 ? (mat.brittle ? 'it cracks' : 'it bends permanently') : 'it survives';
     this.app.status(`Drop from ${num(this.opts.height)} m ${this.engineNote(res)}: peak stress ${stress(hi)} - ${verdict}. ${r.steps} time steps of ${timeText(r.dt)}.`, hi >= mat.yield * 1e6 ? 'error' : '');
+  }
+
+  viewKeys = ['plot', 'frame', 'exaggerate'];
+  optRules = { height: (v) => v >= 0.001 };
+  viewRules = { plot: ['peak', 'frame'], exaggerate: (v) => v >= 0 };
+
+  fitView() {
+    const r = this.result, v = this.view;
+    v.playing = false;
+    if (r?.done) v.frame = Math.max(0, Math.min(r.frames.length - 1, Math.round(v.frame)));
+  }
+
+  exportResult() {
+    const r = this.result;
+    if (!r?.done || !r.frames.length) return null;
+    const arrays = [
+      { name: 'drop.vmMax', data: r.vmMax, enc: 'q16' },
+      { name: 'drop.times', data: r.times, enc: 'f32' },
+      { name: 'drop.forces', data: r.forces, enc: 'f32' },
+    ];
+    r.frames.forEach((fr, i) => arrays.push({ name: `drop.frame.${i}.u`, data: fr.u, enc: 'q16' }, { name: `drop.frame.${i}.vm`, data: fr.vm, enc: 'q16' }));
+    const peakFrame = r.frames.findIndex((fr) => fr.t >= r.tPeak[r.peakAt]);
+    const meta = {
+      nVert: this.part.nVert, units: r.units, material: plain(r.material), height: this.opts.height, speed: r.speed, mass: r.mass,
+      peak: r.peak, peakAt: r.peakAt, peakForce: r.peakForce, contactTime: r.contactTime, duration: r.duration, steps: r.steps, dt: r.dt,
+      rebounded: !!r.rebounded, autoScale: r.autoScale, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null,
+      nTimes: r.times.length, peakFrame: peakFrame < 0 ? r.frames.length - 1 : peakFrame,
+      frameTimes: r.frames.map((fr) => fr.t), frameForces: r.frames.map((fr) => fr.force),
+    };
+    return { meta, arrays };
+  }
+
+  importResult(meta, arrays) {
+    const nV = this.part.nVert;
+    checkMeta(meta, nV, 'drop test');
+    if (!finiteList(meta.frameTimes) || !meta.frameTimes.length || !isObj(meta.material)) throw new Error('The file\'s drop test result is damaged (no frames).');
+    const times = arr(arrays, 'drop.times', meta.nTimes), forces = arr(arrays, 'drop.forces', times.length);
+    const frames = meta.frameTimes.map((t, i) => ({ t, force: meta.frameForces?.[i] ?? 0, u: arr(arrays, `drop.frame.${i}.u`, 3 * nV), vm: arr(arrays, `drop.frame.${i}.vm`, nV) }));
+    const vmMax = arr(arrays, 'drop.vmMax', nV);
+    const r = {
+      frames, material: meta.material, units: meta.units, done: true, vmMax, times, forces, speed: meta.speed, mass: meta.mass,
+      peakForce: meta.peakForce, contactTime: meta.contactTime, duration: meta.duration, steps: meta.steps, dt: meta.dt, rebounded: !!meta.rebounded,
+      engine: meta.engine ?? undefined, gpuNote: meta.gpuNote ?? undefined, peak: meta.peak, peakAt: meta.peakAt, autoScale: meta.autoScale,
+    };
+    this.result = r;
+    this.opts.height = meta.height > 0 ? meta.height : this.opts.height;
+    this.stale = false;
+    // the view a run ends on: the frame at the peak, the shape scaled to be visible
+    this.view.frame = Number.isInteger(meta.peakFrame) ? Math.max(0, Math.min(frames.length - 1, meta.peakFrame)) : frames.length - 1;
+    this.view.exaggerate = r.autoScale;
+    this.view.plot = 'peak';
+    this.view.playing = false;
+  }
+
+  fileNote(r = this.result) {
+    return r?.done ? `peak stress ${stress(r.peak)}, ${r.frames.length} frames` : '';
   }
 
   show() {
@@ -850,6 +1134,11 @@ class DynamicStudy extends Study {
     this.recompute();
     this.app.status(`Linear dynamic ${this.engineNote(res)} with ${res.basis.omegas.length} modes (${res.modes.map((m) => freqText(m.freq)).slice(0, 4).join(', ')}${res.modes.length > 4 ? ', …' : ''}).`);
   }
+
+  // not stored in version 1 (the modal basis is large): exportResult() is null, Re-run solves again
+  viewKeys = ['plot', 'animate'];
+  optRules = { source: ['loads', 'base'], type: ['harmonic', 'shock', 'sine', 'quake'], dir: [0, 1, 2], nev: (v) => v >= 1 && v <= 20 };
+  viewRules = { plot: ['vm', 'disp', 'envelope', 'now'] };
 
   scale() {
     // pattern is per unit load (loads) or per 1 m/s^2 of base acceleration
@@ -1073,6 +1362,67 @@ class OptimizeStudy extends Study {
     this.app.viewer.setShape?.(null);
   }
 
+  viewKeys = ['level'];
+  optRules = {
+    goal: ['topology', 'sizing'], objective: ['mass', 'cost'], family: ['all', 'metals', 'plastics'],
+    keep: (v) => v >= 5 && v <= 95, iters: (v) => v >= 5 && v <= 100, fos: (v) => v >= 0.1, maxDisp: (v) => v >= 0,
+  };
+  viewRules = { level: (v) => v >= 0.2 && v <= 0.8 };
+
+  importOptions(o) {
+    const level = this.view.level;
+    super.importOptions(o);
+    if (this.result?.goal === 'topology' && this.result.done && this.view.level !== level) this.buildShape();
+  }
+
+  exportResult() {
+    const r = this.result;
+    if (!r) return null;
+    if (r.goal === 'sizing') {
+      if (!r.rows) return null;
+      return { meta: { goal: 'sizing', units: r.units, material: plain(r.material), engine: r.engine ?? null, gpuNote: r.gpuNote ?? null, base: plain(r.base), rows: plain(r.rows) }, arrays: [] };
+    }
+    if (!r.done || !r.density) return null;
+    const m = r.model;
+    const meta = {
+      goal: 'topology', units: r.units, material: plain(r.material), toMeters: r.toMeters, resolution: m.resolution, dims: Array.from(m.dims),
+      history: plain(r.history), keptFraction: r.keptFraction ?? null, engine: r.engine ?? null,
+    };
+    return { meta, arrays: [{ name: 'optimize.density', data: r.density, enc: 'q8', dims: Array.from(m.dims) }] };
+  }
+
+  importResult(meta, arrays) {
+    if (!isObj(meta) || !isObj(meta.material)) throw new Error('The file\'s optimization result is damaged (no material).');
+    if (meta.goal === 'sizing') {
+      if (!Array.isArray(meta.rows) || !isObj(meta.base)) throw new Error('The file\'s optimization result is damaged (no table).');
+      this.result = { goal: 'sizing', rows: meta.rows, base: meta.base, units: meta.units, material: meta.material, engine: meta.engine ?? undefined, gpuNote: meta.gpuNote ?? undefined };
+      this.opts.goal = 'sizing';
+      this.stale = false;
+      return;
+    }
+    if (meta.goal !== 'topology') throw new Error('The file\'s optimization result has an unknown goal.');
+    if (!Number.isInteger(meta.resolution) || meta.resolution < 1 || !Array.isArray(meta.dims) || !Array.isArray(meta.history)) throw new Error('The file\'s topology result is damaged.');
+    const model = this.panel.modelFor(meta.resolution);
+    const [nx, ny, nz] = model.dims;
+    if (meta.dims.join() !== `${nx},${ny},${nz}`) throw new Error(`The file's topology result was made on a ${meta.dims.join('x')} voxel grid; this part gives ${nx}x${ny}x${nz}.`);
+    const density = arr(arrays, 'optimize.density', nx * ny * nz);
+    this.result = {
+      goal: 'topology', model, material: meta.material, units: meta.units, history: meta.history, density, toMeters: meta.toMeters,
+      keptFraction: meta.keptFraction ?? undefined, engine: meta.engine ?? undefined, done: true,
+    };
+    this.opts.goal = 'topology';
+    this.stale = false;
+    this.buildShape();
+    this.xrayPending = true;
+  }
+
+  fileNote(r = this.result) {
+    if (!r) return '';
+    if (r.goal === 'sizing') return `${r.rows.filter((x) => x.feasible).length} of ${r.rows.length} materials meet the safety factor`;
+    const h1 = r.history?.[r.history.length - 1];
+    return h1 ? `${r.history.length} iterations, ${num(h1.volume * 100)}% of the material kept` : '';
+  }
+
   leave() {
     if (this.autoXRay) { this.app.setXRay(false); this.autoXRay = false; }
   }
@@ -1174,6 +1524,10 @@ class OptimizeStudy extends Study {
     const r = this.result;
     if (!r || this.app.tab !== 'structural' || this.panel.study !== this.id) return;
     if (r.goal === 'sizing') return this.showSizing();
+    if (this.xrayPending) {
+      this.xrayPending = false;
+      if (!$('#chk-xray').checked) { this.app.setXRay(true); this.autoXRay = true; }
+    }
     const { kpis, body } = this.card('Topology optimization');
     const h0 = r.history[0], h1 = r.history[r.history.length - 1];
     const mat = r.material;
