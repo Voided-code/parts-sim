@@ -26,8 +26,16 @@ struct Value {
     const std::string& string() const { return str; }
 };
 
+/** Limits and strictness for files from strangers (the default is the lenient reader the settings files use). */
+struct ParseOptions {
+    bool strict = false;     // RFC 8259 only: no nan/inf/hex numbers, no control characters in strings, valid escapes
+    int maxDepth = 256;      // nesting limit (the parser recurses)
+    size_t maxNodes = 0;     // 0 = unlimited; otherwise at most this many values (a Value costs about 120 bytes)
+};
+
 /** Throws std::runtime_error on malformed input. */
 Value parse(const std::string& text);
+Value parse(const std::string& text, const ParseOptions& opts);
 /** Serialize (for settings files). */
 std::string stringify(const Value& v, int indent = 0);
 

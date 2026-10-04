@@ -80,6 +80,7 @@ add_library(partssim_core STATIC
   src/core/materials.cpp
   src/core/importers.cpp
   src/core/solidworks.cpp
+  src/core/psim.cpp
   src/core/cad_occt.cpp
   src/fea/hex8.cpp
   src/fea/voxel_fea.cpp
@@ -104,6 +105,10 @@ add_library(partssim_core STATIC
   ${CMAKE_CURRENT_BINARY_DIR}/wgsl_sources.cpp
 )
 target_include_directories(partssim_core PUBLIC src)
+if(NOT MSVC)
+  # the .psim decoders must give the very floats the JavaScript ones give: no fused multiply-add
+  set_source_files_properties(src/core/psim.cpp tools/psim_tool.cpp tests/test_psim.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 target_link_libraries(partssim_core PUBLIC Threads::Threads ZLIB::ZLIB)
 if(PARTS_SIM_GPU)
   target_compile_definitions(partssim_core PUBLIC PARTS_SIM_HAS_GPU)
@@ -135,6 +140,10 @@ ps_test(test_gpu)
 ps_test(test_studies)
 ps_test(test_lbm)
 ps_test(test_flow)
+ps_test(test_psim)
+# .psim command-line tool: verify, inspect, dump, make-fixture (tests/psim_cross.py compares it with scripts/psim.mjs)
+add_executable(psim_tool tools/psim_tool.cpp)
+target_link_libraries(psim_tool PRIVATE partssim_core)
 # performance benchmark (run by hand: build/bench [filter])
 add_executable(bench tests/bench.cpp)
 target_link_libraries(bench PRIVATE partssim_core)
