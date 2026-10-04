@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURE = ROOT / "test" / "fixtures" / "psim" / "v1-tube.psim"
+FIXTURE = ROOT / "test" / "fixtures" / "psim" / "v1-tube-stride.psim"
 failures = []
 
 

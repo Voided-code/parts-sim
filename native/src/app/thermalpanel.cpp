@@ -1,4 +1,5 @@
 #include "thermalpanel.hpp"
+#include "psimjson.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -370,6 +371,7 @@ void ThermalPanel::onPartScaled(double s, const Vec3& pivot) {
 }
 
 void ThermalPanel::markStale() {
+    app_->psimEdited();
     cancel();
     if (result_ && !result_->stale) {
         result_->stale = true;
@@ -645,6 +647,7 @@ void ThermalPanel::run() {
             app_->structural->rememberModel(o.model);
             for (const auto& w : o.warnings) app_->status(QString::fromStdString(w), "warn");
             result_ = std::move(o.r);
+            app_->psimRunDone("thermal", {{"min", result_->frames.back().min}, {"max", result_->frames.back().max}});
             display_ = "results";
             view_.frame = std::max(0, int(result_->frames.size()) - 1);
             view_.playing = false;
@@ -803,6 +806,174 @@ void ThermalPanel::tick(double dt) {
         return;
     }
     setFrame(view_.frame + 1);
+}
+
+
+// ---------- .psim files ----------
+
+json::Value ThermalPanel::exportState() const {
+    using namespace pj;
+    Value o = jobj();
+    o.obj["mode"] = jstr(transient_ ? "transient" : "steady");
+    Value its = jarr();
+    for (const auto& it : items) {
+        Value e = jobj();
+        e.obj["name"] = jstr(it.name.toStdString());
+        e.obj["type"] = jstr(it.type == Item::Temp ? "temp" : it.type == Item::Heat ? "heat" : "conv");
+        e.obj["value"] = jnum(it.value);
+        e.obj["ambient"] = jnum(it.ambient);
+        Value ps = jarr();
+        for (const auto& p : it.patches) ps.arr.push_back(patchToJson(p));
+        e.obj["patches"] = ps;
+        its.arr.push_back(e);
+    }
+    o.obj["items"] = its;
+    Value a = jobj();
+    a.obj["enabled"] = jbool(ambient_->isChecked());
+    a.obj["h"] = jnum(ambientH_->value());
+    a.obj["t"] = jnum(ambientT_->value());
+    o.obj["ambient"] = a;
+    o.obj["duration"] = jnum(duration_->value());
+    o.obj["steps"] = jnum(steps_->value());
+    o.obj["initial"] = jnum(initial_->value());
+    o.obj["resolution"] = jnum(res_->value());
+    return o;
+}
+
+void ThermalPanel::importState(const json::Value& s) {
+    using namespace pj;
+    const int nTri = app_->part->nTri;
+    std::vector<Item> list;
+    for (const auto& j : s["items"].arr) {
+        const std::string t = strOr(j["type"]);
+        if (t != "temp" && t != "heat" && t != "conv") throw std::runtime_error("The file has a thermal condition of an unknown type (" + t + ").");
+        Item it;
+        it.type = t == "temp" ? Item::Temp : t == "heat" ? Item::Heat : Item::Conv;
+        it.name = QString::fromStdString(strOr(j["name"], "Condition"));
+        it.value = numOr(j["value"], 0);
+        it.ambient = numOr(j["ambient"], 20);
+        for (const auto& p : j["patches"].arr) {
+            Patch q = patchFromJson(p, nTri);
+            if (!q.tris.empty()) it.patches.push_back(std::move(q));
+        }
+        list.push_back(std::move(it));
+    }
+    items = std::move(list);
+    selected_ = items.empty() ? -1 : 0;
+    setTransient(strOr(s["mode"]) == "transient");
+    const Value& a = s["ambient"];
+    ambient_->setChecked(boolOr(a["enabled"], true));
+    ambientProps_->setVisible(ambient_->isChecked());
+    if (isNum(a["h"])) ambientH_->setValue(a["h"].num);
+    if (isNum(a["t"])) ambientT_->setValue(a["t"].num);
+    if (isNum(s["duration"])) duration_->setValue(s["duration"].num);
+    if (isNum(s["steps"])) steps_->setValue(s["steps"].num);
+    if (isNum(s["initial"])) initial_->setValue(s["initial"].num);
+    if (isNum(s["resolution"])) res_->setValue(int(s["resolution"].num));
+    renderList();
+    renderEditor();
+    updateMeshInfo();
+}
+
+std::optional<psim::Arrays> ThermalPanel::exportResult() const {
+    using namespace pj;
+    if (!result_ || result_->frames.empty()) return std::nullopt;
+    const Result& r = *result_;
+    const Frame& last = r.frames.back();
+    psim::Arrays out;
+    Value m = jobj();
+    m.obj["min"] = jnum(last.min);
+    m.obj["max"] = jnum(last.max);
+    m.obj["transient"] = jbool(r.transient);
+    m.obj["converged"] = jbool(r.converged);
+    m.obj["heatIn"] = jnum(r.heatIn);
+    m.obj["voxels"] = jnum(r.voxels);
+    m.obj["material"] = materialToJson(r.material);
+    Value ft = jarr();
+    for (const auto& f : r.frames) {
+        Value e = jobj();
+        e.obj["t"] = jnum(f.t);
+        e.obj["min"] = jnum(f.min);
+        e.obj["max"] = jnum(f.max);
+        ft.arr.push_back(e);
+    }
+    m.obj["frameTimes"] = ft;
+    out.meta = m;
+    auto add = [&](const std::string& name, const std::vector<float>& d) {
+        psim::Array a;
+        a.name = name;
+        a.enc = psim::Enc::Q16;
+        a.f = d;
+        out.list.push_back(std::move(a));
+    };
+    add("thermal.T", last.T);
+    add("thermal.flux", r.flux);
+    for (size_t i = 0; i < r.frames.size(); i++) add("thermal.frame." + std::to_string(i), r.frames[i].T);
+    return out;
+}
+
+void ThermalPanel::importResult(const json::Value& m, const psim::Arrays& arrays) {
+    using namespace pj;
+    const size_t nV = size_t(app_->part->nVert);
+    auto get = [&](const std::string& name) -> const std::vector<float>& {
+        const psim::Array* a = arrays.find(name);
+        if (!a || a->f.size() != nV) throw std::runtime_error("The thermal result in the file does not fit this part.");
+        return a->f;
+    };
+    Result r;
+    r.flux = get("thermal.flux");
+    const auto& times = m["frameTimes"].arr;
+    for (size_t i = 0; i < times.size(); i++) {
+        Frame f;
+        f.t = numOr(times[i]["t"], 0);
+        f.min = numOr(times[i]["min"], 0);
+        f.max = numOr(times[i]["max"], 0);
+        f.T = get("thermal.frame." + std::to_string(i));
+        r.frames.push_back(std::move(f));
+    }
+    if (r.frames.empty()) {
+        Frame f;
+        f.t = 0;
+        f.min = numOr(m["min"], 0);
+        f.max = numOr(m["max"], 0);
+        f.T = get("thermal.T");
+        r.frames.push_back(std::move(f));
+    }
+    r.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app_->material;
+    r.transient = boolOr(m["transient"], false);
+    r.converged = boolOr(m["converged"], true);
+    r.heatIn = numOr(m["heatIn"], 0);
+    r.voxels = int(numOr(m["voxels"], 0));
+    result_ = std::move(r);
+    display_ = "results";
+    view_.frame = int(result_->frames.size()) - 1;
+    view_.playing = false;
+    resultsCard_->show();
+    timeBox_->setVisible(result_->transient);
+}
+
+json::Value ThermalPanel::exportView() const {
+    using namespace pj;
+    Value v = jobj();
+    v.obj["plot"] = jstr(view_.plot.toStdString());
+    v.obj["frame"] = jnum(view_.frame);
+    v.obj["bands"] = jbool(view_.bands);
+    v.obj["bcs"] = jbool(view_.bcs);
+    return v;
+}
+
+void ThermalPanel::importView(const json::Value& v) {
+    using namespace pj;
+    const QString plot = QString::fromStdString(strOr(v["plot"]));
+    if (plot == "T" || plot == "flux") { view_.plot = plot; plot_->setCurrentIndex(plot_->findData(plot)); }
+    if (result_ && isNum(v["frame"])) view_.frame = std::clamp(int(v["frame"].num), 0, int(result_->frames.size()) - 1);
+    auto setBox = [this](const QString& text, bool on) {
+        for (auto* b : findChildren<QCheckBox*>()) if (b->text() == text) b->setChecked(on);
+    };
+    view_.bands = boolOr(v["bands"], view_.bands);
+    view_.bcs = boolOr(v["bcs"], view_.bcs);
+    setBox(tr("Contour bands"), view_.bands);
+    setBox(tr("Show heat inputs"), view_.bcs);
 }
 
 }  // namespace ps

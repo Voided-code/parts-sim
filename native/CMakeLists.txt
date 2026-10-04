@@ -164,6 +164,7 @@ if(PARTS_SIM_APP)
     qt_add_executable(PartsSim WIN32 MACOSX_BUNDLE
       src/app/main.cpp
       src/app/mainwindow.cpp
+      src/app/mainwindow_psim.cpp
       src/app/viewport.cpp
       src/app/widgets.cpp
       src/app/jobs.cpp
@@ -274,6 +275,7 @@ if(PARTS_SIM_APP)
     else()
       # Linux: the AppImage (linuxdeploy, see .github/workflows/native.yml) bundles Qt and the rest
       install(FILES linux/parts-sim.desktop DESTINATION share/applications)
+      install(FILES linux/parts-sim-psim.xml DESTINATION share/mime/packages)
       install(FILES ../build/icon.svg DESTINATION share/icons/hicolor/scalable/apps RENAME parts-sim.svg)
     endif()
     set(CPACK_PACKAGE_NAME "Parts Sim")
@@ -304,6 +306,19 @@ if(PARTS_SIM_APP)
       set(CPACK_NSIS_MUI_UNIICON "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PartsSim.ico")
       set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\Parts Sim.exe")
       set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+      # .psim files open with Parts Sim (double click, Open with); removed again on uninstall
+      set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
+        WriteRegStr SHCTX 'Software\\Classes\\.psim' '' 'PartsSim.psim'
+        WriteRegStr SHCTX 'Software\\Classes\\.psim' 'Content Type' 'application/x-parts-sim'
+        WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim' '' 'Parts Sim file'
+        WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim\\DefaultIcon' '' '$INSTDIR\\bin\\Parts Sim.exe,0'
+        WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim\\shell\\open\\command' '' '\"$INSTDIR\\bin\\Parts Sim.exe\" \"%1\"'
+        System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
+      ")
+      set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "
+        DeleteRegKey SHCTX 'Software\\Classes\\.psim'
+        DeleteRegKey SHCTX 'Software\\Classes\\PartsSim.psim'
+      ")
     else()
       set(CPACK_GENERATOR "TGZ")
     endif()

@@ -3,6 +3,8 @@
 // on Linux.
 #pragma once
 
+#include <array>
+
 #include <QElapsedTimer>
 #include <QMatrix4x4>
 #include <QRhiWidget>
@@ -96,6 +98,9 @@ public:
     QString markerLabel() const { return marker_ ? marker_->label : QString(); }
 
     void setView(const QString& name);
+    /** Camera as {eye xyz, target xyz, up xyz} (saved in .psim files). */
+    std::array<float, 9> cameraState() const { return {eye_.x(), eye_.y(), eye_.z(), target_.x(), target_.y(), target_.z(), up_.x(), up_.y(), up_.z()}; }
+    void setCameraState(const std::array<float, 9>& c) { eye_ = {c[0], c[1], c[2]}; target_ = {c[3], c[4], c[5]}; up_ = {c[6], c[7], c[8]}; update(); }
     QPointF project(const QVector3D& p, bool* visible = nullptr) const;
     std::optional<PickHit> pickPart(const QPointF& pos);
     /** Point on the camera-facing plane through `pivot` under the pointer (dragging handles). */

@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 
+#include "core/psim.hpp"
 #include "fea/static_study.hpp"
 #include "fea/structural.hpp"
 #include "jobs.hpp"
@@ -59,6 +60,19 @@ public:
     void showVoxelPreview();
     void setVoxelPreview(bool on);
     bool hasSetup() const { return !fixtures.empty() || !loads.empty(); }
+
+    // ---- .psim files: setup and results as plain data (JS: structural-panel.js exportSetup / importSetup ...) ----
+    json::Value exportSetup() const;
+    /** Throws std::runtime_error with a message for the user. `arrays` holds the wind forces (load.<i>.forces). */
+    void importSetup(const json::Value& s, const psim::Arrays* arrays);
+    std::vector<psim::Array> windArrays() const;
+    std::optional<psim::Arrays> exportStatic() const;
+    void importStatic(const json::Value& meta, const psim::Arrays& arrays);
+    json::Value exportView() const;
+    void importView(const json::Value& v);
+    void restoreStudy(const QString& id);
+    void importMaterial(const json::Value& m);
+    bool hasStaticResult() const { return result_.has_value(); }
 
     void runStudy();
     void runBreak();

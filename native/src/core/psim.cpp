@@ -264,7 +264,7 @@ const KeyOrder& viewOrder() {
 const KeyOrder& arraysHeaderOrder() {
     static const KeyOrder o = {
         {"", {"meta", "arrays"}},
-        {"arrays", {"name", "enc", "n", "dims", "min", "max", "err", "bytes"}},
+        {"arrays", {"name", "enc", "n", "dims", "stride", "min", "max", "err", "bytes"}},
     };
     return o;
 }
@@ -411,7 +411,7 @@ inline int predictAt(const uint16_t* codes, size_t i, size_t x, size_t y, size_t
     return a + b + c - ab - ac - bc + abc;
 }
 
-std::vector<uint32_t> predictEncode(const std::vector<uint16_t>& codes, int L, const std::vector<uint32_t>& dims) {
+std::vector<uint32_t> predictEncode(const std::vector<uint16_t>& codes, int L, const std::vector<uint32_t>& dims, size_t stride) {
     const size_t n = codes.size();
     std::vector<uint32_t> res(n);
     const int half = L >> 1;
@@ -422,8 +422,7 @@ std::vector<uint32_t> predictEncode(const std::vector<uint16_t>& codes, int L, c
         res[i] = uint32_t(r >= 0 ? 2 * r : -2 * r - 1);
     };
     if (dims.empty()) {
-        int prev = 0;
-        for (size_t i = 0; i < n; i++) { put(i, prev); prev = codes[i]; }
+        for (size_t i = 0; i < n; i++) put(i, i >= stride ? codes[i - stride] : 0);
         return res;
     }
     const size_t nx = dims[0], ny = dims[1], nz = dims[2], sy = nx, sz = nx * ny;
@@ -436,7 +435,7 @@ std::vector<uint32_t> predictEncode(const std::vector<uint16_t>& codes, int L, c
     return res;
 }
 
-std::vector<uint16_t> predictDecode(const std::vector<uint32_t>& res, int L, const std::vector<uint32_t>& dims) {
+std::vector<uint16_t> predictDecode(const std::vector<uint32_t>& res, int L, const std::vector<uint32_t>& dims, size_t stride) {
     const size_t n = res.size();
     std::vector<uint16_t> codes(n);
     auto get = [&](size_t i, int p) {
@@ -447,8 +446,7 @@ std::vector<uint16_t> predictDecode(const std::vector<uint32_t>& res, int L, con
         codes[i] = uint16_t(c);
     };
     if (dims.empty()) {
-        int prev = 0;
-        for (size_t i = 0; i < n; i++) { get(i, prev); prev = codes[i]; }
+        for (size_t i = 0; i < n; i++) get(i, i >= stride ? codes[i - stride] : 0);
         return codes;
     }
     const size_t nx = dims[0], ny = dims[1], nz = dims[2], sy = nx, sz = nx * ny;
@@ -494,6 +492,10 @@ Bytes encodeArrays(const json::Value& meta, const std::vector<Array>& arrays, st
             for (uint32_t x : a.dims) d.arr.push_back(num(x));
             entry.obj["dims"] = d;
         }
+        if (a.stride != 1) {
+            if (!(a.enc == Enc::Q16 || a.enc == Enc::Q8) || !a.dims.empty() || a.stride < 2 || a.stride > 4 || n % a.stride) fail("An array has a stride its encoding cannot use.", "invalid");
+            entry.obj["stride"] = num(a.stride);
+        }
         Bytes blob(size_t(widthOf(a.enc)) * n);
         if (a.enc == Enc::F32) {
             std::vector<uint32_t> bits(n);
@@ -519,7 +521,7 @@ Bytes encodeArrays(const json::Value& meta, const std::vector<Array>& arrays, st
                 const double v = a.f[i];
                 codes[i] = std::isfinite(v) ? uint16_t(span > 0 ? 1 + std::round(((v - mn) / span) * (L - 2)) : 1) : uint16_t(0);
             }
-            const std::vector<uint32_t> res = predictEncode(codes, L, a.dims);
+            const std::vector<uint32_t> res = predictEncode(codes, L, a.dims, a.stride);
             putPlanes(blob.data(), res.data(), n, widthOf(a.enc));
             const double err = span / (2.0 * (L - 2));
             entry.obj["min"] = num(mn);
@@ -579,6 +581,11 @@ Arrays decodeArrays(const uint8_t* bytes, size_t length) {
             if (!ok || prod != nd) fail("An array has grid dimensions that do not match its length.", "invalid");
             for (const auto& d : dv.arr) a.dims.push_back(uint32_t(d.num));
         }
+        const json::Value& sv = e["stride"];
+        double strideD = 1;
+        if (sv.type != json::Value::Null) strideD = sv.type == json::Value::Number ? sv.num : std::nan("");
+        if (!(std::floor(strideD) == strideD) || strideD < 1 || strideD > 4 || (strideD > 1 && (truthy(dv) || std::fmod(nd, strideD) != 0))) fail("An array entry has an invalid stride.", "damaged");
+        a.stride = uint32_t(strideD);
         const uint8_t* src = bytes + o;
         if (enc == Enc::F32) {
             const auto bits = getPlanes(src, n, 4);
@@ -597,7 +604,7 @@ Arrays decodeArrays(const uint8_t* bytes, size_t length) {
             }
             const double mn = e["min"].num, mx = e["max"].num;
             const auto res = getPlanes(src, n, widthOf(enc));
-            const auto codes = predictDecode(res, L, a.dims);
+            const auto codes = predictDecode(res, L, a.dims, a.stride);
             a.f.resize(n);
             const double k = (mx - mn) / (L - 2);
             for (size_t i = 0; i < n; i++) a.f[i] = codes[i] == 0 ? std::numeric_limits<float>::quiet_NaN() : float(mn + (codes[i] - 1) * k);

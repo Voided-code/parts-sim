@@ -46,6 +46,7 @@ inline File sampleContent(bool brep) {
     for (size_t i = 0; i < nV; i++) vm.f.push_back(float(1e6 + 5e5 * std::sin(double(i) / 7)));
     u.name = "static.u";
     u.enc = Enc::Q16;
+    u.stride = 3;
     for (size_t i = 0; i < 3 * nV; i++) u.f.push_back(float(0.01 * std::cos(double(i) / 11)));
     Arrays rfea;
     rfea.meta = jobj();
