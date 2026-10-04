@@ -474,6 +474,31 @@ std::shared_ptr<Part> buildPart(const MeshSource& src, const BuildOptions& opts)
     return p;
 }
 
+std::shared_ptr<Part> restorePart(const std::string& name, std::vector<float> vertices, std::vector<uint32_t> tris,
+                                  std::vector<int32_t> faceOf, bool brepFaces, int faceCount, double faceAngle) {
+    auto p = std::make_shared<Part>();
+    p->name = name.empty() ? "Part" : name;
+    p->vertices = std::move(vertices);
+    p->tris = std::move(tris);
+    p->nVert = int(p->vertices.size() / 3);
+    p->nTri = int(p->tris.size() / 3);
+    p->bbox = boundingBox(p->vertices);
+    p->brepFaces = brepFaces && faceOf.size() == size_t(p->nTri);
+    computeTriangleData(*p);
+    p->neighbors = triangleNeighbors(p->tris);
+    p->vertNormal = smoothNormals(*p);
+    if (p->brepFaces) {
+        p->faceOf = std::move(faceOf);
+        p->faceCount = faceCount;
+    } else {
+        setSmoothFaces(*p, faceAngle > 0 ? faceAngle : 20);
+    }
+    p->volume = std::abs(signedVolume(p->vertices, p->tris));
+    p->edges = featureEdges(*p, 30);
+    creasedDisplay(*p, 35);
+    return p;
+}
+
 void setSmoothFaces(Part& p, double angleDeg) {
     const double cosT = std::cos(angleDeg * M_PI / 180);
     p.faceOf.assign(p.nTri, -1);

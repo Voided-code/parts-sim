@@ -8,6 +8,7 @@
 #include <string>
 
 #include "check.hpp"
+#include "core/mesh.hpp"
 #include "core/psim.hpp"
 #include "../tools/psim_sample.hpp"
 
@@ -724,6 +725,34 @@ TEST("the stride fixture written by JavaScript reads (and the old one without st
     CHECK(bound > 0);
     for (size_t i = 0; i < u->f.size(); i++) CHECK_NEAR(u->f[i], mine.rfea->list[1].f[i], bound * 1.0001 + 1e-9);
     CHECK(readPsim(loadFixture("v1-tube.psim")).rfea->find("static.u")->stride == 1);
+}
+
+TEST("restorePart rebuilds a built part exactly, without refining") {
+    MeshSource m;
+    const double x = 20, y = 5, z = 3;
+    const double v[8][3] = {{-x, -y, -z}, {x, -y, -z}, {x, y, -z}, {-x, y, -z}, {-x, -y, z}, {x, -y, z}, {x, y, z}, {-x, y, z}};
+    for (auto& q : v) for (double d : q) m.positions.push_back(float(d));
+    m.index = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5, 0, 4, 7, 0, 7, 3};
+    for (bool brep : {false, true}) {
+        MeshSource s = m;
+        if (brep) s.faceIds = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5};
+        const auto a = buildPart(s, BuildOptions{3000, 20});
+        CHECK(a->nTri > 200);  // refined
+        const auto b = restorePart(a->name, a->vertices, a->tris, a->brepFaces ? a->faceOf : std::vector<int32_t>{}, a->brepFaces, a->faceCount, a->faceAngle);
+        CHECK(b->nTri == a->nTri && b->nVert == a->nVert);
+        CHECK(b->brepFaces == a->brepFaces);
+        CHECK(b->neighbors == a->neighbors);
+        CHECK(b->faceOf == a->faceOf);
+        CHECK(b->faceCount == a->faceCount);
+        CHECK(b->triNormal == a->triNormal);
+        CHECK(b->triArea == a->triArea);
+        CHECK(b->vertNormal == a->vertNormal);
+        CHECK(b->edges == a->edges);
+        CHECK(b->displayPosition == a->displayPosition && b->displayNormal == a->displayNormal && b->displaySrc == a->displaySrc);
+        CHECK(b->volume == a->volume && b->area == a->area);
+        CHECK(b->bbox.min == a->bbox.min && b->bbox.max == a->bbox.max);
+        CHECK(b->faceAngle == a->faceAngle);
+    }
 }
 
 TEST_MAIN

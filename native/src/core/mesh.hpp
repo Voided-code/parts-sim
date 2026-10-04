@@ -64,6 +64,11 @@ struct BuildOptions {
 /** Weld, clean, orient, refine and analyse raw triangles. Throws std::runtime_error on bad input. */
 std::shared_ptr<Part> buildPart(const MeshSource& src, const BuildOptions& opts = {});
 
+/** Rebuilds a Part from an already built mesh (a .psim file): no welding, orientation or refinement, so
+ *  vertex and triangle numbers stay those of the file. faceOf is used when brepFaces, else faces grow from faceAngle. */
+std::shared_ptr<Part> restorePart(const std::string& name, std::vector<float> vertices, std::vector<uint32_t> tris,
+                                  std::vector<int32_t> faceOf, bool brepFaces, int faceCount, double faceAngle);
+
 BBox boundingBox(const std::vector<float>& V);
 /** Regroup triangles into faces across edges bent less than angleDeg (mesh files without CAD faces). */
 void setSmoothFaces(Part& part, double angleDeg);
