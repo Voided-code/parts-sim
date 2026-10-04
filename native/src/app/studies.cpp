@@ -1039,7 +1039,7 @@ public:
         m.obj["nVert"] = jnum(part().nVert);
         m.obj["units"] = jstr(app()->units.toStdString());
         m.obj["material"] = materialToJson(r_->material);
-        m.obj["totalF"] = jnum(0);
+        m.obj["totalF"] = jnum(r_->totalF);
         m.obj["engine"] = jstr(r_->m.engine);
         m.obj["gpuNote"] = jstr(r_->m.gpuNote);
         out.meta = m;
@@ -1064,7 +1064,7 @@ public:
         }
         mp.engine = strOr(m["engine"]);
         mp.gpuNote = strOr(m["gpuNote"]);
-        r_ = Result{std::move(mp), m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material, {}};
+        r_ = Result{std::move(mp), m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material, {}, numOr(m["totalF"], 0)};
         invalidate();
         r_->fat = fatigueField(r_->m.vm, r_->m.p1, r_->m.p3, r_->material, o_.finish.toStdString(), o_.R, o_.cycles, o_.scale);
     }
@@ -1117,7 +1117,7 @@ public:
                 },
                 [this, gen](std::any& value, StructuralPanel::Prepared& p) {
                     if (gen != runGen_) return;
-                    r_ = Result{std::any_cast<Mapped>(std::move(value)), p.material, {}};
+                    r_ = Result{std::any_cast<Mapped>(std::move(value)), p.material, {}, totalForce(p.asm_)};
                     panel_->setDisplay("study");
                     invalidate();
                     recompute();
@@ -1240,6 +1240,7 @@ private:
         Mapped m;
         Material material;
         FatigueField fat;
+        double totalF = 0;
     };
     struct Options { int loading = 0; double R = 0, cycles = 1e6, scale = 1; QString finish = "machined"; } o_;
     QString view_ = "life";
@@ -1966,6 +1967,126 @@ public:
         sizing_.reset();
         app()->viewer->clearLayer("shape");
         app()->viewer->clearLayer("voxels");
+    }
+
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        psim::Arrays out;
+        Value m = jobj();
+        if (sizing_) {
+            const Sizing& s = *sizing_;
+            m.obj["goal"] = jstr("sizing");
+            m.obj["units"] = jstr(s.units.toStdString());
+            m.obj["material"] = materialToJson(s.material);
+            m.obj["engine"] = jstr(s.run.engine);
+            m.obj["gpuNote"] = jstr(s.run.gpuNote);
+            Value b = jobj();
+            b.obj["fos"] = jnum(s.run.base.fos);
+            b.obj["peak"] = jnum(0);
+            b.obj["exact"] = jbool(s.run.base.exact);
+            b.obj["disp"] = jnum(s.run.base.disp);
+            m.obj["base"] = b;
+            Value rows = jarr();
+            for (const auto& r : s.run.rows) {
+                Value e = jobj();
+                e.obj["id"] = jstr(r.id);
+                e.obj["name"] = jstr(r.name);
+                e.obj["feasible"] = jbool(r.feasible);
+                if (r.feasible) {
+                    e.obj["scale"] = jnum(r.scale); e.obj["fos"] = jnum(r.fos); e.obj["disp"] = jnum(r.disp);
+                    e.obj["mass"] = jnum(r.mass); e.obj["cost"] = jnum(r.cost); e.obj["exact"] = jbool(r.exact);
+                }
+                rows.arr.push_back(e);
+            }
+            m.obj["rows"] = rows;
+            out.meta = m;
+            return out;
+        }
+        if (!topo_ || !topo_->done || topo_->density.empty()) return std::nullopt;
+        const Topo& t = *topo_;
+        const auto& d = t.model->grid.dims;
+        m.obj["goal"] = jstr("topology");
+        m.obj["units"] = jstr(app()->units.toStdString());
+        m.obj["material"] = materialToJson(t.material);
+        m.obj["toMeters"] = jnum(t.toMeters);
+        m.obj["resolution"] = jnum(t.model->resolution);
+        m.obj["dims"] = vec({double(d[0]), double(d[1]), double(d[2])});
+        Value h = jarr();
+        for (const auto& p : t.history) {
+            Value e = jobj();
+            e.obj["it"] = jnum(p.it); e.obj["compliance"] = jnum(p.compliance); e.obj["volume"] = jnum(p.volume);
+            h.arr.push_back(e);
+        }
+        m.obj["history"] = h;
+        m.obj["keptFraction"] = t.shapeFraction >= 0 ? jnum(t.shapeFraction) : Value{};
+        m.obj["engine"] = Value{};
+        out.meta = m;
+        psim::Array a;
+        a.name = "optimize.density";
+        a.enc = psim::Enc::Q8;
+        a.f = t.density;
+        a.dims = {uint32_t(d[0]), uint32_t(d[1]), uint32_t(d[2])};
+        out.list.push_back(std::move(a));
+        return out;
+    }
+    void scriptOption(const QString& o) override {
+        o_.sizing = o == "sizing";
+        QMetaObject::invokeMethod(panel_, [p = panel_] { p->renderStudyOptions(); }, Qt::QueuedConnection);
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        if (m["material"].type != Value::Object) throw std::runtime_error("The file's optimization result is damaged (no material).");
+        const Material mat = materialFromJson(m["material"]);
+        const std::string goal = strOr(m["goal"]);
+        if (goal == "sizing") {
+            if (m["rows"].type != Value::Array || m["base"].type != Value::Object) throw std::runtime_error("The file's optimization result is damaged (no table).");
+            Sizing s;
+            s.material = mat;
+            s.units = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+            s.run.engine = strOr(m["engine"]);
+            s.run.gpuNote = strOr(m["gpuNote"]);
+            s.run.base.fos = numOr(m["base"]["fos"], 0);
+            s.run.base.disp = numOr(m["base"]["disp"], 0);
+            s.run.base.exact = boolOr(m["base"]["exact"], true);
+            s.run.base.feasible = true;
+            for (const auto& e : m["rows"].arr) {
+                SizingRow r;
+                r.id = strOr(e["id"]);
+                r.name = strOr(e["name"]);
+                r.feasible = boolOr(e["feasible"], false);
+                r.scale = numOr(e["scale"], 0); r.fos = numOr(e["fos"], 0); r.disp = numOr(e["disp"], 0);
+                r.mass = numOr(e["mass"], 0); r.cost = numOr(e["cost"], 0); r.exact = boolOr(e["exact"], true);
+                s.run.rows.push_back(std::move(r));
+            }
+            topo_.reset();
+            sizing_ = std::move(s);
+            o_.sizing = true;
+            invalidate();
+            return;
+        }
+        if (goal != "topology") throw std::runtime_error("The file's optimization result has an unknown goal.");
+        const double res = numOr(m["resolution"], 0);
+        if (!(res >= 1) || m["dims"].size() != 3 || m["history"].type != Value::Array) throw std::runtime_error("The file's topology result is damaged.");
+        auto model = panel_->modelFor(int(res));
+        const auto& d = model->grid.dims;
+        if (numOr(m["dims"][0], 0) != d[0] || numOr(m["dims"][1], 0) != d[1] || numOr(m["dims"][2], 0) != d[2])
+            throw std::runtime_error("The file's topology result was made on a different voxel grid than this part gives.");
+        const psim::Array* a = arrays.find("optimize.density");
+        if (!a || a->f.size() != size_t(d[0]) * d[1] * d[2]) throw std::runtime_error("The topology result in the file does not fit this part.");
+        Topo t;
+        t.model = model;
+        t.material = mat;
+        t.toMeters = numOr(m["toMeters"], 0.001);
+        t.density = a->f;
+        for (auto& v : t.density) if (std::isnan(v)) v = 0;
+        for (const auto& e : m["history"].arr) t.history.push_back({int(numOr(e["it"], 0)), numOr(e["compliance"], 0), numOr(e["volume"], 0)});
+        t.done = true;
+        sizing_.reset();
+        topo_ = std::move(t);
+        o_.sizing = false;
+        buildShape();
+        invalidate();
     }
     void leave() override {
         if (autoXRay_) { app()->setXRay(false); autoXRay_ = false; }

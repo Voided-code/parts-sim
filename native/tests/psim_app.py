@@ -59,9 +59,11 @@ def main():
     rc, out = app(a.exe, f"open:{th};idle;assert:psim;status;quit")
     check("3 thermal reopen", rc == 0 and "Opened th.psim" in out, out)
     # 3b: the other studies round trip (save, JS verify, reopen shows results without a solve)
-    for study, extra in [("modal", ""), ("buckling", ""), ("fatigue", ""), ("nonlinear", "mesh:6000;"), ("break", "mesh:20000;")]:
+    for study, extra in [("modal", ""), ("buckling", ""), ("fatigue", ""), ("nonlinear", "mesh:6000;"), ("break", "mesh:20000;"), ("optimize-topology", "mesh:3000;"), ("optimize-sizing", "mesh:3000;")]:
         f = t / (study + ".psim")
         run = "break" if study == "break" else f"study:{study};run"
+        if study.startswith("optimize"):
+            run = f"study:optimize;studyopt:{study.split('-')[1]};run"
         rc, out = app(a.exe, f"sample:{'lbracket' if study == 'break' else 'beam'};idle;engine:cpu;{extra}{run};idle;savepsim:{f};quit")
         check(f"3b {study} save", rc == 0 and f.exists(), out)
         check(f"3b JS verifies {study}", js("verify", f).returncode == 0, js("verify", f).stderr)

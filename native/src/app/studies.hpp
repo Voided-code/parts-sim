@@ -49,6 +49,8 @@ public:
     /** .psim files: the result as { meta, arrays } (empty when there is none or the study is not stored), and back. */
     virtual std::optional<psim::Arrays> exportResult() const { return std::nullopt; }
     virtual bool canImport() const { return false; }
+    /** Automation (PARTS_SIM_SCRIPT studyopt:<name>): set a study option, e.g. the optimization goal "sizing". */
+    virtual void scriptOption(const QString&) {}
     /** Throws std::runtime_error with a message for the user when the stored result does not fit the part. */
     virtual void importResult(const json::Value&, const psim::Arrays&) {}
 

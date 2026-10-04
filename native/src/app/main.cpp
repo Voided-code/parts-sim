@@ -13,6 +13,7 @@
 
 #include "jobs.hpp"
 #include "mainwindow.hpp"
+#include "studies.hpp"
 #include "structuralpanel.hpp"
 #include "thermalpanel.hpp"
 #include "airflowpanel.hpp"
@@ -121,6 +122,7 @@ void runScript(ps::MainWindow* w, QStringList steps) {
     } else if (cmd == "rerun") w->rerunLoaded();
     else if (cmd == "tab") w->setTab(arg);
     else if (cmd == "study") w->structural->selectStudy(arg);
+    else if (cmd == "studyopt") { if (auto* s = w->structural->currentStudy()) s->scriptOption(arg); }
     else if (cmd == "run") {
         if (w->tab() == "thermal") w->thermal->run();
         else if (w->tab() == "airflow") w->airflow->run();
