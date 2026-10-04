@@ -9,6 +9,7 @@ import { StructuralPanel } from './ui/structural-panel.js';
 import { AirflowPanel } from './ui/airflow-panel.js';
 import { ThermalPanel } from './ui/thermal-panel.js';
 import { Picker } from './ui/picker.js';
+import { openPsim, isPsimName, saveDialog, clearLoaded, runDone, showBanner, gather, buildFile } from './ui/psim-io.js';
 import { $, $$, h, num, nextFrame } from './ui/dom.js';
 
 const app = {
@@ -99,12 +100,19 @@ async function loadPart(src, { units = null, setup = null, airflow = null, info 
     app.status(`Could not process the mesh: ${err.message}`, 'error');
     return false;
   }
+  return installPart(part, { units, setup, airflow, info });
+}
+
+/** Makes a built part the current one and resets every panel for it. */
+function installPart(part, { units = null, setup = null, airflow = null, info = '' } = {}) {
   if (app.picker.active) app.picker.finish(false);
   app.structural.deactivate();
   app.thermal.deactivate();
   app.airflow.deactivate();
   app.part = part;
   app.partInfo = info;
+  app.sourceFile = null;
+  clearLoaded(app);
   if (units) setUnits(units, false);
   app.viewer.setPart(part);
   $('#empty-state').hidden = true;
@@ -129,11 +137,25 @@ async function importFromFile(file, companions = [], readSibling = null) {
   const request = ++partRequest;
   app.busy.show(`Reading ${file.name}…`);
   await nextFrame();
+  if (isPsimName(file.name)) {
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await openPsim(app, bytes, file.name, async (part, o) => {
+        if (request !== partRequest) return false;
+        return installPart(part, o);
+      });
+    } catch (err) {
+      app.status(`Could not open ${file.name}: ${err.message}`, 'error');
+    }
+    app.busy.hide();
+    return;
+  }
   try {
     const src = await importFile(file, { companions, readSibling });
     if (request !== partRequest) return;
     const loaded = await loadPart(src, { units: src.units, info: src.info, request });
     if (!loaded) return;
+    if (/\.(step|stp|iges|igs|sldprt)$/i.test(file.name) && !companions.length) app.sourceFile = file;
     const notes = [...(src.warnings || [])];
     const matId = matchMaterial(src.material, MATERIALS);
     if (matId) {
@@ -251,6 +273,19 @@ $('#btn-shot').addEventListener('click', async () => {
   h('a', { href: png, download: `${name}.png` }).click();
 });
 $('#btn-help').addEventListener('click', () => $('#help').showModal());
+$('#btn-save').addEventListener('click', () => saveDialog(app));
+// results loaded from a file stay on screen until something new is computed or the setup changes
+app.runDone = (kind, now) => runDone(app, kind, now);
+for (const id of ['#btn-run', '#btn-break', '#btn-th-run', '#btn-flow-run']) {
+  $(id).addEventListener('click', () => { if (!app.rerunOf) clearLoaded(app); });
+}
+for (const panel of [app.structural, app.thermal]) {
+  const markStale = panel.markStale.bind(panel);
+  panel.markStale = (...args) => {
+    if (app.loadedFile && !app.loadedFile.edited) { app.loadedFile.edited = true; showBanner(app); }
+    return markStale(...args);
+  };
+}
 $('#busy-cancel').addEventListener('click', () => app.busy.onCancel?.());
 
 for (const b of $$('.tabs button')) b.addEventListener('click', () => app.setTab(b.dataset.tab));
@@ -296,6 +331,16 @@ function applyScale(s) {
 }
 
 app.applyScale = applyScale;
+
+/** Save and open without dialogs (tests, scripts): bytes in, bytes out. */
+app.psim = {
+  async save(options = {}) {
+    const draft = gather(app);
+    const all = { geometry: 'quantised', setup: true, results: [...draft.results.keys()], cad: false, thumb: false, ...options };
+    return (await buildFile(app, draft, all, null)).bytes;
+  },
+  open: (bytes, name = 'file.psim') => openPsim(app, bytes, name, async (part, o) => installPart(part, o)),
+};
 
 /** Replace the part with a generated mesh (e.g. an optimized shape), keeping the units. */
 app.loadGeneratedPart = (src) => {
@@ -381,6 +426,11 @@ function siblingReader(file) {
 }
 
 window.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    if (app.part) saveDialog(app);
+    return;
+  }
   if (e.target.closest('input, select, textarea') || app.picker.active) return;
   if (e.key === 'f') app.viewer.setView('iso');
 });
@@ -411,6 +461,7 @@ if (app.desktop) {
     else if (command === 'toggle:edges') toggle('#chk-edges');
     else if (command === 'toggle:xray') toggle('#chk-xray');
     else if (command === 'screenshot') click('#btn-shot');
+    else if (command === 'save:psim') { if (app.part) saveDialog(app); else app.status('Open a part or a sample first.', 'error'); }
     else if (command === 'help') $('#help').showModal();
     else if (kind === 'study') {
       app.setTab('structural');

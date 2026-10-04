@@ -8,7 +8,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { unzipSync, strFromU8 } from 'three/examples/jsm/libs/fflate.module.js';
 import { readSolidWorks, assemblyPartNames } from './solidworks.js';
 
-export const ACCEPT = '.step,.stp,.iges,.igs,.brep,.brp,.sldprt,.sldasm,.slddrw,.stl,.obj,.3mf,.ply,.glb,.gltf';
+export const ACCEPT = '.psim,.step,.stp,.iges,.igs,.brep,.brp,.sldprt,.sldasm,.slddrw,.stl,.obj,.3mf,.ply,.glb,.gltf';
 
 /** Pick the file to open from a multi-file selection; the rest travel along as companions (assembly parts). */
 export function primaryFile(files) {

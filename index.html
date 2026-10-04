@@ -34,6 +34,7 @@
         <span class="sep"></span>
         <label class="toggle" title="Show feature edges"><input type="checkbox" id="chk-edges" checked /> Edges</label>
         <label class="toggle" title="See-through part (shows internal cracks)"><input type="checkbox" id="chk-xray" /> X-ray</label>
+        <button class="btn" id="btn-save" title="Save the part, its setup and its results as one small .psim file (Ctrl/Cmd+S)">Save .psim</button>
         <button class="btn icon" id="btn-shot" title="Save screenshot (PNG)">
           <svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><circle cx="12" cy="13" r="3.5" /></svg>
         </button>
@@ -430,11 +431,12 @@
       <div class="viewport" id="viewport">
         <div class="empty" id="empty-state">
           <div class="empty-inner">
-            <div class="empty-title">Drop a STEP, SolidWorks, STL or OBJ file here</div>
+            <div class="empty-title">Drop a STEP, SolidWorks, STL, OBJ or .psim file here</div>
             <div class="muted">or <button class="linklike" id="empty-open">browse</button> · <button class="linklike" id="empty-sample">open a sample</button></div>
           </div>
         </div>
         <div class="drop-overlay" id="drop-overlay">Drop to import</div>
+        <div class="file-banner" id="file-banner" role="status" hidden></div>
         <div class="legend" id="legend" hidden></div>
         <div class="probe" id="probe" hidden></div>
         <div class="picker" id="picker" hidden>
@@ -461,6 +463,15 @@
       <span class="muted" id="status-right"></span>
     </footer>
 
+    <dialog id="save-dialog" class="psim-dialog" aria-labelledby="save-title">
+      <h2 id="save-title">Save as .psim</h2>
+      <p class="muted">One small file with the part, its setup and its results. Whoever opens it sees the results at once, in either app or on the website, without solving again.</p>
+      <div id="save-body"></div>
+    </dialog>
+    <dialog id="info-dialog" class="psim-dialog">
+      <div class="info-body"></div>
+      <form method="dialog" class="dialog-actions"><button class="btn primary">Close</button></form>
+    </dialog>
     <dialog id="help">
       <form method="dialog">
         <h2>How Parts Sim works</h2>

@@ -1,5 +1,6 @@
 // Thermal tab: fixed temperatures, heat inputs and convection picked on faces, steady-state or
 // transient heat conduction on the voxel model, and temperature / heat-flux results.
+import { patchToJson, patchFromJson } from '../core/psim-patches.js';
 import * as THREE from 'three';
 import { FEAJob } from '../fea/structural.js';
 import { completeMaterial } from '../core/materials.js';
@@ -319,6 +320,7 @@ export class ThermalPanel {
     this.show();
     this.app.status(`Heat transfer on ${model.voxelCount.toLocaleString()} voxels: ${num(r.min)}–${num(r.max)} °C${transient ? ` after ${num(duration)} s` : ''}.${res0(r)}`);
     $('#th-results').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    this.app.runDone?.('thermal', r);
   }
 
   // ---------- display ----------
@@ -448,6 +450,82 @@ export class ThermalPanel {
     }
     this.setFrame(this.view.frame + 1);
   }
+
+  // ---------- .psim file ----------
+
+  exportState() {
+    return {
+      mode: this.mode,
+      items: this.items.map((it) => ({ name: it.name, type: it.type, value: it.value, ambient: it.ambient, patches: it.patches.map(patchToJson) })),
+      ambient: { enabled: $('#th-ambient').checked, h: Number($('#th-ambient-h').value), t: Number($('#th-ambient-t').value) },
+      duration: Number($('#th-duration').value),
+      steps: Number($('#th-steps').value),
+      initial: Number($('#th-initial').value),
+      resolution: Number($('#th-res').value),
+    };
+  }
+
+  importState(s) {
+    const nTri = this.part.nTri;
+    this.items = (s.items || []).map((it) => {
+      if (!['temp', 'heat', 'conv'].includes(it.type)) throw new Error(`The file has a thermal condition of an unknown type (${it.type}).`);
+      return { id: uid++, name: String(it.name), type: it.type, value: Number(it.value), ambient: Number(it.ambient ?? 20), patches: (it.patches || []).map((p) => patchFromJson(p, nTri)).filter((p) => p.tris.length) };
+    });
+    this.selected = this.items[0] || null;
+    this.mode = s.mode === 'transient' ? 'transient' : 'steady';
+    for (const b of $$('#th-mode button')) b.classList.toggle('active', b.dataset.mode === this.mode);
+    $('#th-transient').hidden = this.mode !== 'transient';
+    const a = s.ambient || {};
+    $('#th-ambient').checked = a.enabled !== false;
+    $('#th-ambient-props').hidden = a.enabled === false;
+    const put = (sel, v) => { if (Number.isFinite(v)) $(sel).value = v; };
+    put('#th-ambient-h', a.h); put('#th-ambient-t', a.t); put('#th-duration', s.duration); put('#th-steps', s.steps); put('#th-initial', s.initial);
+    if (Number.isFinite(s.resolution)) { $('#th-res').value = s.resolution; $('#th-res-out').textContent = s.resolution; }
+    this.renderList();
+  }
+
+  /** The thermal result as { meta, arrays }, or null. */
+  exportResult() {
+    const r = this.result;
+    if (!r) return null;
+    const meta = {};
+    for (const [k, v] of Object.entries(r)) if (!ArrayBuffer.isView(v) && k !== 'frames' && k !== 'stale') meta[k] = v;
+    meta.frameTimes = r.frames.map((f) => ({ t: f.t, min: f.min, max: f.max }));
+    const arrays = [{ name: 'thermal.T', data: r.T, enc: 'q16' }, { name: 'thermal.flux', data: r.flux, enc: 'q16' }];
+    r.frames.forEach((f, i) => arrays.push({ name: `thermal.frame.${i}`, data: f.T, enc: 'q16' }));
+    return { meta, arrays };
+  }
+
+  importResult(meta, arrays) {
+    const nV = this.part.nVert;
+    const get = (name) => {
+      const a = arrays.get(name);
+      if (!a || a.data.length !== nV) throw new Error('The thermal result in the file does not fit this part.');
+      return a.data;
+    };
+    const { frameTimes = [], ...rest } = meta;
+    const frames = frameTimes.map((f, i) => ({ i, t: f.t, min: f.min, max: f.max, T: get(`thermal.frame.${i}`) }));
+    this.result = { ...rest, T: get('thermal.T'), flux: get('thermal.flux'), frames };
+    this.display = 'results';
+    this.view.frame = Math.max(0, frames.length - 1);
+    $('#th-results').hidden = false;
+    $('#th-time').hidden = !this.result.transient;
+  }
+
+  exportView() {
+    return { plot: this.view.plot, frame: this.view.frame, bands: this.view.bands, bcs: this.view.bcs };
+  }
+
+  importView(v = {}) {
+    if (['T', 'flux'].includes(v.plot)) this.view.plot = v.plot;
+    if (Number.isInteger(v.frame) && this.result) this.view.frame = Math.max(0, Math.min(Math.max(0, this.result.frames.length - 1), v.frame));
+    if (typeof v.bands === 'boolean') this.view.bands = v.bands;
+    if (typeof v.bcs === 'boolean') this.view.bcs = v.bcs;
+    $('#th-plot').value = this.view.plot;
+    $('#th-bands').checked = this.view.bands;
+    $('#th-bcs').checked = this.view.bcs;
+  }
+
 }
 
 function res0(r) {

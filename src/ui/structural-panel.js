@@ -9,6 +9,7 @@ import { $, $$, h, num, stress, stressFormatter, force, nextFrame } from './dom.
 import { renderLegend } from './legend.js';
 import { LineChart } from './chart.js';
 import { createStudies, STUDY_INFO } from './studies.js';
+import { patchToJson, patchFromJson } from '../core/psim-patches.js';
 
 const FIX_COLOR = 0x1a9f55;
 const LOAD_COLOR = 0x9b46d4;
@@ -717,6 +718,7 @@ export class StructuralPanel {
     );
     this.applyDisplay();
     $('#results-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    this.app.runDone?.('static', this.result);
   }
 
   mapResult(res, asm, prep) {
@@ -1217,6 +1219,7 @@ export class StructuralPanel {
   }
 
   voxelPositions(list, step, scale) {
+    if (step.loaded) return this.loadedVoxelPositions(list, step, scale);
     const m = this.brk.model;
     const [nx, ny] = m.dims;
     const out = new Float32Array(list.length * 3);
@@ -1251,6 +1254,210 @@ export class StructuralPanel {
     this.playing = false;
     $('#btn-break-play').textContent = '▶ Play';
   }
+
+  // ---------- .psim file: setup and results as plain data ----------
+
+  /** Material, fixtures, loads and study settings as plain data. */
+  exportSetup() {
+    const res = Number($('#res-range').value);
+    const options = {};
+    for (const [id, st] of Object.entries(this.studies)) {
+      const o = st.exportOptions?.();
+      if (o) options[id] = o;
+    }
+    return {
+      study: this.study,
+      resolution: res,
+      resFor: { ...this.resFor, [this.study]: res },
+      gravity: $('#chk-gravity').checked,
+      engine: $('#fea-engine').value,
+      fixtures: this.fixtures.map((f) => ({ name: f.name, patches: f.patches.map(patchToJson) })),
+      loads: this.loads.map((l) => ({
+        name: l.name, type: l.type, magnitude: l.magnitude, dir: l.dir.slice(), userDir: !!l.userDir,
+        ...(l.type === 'wind' ? { net: l.net.slice() } : { patches: l.patches.map(patchToJson) }),
+      })),
+      options,
+    };
+  }
+
+  /** Per-triangle forces of the wind loads, as arrays named load.<index>.forces. */
+  exportWindArrays() {
+    return this.loads.flatMap((l, i) => (l.type === 'wind' && l.forces ? [{ name: `load.${i}.forces`, data: l.forces, enc: 'q16' }] : []));
+  }
+
+  /** Puts the material back, library or custom, as saved. */
+  importMaterial(m) {
+    if (!m || typeof m !== 'object' || !Number.isFinite(m.E) || !Number.isFinite(m.density)) throw new Error('The material in the file is incomplete.');
+    this.material = { ...m, fatigue: m.fatigue ? { ...m.fatigue } : m.fatigue };
+    const sel = $('#mat-select');
+    sel.value = MATERIALS.some((x) => x.id === m.id) ? m.id : 'custom';
+    this.renderMaterial();
+  }
+
+  /** Call after the part is loaded (reset has cleared the old setup). */
+  importSetup(s, arrays = new Map()) {
+    const nTri = this.part.nTri;
+    this.fixtures = (s.fixtures || []).map((f) => ({ id: uid++, name: String(f.name), patches: (f.patches || []).map((p) => patchFromJson(p, nTri)).filter((p) => p.tris.length) }));
+    this.loads = (s.loads || []).map((l, i) => {
+      const dir = Array.isArray(l.dir) && l.dir.length === 3 ? l.dir.map(Number) : [0, -1, 0];
+      const base = { id: uid++, name: String(l.name), type: l.type, magnitude: Number(l.magnitude), dir, userDir: !!l.userDir };
+      if (l.type === 'wind') {
+        const f = arrays.get(`load.${i}.forces`);
+        if (!f || f.data.length !== 3 * nTri) throw new Error('The wind load in the file has no forces for this part.');
+        return { ...base, forces: Float32Array.from(f.data), net: (l.net || [0, 0, 0]).map(Number), patches: [] };
+      }
+      if (l.type !== 'force' && l.type !== 'pressure') throw new Error(`The file has a load of an unknown type (${l.type}).`);
+      return { ...base, patches: (l.patches || []).map((p) => patchFromJson(p, nTri)).filter((p) => p.tris.length) };
+    });
+    this.selected = this.loads[0] || null;
+    $('#chk-gravity').checked = !!s.gravity;
+    if (s.engine && [...$('#fea-engine').options].some((o) => o.value === s.engine)) $('#fea-engine').value = s.engine;
+    this.resFor = {};
+    for (const [id, n] of Object.entries(s.resFor || {})) if (STUDY_INFO[id] && Number.isFinite(n)) this.resFor[id] = Math.min(480, Math.max(16, Math.round(n)));
+    for (const [id, o] of Object.entries(s.options || {})) this.studies[id]?.importOptions?.(o);
+    this.renderLists();
+  }
+
+  /** Switches to a study without running or clearing anything. */
+  restoreStudy(id) {
+    if (!STUDY_INFO[id]) id = 'static';
+    this.study = id;
+    $('#study-select').value = id;
+    const n = this.resFor[id] ?? suggestResolution(this.part, STUDY_INFO[id].budget);
+    $('#res-range').value = n;
+    $('#res-out').textContent = n;
+    this.updateMeshInfo();
+    const st = this.studies[id];
+    this.display = id === 'static' ? (this.result ? 'results' : this.brk?.steps.length ? 'break' : 'setup') : st?.result ? 'study' : 'setup';
+    this.renderStudyOptions();
+  }
+
+  /** The linear static result as { meta, arrays }, or null. */
+  exportStatic() {
+    const r = this.result;
+    if (!r) return null;
+    const meta = {};
+    for (const [k, v] of Object.entries(r)) if (!ArrayBuffer.isView(v) && k !== 'reaction') meta[k] = v;
+    const field = (name) => ({ name: `static.${name}`, data: r[name], enc: 'q16' });
+    return { meta, arrays: ['vm', 'p1', 'p3', 'fos', 'u'].map(field) };
+  }
+
+  importStatic(meta, arrays) {
+    const nV = this.part.nVert;
+    const get = (name, n) => {
+      const a = arrays.get(`static.${name}`);
+      if (!a || a.data.length !== n) throw new Error(`The static result in the file does not fit this part (${name}).`);
+      return a.data;
+    };
+    const u = get('u', 3 * nV);
+    const dmag = new Float32Array(nV);
+    for (let v = 0; v < nV; v++) dmag[v] = Number.isNaN(u[3 * v]) ? NaN : Math.hypot(u[3 * v], u[3 * v + 1], u[3 * v + 2]);
+    this.result = { ...meta, vm: get('vm', nV), p1: get('p1', nV), p3: get('p3', nV), fos: get('fos', nV), u, dmag, reaction: null };
+    this.stale = false;
+    this.display = 'results';
+    $('#results-card').hidden = false;
+  }
+
+  /** The break test as { meta, arrays }, or null. Only what the pictures need is kept. */
+  exportBreak() {
+    const b = this.brk;
+    if (!b || !b.steps.length) return null;
+    const m = b.model;
+    const arrays = [];
+    const steps = b.steps.map((s, i) => {
+      if (!s.mapped) {
+        const W = m.vertexWeights(s.activeNode);
+        const u = m.interpolate(W, s.u, 3);
+        for (let q = 0; q < u.length; q++) u[q] /= b.toMeters;
+        s.mapped = { vm: m.interpolate(W, s.nodeVM), u };
+      }
+      arrays.push({ name: `break.vm.${i}`, data: s.mapped.vm, enc: 'q16' }, { name: `break.u.${i}`, data: s.mapped.u, enc: 'q16' },
+        { name: `break.cracked.${i}`, data: Int32Array.from(s.cracked), enc: 'i32' }, { name: `break.detached.${i}`, data: Int32Array.from(s.detached), enc: 'i32' });
+      return { step: s.step, lambda: s.lambda, maxDisp: s.maxDisp };
+    });
+    return {
+      meta: { steps, totalF: b.totalF, material: b.material, toMeters: b.toMeters, reason: b.reason ?? null, done: !!b.done, scale: b.scale ?? null, grid: { dims: Array.from(m.dims), origin: Array.from(m.origin), h: m.h, resolution: m.resolution } },
+      arrays,
+    };
+  }
+
+  importBreak(meta, arrays) {
+    const nV = this.part.nVert;
+    const grid = meta.grid;
+    if (!grid || !Array.isArray(grid.dims) || grid.dims.length !== 3 || !Array.isArray(grid.origin) || !(grid.h > 0)) throw new Error('The break test in the file has no voxel grid.');
+    const need = (name, n) => {
+      const a = arrays.get(name);
+      if (!a || (n !== undefined && a.data.length !== n)) throw new Error('The break test in the file does not fit this part.');
+      return a.data;
+    };
+    const steps = meta.steps.map((s, i) => ({
+      step: s.step, lambda: s.lambda, maxDisp: s.maxDisp, loaded: true,
+      cracked: need(`break.cracked.${i}`), detached: need(`break.detached.${i}`),
+      mapped: { vm: need(`break.vm.${i}`, nV), u: need(`break.u.${i}`, 3 * nV) },
+    }));
+    const model = { dims: grid.dims, origin: grid.origin, h: grid.h, resolution: grid.resolution };
+    this.brk = { steps, totalF: meta.totalF, material: meta.material, current: 0, done: true, reason: meta.reason, model, toMeters: meta.toMeters, scale: meta.scale || undefined, loaded: true };
+    if (!this.result) this.display = 'break';
+    $('#break-card').hidden = false;
+  }
+
+  /** Nearest-vertex displacement of a voxel centre, for break steps loaded from a file. */
+  loadedVoxelPositions(list, step, scale) {
+    const b = this.brk, m = b.model;
+    if (!b.hash) {
+      const V = this.part.vertices, cell = m.h * 2, map = new Map();
+      for (let i = 0; i < this.part.nVert; i++) {
+        const key = `${Math.floor(V[3 * i] / cell)},${Math.floor(V[3 * i + 1] / cell)},${Math.floor(V[3 * i + 2] / cell)}`;
+        let a = map.get(key);
+        if (!a) map.set(key, (a = []));
+        a.push(i);
+      }
+      b.hash = { map, cell };
+    }
+    const { map, cell } = b.hash, V = this.part.vertices, u = step.mapped.u;
+    const [nx, ny] = m.dims;
+    const out = new Float32Array(list.length * 3);
+    list.forEach((e, q) => {
+      const i = e % nx, j = ((e / nx) | 0) % ny, k = (e / (nx * ny)) | 0;
+      const x = m.origin[0] + (i + 0.5) * m.h, y = m.origin[1] + (j + 0.5) * m.h, z = m.origin[2] + (k + 0.5) * m.h;
+      const cx = Math.floor(x / cell), cy = Math.floor(y / cell), cz = Math.floor(z / cell);
+      let best = -1, bd = Infinity;
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+        for (const v of map.get(`${cx + dx},${cy + dy},${cz + dz}`) || []) {
+          const d = (V[3 * v] - x) ** 2 + (V[3 * v + 1] - y) ** 2 + (V[3 * v + 2] - z) ** 2;
+          if (d < bd) { bd = d; best = v; }
+        }
+      }
+      const f = best >= 0 && !Number.isNaN(u[3 * best]) ? scale : 0;
+      out[3 * q] = x + (f ? u[3 * best] * f : 0);
+      out[3 * q + 1] = y + (f ? u[3 * best + 1] * f : 0);
+      out[3 * q + 2] = z + (f ? u[3 * best + 2] * f : 0);
+    });
+    return out;
+  }
+
+  exportView() {
+    const v = this.view;
+    return { plot: v.plot, scalePct: v.scalePct, level: v.level, bands: v.bands, heat: v.heat, bcs: v.bcs, marker: v.marker, breakStress: v.breakStress, breakStep: this.brk?.current ?? 0 };
+  }
+
+  importView(v = {}) {
+    const take = (k, ok) => { if (k in v && ok(v[k])) this.view[k] = v[k]; };
+    take('plot', (x) => ['vm', 'disp', 'fos', 'p1', 'p3'].includes(x));
+    take('scalePct', Number.isFinite);
+    take('level', (x) => ['applied', 'yield', 'break'].includes(x));
+    for (const k of ['bands', 'heat', 'bcs', 'marker', 'breakStress']) take(k, (x) => typeof x === 'boolean');
+    $('#plot-select').value = this.view.plot;
+    $('#scale-range').value = this.view.scalePct;
+    $('#chk-bands').checked = this.view.bands;
+    $('#chk-heat').checked = this.view.heat;
+    $('#chk-bcs').checked = this.view.bcs;
+    $('#chk-marker').checked = this.view.marker;
+    $('#chk-break-stress').checked = this.view.breakStress;
+    if (this.result) this.setLevel(this.view.level, false);
+    if (this.brk && Number.isInteger(v.breakStep)) this.brk.current = Math.max(0, Math.min(this.brk.steps.length - 1, v.breakStep));
+  }
+
 }
 
 /**

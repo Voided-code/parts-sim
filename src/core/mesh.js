@@ -67,6 +67,36 @@ export function buildPart(src, { maxTris = 350000, faceAngle = 20 } = {}) {
   return part;
 }
 
+/**
+ * Rebuilds a part from the arrays of an already built one (a .psim file), without welding, refining
+ * or moving it: vertex and triangle numbers stay exactly as saved, because results and selections
+ * refer to them. Faces come from `faceOf` for CAD parts, otherwise from the smooth-face angle.
+ */
+export function restorePart({ name, vertices, tris, faceOf = null, brepFaces = false, faceCount = 0, faceAngle = 20 }) {
+  const part = {
+    name: name || 'Part',
+    vertices,
+    tris,
+    nVert: vertices.length / 3,
+    nTri: tris.length / 3,
+    bbox: boundingBox(vertices),
+    brepFaces: !!brepFaces,
+  };
+  computeTriangleData(part);
+  part.neighbors = triangleNeighbors(tris, part.nVert);
+  part.vertNormal = smoothNormals(part);
+  if (brepFaces && faceOf) {
+    part.faceOf = faceOf;
+    part.faceCount = faceCount;
+  } else {
+    setSmoothFaces(part, faceAngle || 20);
+  }
+  part.volume = Math.abs(signedVolume(vertices, tris));
+  part.edges = featureEdges(part, 30);
+  part.display = creasedDisplay(part, 35);
+  return part;
+}
+
 function validateMesh({ positions, index, faceIds }) {
   if (!positions?.length || positions.length % 3 !== 0) throw new Error('The file contains no valid vertex positions.');
   for (const v of positions) if (!Number.isFinite(v)) throw new Error('The mesh contains non-finite vertex coordinates.');

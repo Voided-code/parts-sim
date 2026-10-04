@@ -11,7 +11,7 @@ import { pathToFileURL } from 'node:url';
 
 const ROOT = path.join(import.meta.dirname, '..', 'dist');
 const ORIGIN = 'app://parts-sim';
-const OPENABLE = ['step', 'stp', 'iges', 'igs', 'brep', 'brp', 'sldprt', 'sldasm', 'slddrw', 'stl', 'obj', '3mf', 'ply', 'glb', 'gltf'];
+const OPENABLE = ['step', 'stp', 'iges', 'igs', 'brep', 'brp', 'sldprt', 'sldasm', 'slddrw', 'stl', 'obj', '3mf', 'ply', 'glb', 'gltf', 'psim'];
 const SAMPLES = [
   ['beam', 'Cantilever beam'], ['lbracket', 'L-bracket (PLA print)'], ['bracket', 'Bolted mounting bracket'],
   ['wrench', 'Open-end wrench'], ['hook', 'Crane hook'], ['wing', 'Wing (NACA 2412)'], ['ahmed', 'Ahmed body (car)'],
@@ -113,10 +113,11 @@ async function flushOpen() {
 
 async function showOpenDialog() {
   const res = await dialog.showOpenDialog(win, {
-    title: 'Open part or assembly',
+    title: 'Open part, assembly or .psim file',
     properties: ['openFile', 'multiSelections'],
     filters: [
-      { name: 'CAD parts', extensions: OPENABLE },
+      { name: 'All supported files', extensions: OPENABLE },
+      { name: 'Parts Sim files (.psim)', extensions: ['psim'] },
       { name: 'SolidWorks', extensions: ['sldprt', 'sldasm'] },
       { name: 'STEP / IGES', extensions: ['step', 'stp', 'iges', 'igs'] },
       { name: 'Meshes', extensions: ['stl', 'obj', '3mf', 'ply', 'glb'] },
@@ -141,6 +142,7 @@ function buildMenu() {
         ...(mac ? [{ role: 'recentDocuments', submenu: [{ role: 'clearRecentDocuments' }] }] : []),
         { label: 'Open Sample', submenu: SAMPLES.map(([id, label]) => cmd(label, `sample:${id}`)) },
         { type: 'separator' },
+        cmd('Save as .psim…', 'save:psim', 'CmdOrCtrl+S'),
         cmd('Save Screenshot…', 'screenshot', 'CmdOrCtrl+Shift+S'),
         { type: 'separator' },
         mac ? { role: 'close' } : { role: 'quit' },
@@ -309,13 +311,18 @@ ipcMain.handle('save-image', async (e, dataUrl, suggested) => {
   return true;
 });
 
-// Save a generated mesh (the topology-optimization result) as STL.
+// Save a generated mesh (the topology-optimization result) as STL, or a .psim file.
+const SAVE_KINDS = {
+  stl: { title: 'Export STL', filters: [{ name: 'STL mesh', extensions: ['stl'] }] },
+  psim: { title: 'Save as .psim', filters: [{ name: 'Parts Sim file', extensions: ['psim'] }] },
+};
 ipcMain.handle('save-file', async (e, data, suggested) => {
-  if (e.sender !== win?.webContents || !(data instanceof Uint8Array) || typeof suggested !== 'string' || !/\.stl$/i.test(suggested)) return false;
+  const kind = typeof suggested === 'string' ? suggested.match(/\.(stl|psim)$/i)?.[1].toLowerCase() : null;
+  if (e.sender !== win?.webContents || !(data instanceof Uint8Array) || !kind) return false;
   const res = await dialog.showSaveDialog(win, {
-    title: 'Export STL',
+    title: SAVE_KINDS[kind].title,
     defaultPath: path.join(app.getPath('documents'), suggested.replace(/[\\/:*?"<>|]/g, '_')),
-    filters: [{ name: 'STL mesh', extensions: ['stl'] }],
+    filters: SAVE_KINDS[kind].filters,
   });
   if (res.canceled || !res.filePath) return false;
   await writeFile(res.filePath, data);

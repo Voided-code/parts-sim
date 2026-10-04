@@ -67,6 +67,16 @@
     "fileAssociations": [
       {
         "ext": [
+          "psim"
+        ],
+        "name": "Parts Sim file",
+        "description": "Parts Sim part, setup and results",
+        "mimeType": "application/x-parts-sim",
+        "role": "Editor",
+        "rank": "Owner"
+      },
+      {
+        "ext": [
           "sldprt",
           "sldasm"
         ],

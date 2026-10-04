@@ -6,7 +6,7 @@
 //   smoke      scripts/browser-smoke.mjs against the served /app/
 // With no argument all four run. Browser parts need CHROME=<path to Chrome for Testing>.
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -197,11 +197,12 @@ async function checkIsolation() {
 async function checkSmoke() {
   const { server, url } = await serveSite(site);
   try {
-    const r = await new Promise((done) => {
-      const child = spawnSync(process.execPath, [join(root, 'scripts/browser-smoke.mjs')], { stdio: 'inherit', env: { ...process.env, PARTS_SIM_URL: `${url}app/` } });
-      done(child);
+    // spawnSync would block this process, which is serving the site
+    const status = await new Promise((done) => {
+      const child = spawn(process.execPath, [join(root, 'scripts/browser-smoke.mjs')], { stdio: 'inherit', env: { ...process.env, PARTS_SIM_URL: `${url}app/` } });
+      child.on('exit', done);
     });
-    assert.equal(r.status, 0, 'browser-smoke failed against the built /app/');
+    assert.equal(status, 0, 'browser-smoke failed against the built /app/');
   } finally {
     server.close();
   }

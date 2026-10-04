@@ -88,7 +88,7 @@ Only the sections a file needs are present. Sections appear in the order of the 
 
 ### INFO
 
-A JSON object with these keys, in this order (extra keys are allowed and ignored):
+A JSON object with these keys (the order of keys is not significant, and extra keys are allowed and ignored):
 
 ```json
 {
@@ -191,7 +191,7 @@ cannot hold infinity or not-a-number, so these are written as `{"$num":"inf"}`, 
 `{"$num":"nan"}`). Each array entry is:
 
 ```json
-{ "name": "static.vm", "enc": "q16", "n": 31204, "min": 0, "max": 1.2e8, "dims": [63, 40, 30], "bytes": 51234 }
+{ "name": "static.vm", "enc": "q16", "n": 31204, "dims": [63, 40, 30], "min": 0, "max": 1.2e8, "err": 458.2, "bytes": 51234 }
 ```
 
 - `name`: `<study>.<field>`, for example `static.vm`, `thermal.T`, `airflow.cp`, `airflow.avg.ux`.
@@ -203,6 +203,7 @@ cannot hold infinity or not-a-number, so these are written as `{"$num":"inf"}`, 
     `v` becomes `c = 1 + round((v - min) / (max - min) * (L - 2))` with `L = 65536` (`q16`) or `256` (`q8`), and
     `c = 0` means "no value" (NaN or a solid cell). When `max = min`, every finite value is `c = 1`. The error is at most
     `(max - min) / (2 * (L - 2))`. The codes are then predicted and written as zig-zag residuals in byte planes.
+- `err`: written for `q16` and `q8`: the largest error of the array, `(max - min) / (2 * (L - 2))`. Readers may ignore it.
 - `dims`: present for 3-D grids (`nx * ny * nz = n`, x fastest). The prediction is the 3-D Lorenzo predictor
   `p = a[x-1] + a[y-1] + a[z-1] - a[x-1,y-1] - a[x-1,z-1] - a[y-1,z-1] + a[x-1,y-1,z-1]` (missing neighbours count as
   0). Without `dims` the prediction is the previous value. The residual `code - p` is taken modulo `L`, as a signed
@@ -284,3 +285,68 @@ format version, truncated and bit-flipped files, oversized headers, decompressio
 ## Sizes
 
 The measured sizes against binary STL and raw results are in [website-and-psim.md](website-and-psim.md).
+
+### Study result schemas (RFEA)
+
+These are the schemas of the structural studies that `src/ui/studies.js` writes (`exportResult`) and reads (`importResult`).
+`nV` is the part's vertex count, in the vertex order of `GEOM`. Every `meta` has `nVert` (= `nV`); a reader refuses the
+study when it differs from the loaded part, and when an array does not have the stated length. The material is stored
+whole in `meta.material` (an object as in `SETP`); `units` is the model's unit (`mm`, `cm`, `m`, `in`), `diag` the
+bounding-box diagonal in model units. Values in `meta` may be infinite (written as `{"$num":"inf"}`). A key that is
+`null` means "absent". Only what a redraw needs is stored: damage and life (fatigue), the work arrays of the solver, the
+unused principal stress of nonlinear steps and the modal basis of dynamic are not. Linear dynamic (`dynamic`) is not
+stored in version 1.
+
+Lossy fields use `q16` (relative to the range of that array, at most `1/131068` = 7.6e-6 of `max - min`) except the
+topology density, which uses `q8` (at most `1/508` = 0.002 of the density range 0..1). Everything else is exact.
+
+| study | arrays (`enc`, count) | `meta` keys |
+|---|---|---|
+| `nonlinear` | `nonlinear.step.<i>.u` (q16, 3 nV), `nonlinear.step.<i>.vm` (q16, nV, pascal), `nonlinear.step.<i>.pe` (q16, nV, plastic strain, 1 = 100 %) for each load step `i` from 0; the same three as `nonlinear.unloaded.u/.vm/.pe` after spring-back. `u` is in model units. | `units`, `material`, `totalF` (newton, size of all loads), `reason` (`reached`, `collapse`, `rupture`, `crack`, `large deformation`, `time limit`, `step limit`), `engine`, `gpuNote`, `plastic`, `opts` (`large`, `plastic`, `mode`, `steps`), `steps` (a list of `{lam, D, maxVM, maxPE, maxDisp, iterations}`: load factor, load-weighted displacement in model units, maxima in pascal, strain and model units), `unloaded` (the same object, or `null`) |
+| `modal` | `modal.shape.<i>` (q16, 3 nV) for mode `i` from 0. Each shape is scaled so its largest displacement is 1. | `units`, `material`, `diag`, `free` (no fixtures), `converged`, `iterations`, `totalMass` (kg), `engine`, `gpuNote`, `modes` (a list of `{freq, eff}`: hertz and the three effective-mass fractions x y z) |
+| `buckling` | `buckling.shape.<i>` (q16, 3 nV), scaled to a largest displacement of 1. | `units`, `material`, `diag`, `totalF`, `maxVM` (pascal, largest stress under the applied loads), `maxFactor` (largest factor searched, may be infinite), `converged`, `iterations`, `engine`, `gpuNote`, `factors` (list of load factors, infinite when none) |
+| `fatigue` | `fatigue.vm`, `fatigue.p1`, `fatigue.p3` (q16, nV, pascal: von Mises and the largest and smallest principal stress under the applied loads) | `units`, `material`, `totalF`, `engine`, `gpuNote`. The options (`SETP`/view: `loading`, `R`, `cycles`, `finish`, `scale`) are applied again to the stresses, so life, damage and safety factor are recomputed on loading. |
+| `drop` | `drop.vmMax` (q16, nV, pascal, peak over the impact), `drop.times` (f32, `nTimes`, seconds) and `drop.forces` (f32, `nTimes`, newton) for the force chart, and per stored frame `i` from 0: `drop.frame.<i>.u` (q16, 3 nV, model units) and `drop.frame.<i>.vm` (q16, nV, pascal). All frames of the run are kept. | `units`, `material`, `height` (m), `speed` (m/s), `mass` (kg), `peak` (pascal, maximum of `vmMax`), `peakAt` (vertex of the maximum), `peakForce`, `contactTime`, `duration`, `steps`, `dt` (s), `rebounded`, `autoScale` (shape exaggeration that makes the largest movement 5 % of the part), `nTimes`, `peakFrame` (index of the first frame at or after the peak-stress time of `peakAt`), `frameTimes` (seconds, one per frame), `frameForces` (newton), `engine`, `gpuNote` |
+| `optimize`, topology | `optimize.density` (q8, `nx*ny*nz`, `dims` = the voxel grid, x fastest) | `goal` = `topology`, `units`, `material`, `toMeters`, `resolution` (voxels on the longest side: the grid is rebuilt by the voxelizer at this resolution and must give `dims`), `dims`, `history` (a list of `{it, compliance, volume}`), `keptFraction`, `engine`. The shown shape is an iso-surface of the density at the view's `level` and is rebuilt on loading. |
+| `optimize`, sizing | none | `goal` = `sizing`, `units`, `material`, `engine`, `gpuNote`, `base` (`{fos, peak, exact, disp}` of the current design), `rows` (a list of `{id, name, feasible, scale, fos, disp, mass, cost, exact}`; infeasible rows only have `id`, `name`, `feasible`) |
+
+Study options (`opts`) and view settings (`plot`, `step`, `mode`, `frame`, `level`...) are plain JSON in `SETP` and
+`VIEW`; the readers use defaults for missing keys and ignore values of the wrong type.
+
+### Airflow result schema (RAIR)
+
+The section is an arrays container. `meta` keys (all numbers are plain JSON numbers, or `{"$num":...}` for not-a-number
+and infinity; `NaN` is written for a confidence half-width that does not exist yet):
+
+| key | meaning |
+|---|---|
+| `schema` | 1 |
+| `results` | object: `drag`, `lift`, `side`, `frictionDrag` (N), `dragCI`, `liftCI`, `sideCI` (N, 95 % half-widths, `NaN` until averaged), `cd`, `cl`, `cdCI`, `clCI` (dimensionless), `frontalArea` (m², already in SI), `force` (`[x, y, z]` newtons in world axes), `averaged` (bool) |
+| `reynolds` | on the part's larger size across the wind; `reynoldsLength`: on its length along the wind (decides the wall model); `simReynolds`: the value the grid simulates |
+| `nuAir`, `nuLat`, `uLat` | air viscosity (m²/s), lattice viscosity, lattice free-stream speed (0.08) |
+| `wallModel` | bool, turbulent wall model on |
+| `groundGap` | gap under the part in cells, `-1` without a road |
+| `q` | dynamic pressure `0.5 rho U²` (Pa) |
+| `frontal` | frontal area in cells² |
+| `steps`, `samples` | lattice steps run, averaging samples taken |
+| `converged`, `developing` | bools |
+| `mlups`, `engine` | speed of the run, `"WebGPU"` or `"CPU"` |
+| `dims` | tunnel grid `[nx, ny, nz]` (cells); `h`: cell size in model units; `toMeters`: metres per model unit |
+| `factor`, `fieldDims`, `fieldSamples` | coarse view grid: cells per coarse cell side, its size `[ceil(nx/factor), ceil(ny/factor), ceil(nz/factor)]`, number of samples in the stored average |
+| `nVert` | vertices of the part (the length of `airflow.cp`) |
+| `settings` | `dir` (`[x, y, z]` unit vector the air travels), `yaw`, `pitch` (degrees, derived from `dir`), `speed` (m/s), `airDensity` (kg/m³), `ground` (clearance in model units, or `null`), `boundaryLayer` (`auto`, `turbulent`, `laminar`), `cells` (requested), `engine` (requested) |
+
+Arrays, all `q16`:
+
+| name | elements | dims | content |
+|---|---|---|---|
+| `airflow.cp` | `nVert` | none | time-averaged pressure coefficient per part vertex, `Cp = surfaceRho * 1/(3 * 0.5 * uLat²)`; `NaN` (code 0) where the vertex has no wall cell |
+| `airflow.avg.rho` | `fieldDims[0] * fieldDims[1] * fieldDims[2]` | `fieldDims` | time-averaged `rho - 1` per coarse cell (lattice units), x fastest |
+| `airflow.avg.ux`, `.uy`, `.uz` | same | `fieldDims` | time-averaged velocity components in the tunnel frame (lattice units, `uLat` = free stream), x along the wind |
+
+A coarse cell that holds no fluid (solid, or the ground layer) is `NaN` in all four arrays, so its code is `0`. On reading,
+such a cell is the solid marker `rho - 1 = -2` with velocity 0. Only the average is stored; particles move in it too. The
+tunnel frame is planned again on load: `planTunnel(part, dir, any, {margins: "app", ground, h})` with the stored `h` gives the
+same `dims` and origin (the reader checks `dims`), and the fine solid cells for the streamlines and particles come from
+voxelising the part on that grid. Lattice position `p` maps to the model as `x = e1 * (origin0 + h p0) + e2 * (origin1 + h p1) + e3 * (origin2 + h p2)`
+with `e1 = dir`, `e2` = the world up vector (`(0,1,0)`, or `(1,0,0)` when `|dir.y| >= 0.9`) made orthogonal to `e1` and normalised, `e3 = e1 x e2`.
