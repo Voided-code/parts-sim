@@ -504,6 +504,8 @@ export class ThermalPanel {
       return a.data;
     };
     const { frameTimes = [], ...rest } = meta;
+    // files from the native app carry the frame times but no separate history list
+    if (!rest.history && frameTimes.length) rest.history = frameTimes.map((f) => ({ t: f.t, min: f.min, max: f.max }));
     const frames = frameTimes.map((f, i) => ({ i, t: f.t, min: f.min, max: f.max, T: get(`thermal.frame.${i}`) }));
     this.result = { ...rest, T: get('thermal.T'), flux: get('thermal.flux'), frames };
     this.display = 'results';
