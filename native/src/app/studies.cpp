@@ -330,6 +330,85 @@ public:
     bool hasResult() const override { return r_ && !r_->steps.empty(); }
     void clear() override { r_.reset(); view_.playing = false; }
 
+    std::optional<psim::Arrays> exportResult() const override {
+        using namespace pj;
+        if (!r_ || r_->steps.empty()) return std::nullopt;
+        psim::Arrays out;
+        auto stepMeta = [](const NonlinearStep& s) {
+            Value e = jobj();
+            e.obj["lam"] = jnum(s.lam); e.obj["D"] = jnum(s.D); e.obj["maxVM"] = jnum(s.maxVM); e.obj["maxPE"] = jnum(s.maxPE);
+            e.obj["maxDisp"] = jnum(s.maxDisp); e.obj["iterations"] = jnum(s.iterations);
+            return e;
+        };
+        auto put = [&](const std::string& prefix, const NonlinearStep& s) {
+            for (auto [n, data, stride] : {std::tuple<const char*, const std::vector<float>*, uint32_t>{"u", &s.u, 3}, {"vm", &s.vm, 1}, {"pe", &s.pe, 1}}) {
+                psim::Array a;
+                a.name = prefix + "." + n;
+                a.enc = psim::Enc::Q16;
+                a.f = *data;
+                a.stride = stride;
+                out.list.push_back(std::move(a));
+            }
+        };
+        Value m = jobj();
+        m.obj["nVert"] = jnum(part().nVert);
+        m.obj["units"] = jstr(r_->units.toStdString());
+        m.obj["material"] = materialToJson(r_->material);
+        m.obj["totalF"] = jnum(r_->totalF);
+        m.obj["reason"] = jstr(r_->reason.toStdString());
+        m.obj["engine"] = jstr("");
+        m.obj["gpuNote"] = jstr("");
+        m.obj["plastic"] = jbool(o_.plastic);
+        Value opts = jobj();
+        opts.obj["large"] = jbool(o_.large);
+        opts.obj["plastic"] = jbool(o_.plastic);
+        opts.obj["mode"] = jstr(r_->untilFailure ? "failure" : "applied");
+        opts.obj["steps"] = jnum(o_.steps);
+        m.obj["opts"] = opts;
+        Value steps = jarr();
+        for (size_t i = 0; i < r_->steps.size(); i++) {
+            steps.arr.push_back(stepMeta(r_->steps[i]));
+            put("nonlinear.step." + std::to_string(i), r_->steps[i]);
+        }
+        m.obj["steps"] = steps;
+        if (r_->unloaded) { m.obj["unloaded"] = stepMeta(*r_->unloaded); put("nonlinear.unloaded", *r_->unloaded); }
+        else m.obj["unloaded"] = Value{};
+        out.meta = m;
+        return out;
+    }
+    bool canImport() const override { return true; }
+    void importResult(const json::Value& m, const psim::Arrays& arrays) override {
+        using namespace pj;
+        const size_t nV = size_t(part().nVert);
+        if (numOr(m["nVert"], -1) != double(nV)) throw std::runtime_error("The nonlinear result in the file was computed for a different part.");
+        auto load = [&](const Value& e, const std::string& prefix) {
+            NonlinearStep s;
+            s.lam = numOr(e["lam"], 0); s.D = numOr(e["D"], 0); s.maxVM = numOr(e["maxVM"], 0); s.maxPE = numOr(e["maxPE"], 0);
+            s.maxDisp = numOr(e["maxDisp"], 0); s.iterations = int(numOr(e["iterations"], 0));
+            for (auto [n, data, len] : {std::tuple<const char*, std::vector<float>*, size_t>{"u", &s.u, 3 * nV}, {"vm", &s.vm, nV}, {"pe", &s.pe, nV}}) {
+                const psim::Array* a = arrays.find(prefix + "." + n);
+                if (!a || a->f.size() != len) throw std::runtime_error("The nonlinear result in the file does not fit this part.");
+                *data = a->f;
+            }
+            return s;
+        };
+        Result r;
+        for (size_t i = 0; i < m["steps"].arr.size(); i++) r.steps.push_back(load(m["steps"].arr[i], "nonlinear.step." + std::to_string(i)));
+        if (r.steps.empty()) throw std::runtime_error("The nonlinear result in the file has no steps.");
+        if (m["unloaded"].type == Value::Object) { r.unloaded = load(m["unloaded"], "nonlinear.unloaded"); r.unloaded->unloaded = true; }
+        r.material = m["material"].type == Value::Object ? materialFromJson(m["material"]) : app()->material;
+        r.totalF = numOr(m["totalF"], 0);
+        r.units = QString::fromStdString(strOr(m["units"], app()->units.toStdString()));
+        r.reason = QString::fromStdString(strOr(m["reason"]));
+        r.done = true;
+        r.untilFailure = strOr(m["opts"]["mode"]) == "failure";
+        r_ = std::move(r);
+        view_.step = int(r_->steps.size()) - 1;
+        view_.unloaded = false;
+        view_.playing = false;
+        invalidate();
+    }
+
     bool options(QVBoxLayout* l) override {
         const Material& mat = app()->material;
         l->addWidget(heading(tr("NONLINEAR OPTIONS")));
