@@ -85,7 +85,7 @@ export class AirflowPanel {
       this.syncCells();
     });
     $('#btn-flow-run').addEventListener('click', () => this.run());
-    $('#btn-flow-reset').addEventListener('click', () => this.study.reset());
+    $('#btn-flow-reset').addEventListener('click', () => (this.study.frozen ? this.reset() : this.study.reset()));
     const vis = { '#chk-particles': 'particles', '#chk-streamlines': 'streamlines', '#chk-domain': 'domain' };
     for (const [id, key] of Object.entries(vis)) {
       $(id).addEventListener('change', (e) => { this.study.setVisible(key, e.target.checked); this.renderLegends(); });
@@ -207,8 +207,8 @@ export class AirflowPanel {
     if (this.study.running) run.textContent = this.dirty ? 'Apply & restart' : 'Pause';
     else if (this.study.ready && !this.dirty) run.textContent = 'Resume';
     else run.textContent = this.study.ready ? 'Apply & run' : 'Run airflow';
-    $('#btn-flow-reset').disabled = !this.study.ready || this.building;
-    $('#btn-wind-load').disabled = this.dirty || !this.study.results || this.study.developing || !this.study.surface;
+    $('#btn-flow-reset').disabled = !(this.study.ready || this.study.frozen) || this.building;
+    $('#btn-wind-load').disabled = this.dirty || !this.study.results || this.study.developing || !this.study.hasSurface;
   }
 
   async run() {
@@ -305,10 +305,10 @@ export class AirflowPanel {
       $('#flow-notes').textContent = '';
     }
     const phase = !s.steps ? 'starting' : s.developing ? 'developing flow' : s.converged ? `converged (${s.samples} samples)` : `averaging (${s.samples} samples)`;
-    $('#flow-state').textContent = s.ready
+    $('#flow-state').textContent = s.ready || s.frozen
       ? `${this.dirty ? 'Settings changed; apply to update results. ' : ''}${s.engine} · ${s.dims.join('×')} cells · step ${s.steps.toLocaleString()} · ${num(s.mlups || 0)} MLUPS · ${phase}.`
       : '';
-    if (!s.surface) {
+    if (!s.hasSurface) {
       this.cp = null;
       this.cpRange = null;
       if (this.app.tab === 'airflow') this.app.viewer.setScalars(null);
@@ -320,7 +320,7 @@ export class AirflowPanel {
     if (this.app.tab !== 'airflow') return;
     const v = this.app.viewer;
     const s = this.study;
-    if ($('#chk-cp').checked && s.surface) {
+    if ($('#chk-cp').checked && s.hasSurface) {
       if (force || performance.now() - this.lastCp > 900 || !this.cp) {
         this.cp = s.surfaceCp();
         this.lastCp = performance.now();
@@ -350,8 +350,8 @@ export class AirflowPanel {
       });
     }
     const speedShown = (s.fields && ($('#chk-particles').checked || $('#chk-streamlines').checked)) || ($('#chk-slice').checked && s.sliceQuantity === 'speed');
-    if (speedShown && s.ready) specs.push({ title: 'Air speed', sub: 'particles, streamlines, slice', min: 0, max: 1.6 * U, format: (x) => `${num(x)} m/s` });
-    if ($('#chk-slice').checked && s.sliceQuantity === 'pressure' && s.ready) {
+    if (speedShown && (s.ready || s.frozen)) specs.push({ title: 'Air speed', sub: 'particles, streamlines, slice', min: 0, max: 1.6 * U, format: (x) => `${num(x)} m/s` });
+    if ($('#chk-slice').checked && s.sliceQuantity === 'pressure' && (s.ready || s.frozen)) {
       specs.push({ title: 'Slice pressure (Cp)', min: -1.2, max: 1, format: (x) => num(x, 2) });
     }
     renderLegend($('#legend'), specs);
@@ -402,10 +402,98 @@ export class AirflowPanel {
     return `Cp ${num(s, 2)} · ${stress(s * this.study.q)}`;
   }
 
+  /** The settings and display choices, for a .psim file (what the user set, as plain data). */
+  exportState() {
+    return {
+      yaw: this.yaw, pitch: this.pitch,
+      speed: Number($('#wind-speed').value), airDensity: Number($('#air-density').value),
+      ground: $('#chk-ground').checked, groundClearance: Number($('#ground-clearance').value),
+      boundaryLayer: $('#bl-select').value, engine: $('#engine-select').value, cells: this.cells,
+      autoStop: $('#chk-autostop').checked,
+      show: {
+        cp: $('#chk-cp').checked, particles: $('#chk-particles').checked, streamlines: $('#chk-streamlines').checked,
+        domain: $('#chk-domain').checked, slice: $('#chk-slice').checked,
+      },
+      slice: { axis: $('#slice-axis').value, quantity: $('#slice-qty').value, pos: Number($('#slice-pos').value) },
+    };
+  }
+
+  /** Sets the inputs as the user would have; keys that are missing or invalid keep their current value. */
+  importState(state) {
+    if (!state || typeof state !== 'object') return;
+    const fin = (v) => typeof v === 'number' && Number.isFinite(v);
+    const bool = (id, v) => { if (typeof v === 'boolean') $(id).checked = v; };
+    const pick = (id, v) => { if (typeof v === 'string' && [...$(id).options].some((o) => o.value === v)) $(id).value = v; };
+    if (fin(state.yaw)) this.yaw = Math.max(-180, Math.min(180, Math.round(state.yaw)));
+    if (fin(state.pitch)) this.pitch = Math.max(-90, Math.min(90, Math.round(state.pitch)));
+    if (fin(state.speed) && state.speed > 0) $('#wind-speed').value = state.speed;
+    if (fin(state.airDensity) && state.airDensity > 0) $('#air-density').value = state.airDensity;
+    bool('#chk-ground', state.ground);
+    $('#ground-controls').hidden = !$('#chk-ground').checked;
+    if (fin(state.groundClearance) && state.groundClearance >= 0) $('#ground-clearance').value = state.groundClearance;
+    pick('#bl-select', state.boundaryLayer);
+    pick('#engine-select', state.engine);
+    if (fin(state.cells) && state.cells > 0) this.cells = state.cells;
+    bool('#chk-autostop', state.autoStop);
+    this.study.autoStop = $('#chk-autostop').checked;
+    const sh = state.show && typeof state.show === 'object' ? state.show : {};
+    bool('#chk-cp', sh.cp); bool('#chk-particles', sh.particles); bool('#chk-streamlines', sh.streamlines);
+    bool('#chk-domain', sh.domain); bool('#chk-slice', sh.slice);
+    $('#slice-controls').hidden = !$('#chk-slice').checked;
+    const sl = state.slice && typeof state.slice === 'object' ? state.slice : {};
+    pick('#slice-axis', sl.axis);
+    pick('#slice-qty', sl.quantity);
+    if (fin(sl.pos)) $('#slice-pos').value = Math.max(0, Math.min(100, sl.pos));
+    $('#slice-pos-out').textContent = `${$('#slice-pos').value}%`;
+    this.study.sliceAxis = $('#slice-axis').value;
+    this.study.sliceQuantity = $('#slice-qty').value;
+    this.study.slicePos = Number($('#slice-pos').value) / 100;
+    this.syncWind();
+    this.syncCells();
+  }
+
+  /**
+   * Imports a stored result into the study (frozen) and draws everything a finished run shows. The part
+   * must be loaded and its setup (importState) applied first.
+   */
+  async loadResults(meta, arrays, state = null) {
+    if (state) this.importState(state);
+    this.operation++;
+    this.building = true;
+    this.updateButtons();
+    try { await this.study.importResults(meta, arrays, this.app.part); }
+    finally { this.building = false; }
+    this.showLoaded();
+  }
+
+  /** Draws the frozen study as a finished run: results card, Cp colouring and legend, slice, streamlines, particles. */
+  showLoaded() {
+    const s = this.study;
+    if (!s.frozen) return;
+    this.dirty = false;
+    this.cp = null;
+    this.cpRange = null;
+    $('#ground-unit').textContent = this.app.units;
+    $('#flow-card').hidden = false;
+    $('#flow-display').hidden = false;
+    s.setVisible('domain', $('#chk-domain').checked);
+    s.show.particles = $('#chk-particles').checked;
+    s.show.streamlines = $('#chk-streamlines').checked;
+    s.show.slice = $('#chk-slice').checked;
+    if (s.particles) s.particles.visible = s.show.particles;
+    s.updateSlice();
+    s.buildStreamlines();
+    if (this.app.tab === 'airflow') s.setGroupVisible(true);
+    this.updateCellsInfo();
+    this.update();
+    this.applyColoring(true);
+    this.renderLegends();
+  }
+
   useAsLoad() {
     const s = this.study;
     if (this.dirty) return this.app.status('Apply the changed airflow settings before transferring the wind load.', 'warn');
-    if (!s.results || !s.surface) return this.app.status('Run the airflow first.', 'error');
+    if (!s.results || !s.hasSurface) return this.app.status('Run the airflow first.', 'error');
     if (s.developing) return this.app.status('The flow is still developing - wait until it says “averaging”, then try again.', 'warn');
     const F = s.triangleForces();
     const net = new THREE.Vector3();

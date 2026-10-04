@@ -170,6 +170,8 @@ export class AirflowStudy {
     this.group.matrixAutoUpdate = false;
     viewer.flowGroup.add(this.group);
     this.running = false;
+    this.frozen = false; // results loaded from a file (importResults), no solver
+    this.frozenCp = null;
     this.generation = 0;
     this.runGeneration = 0;
     this.show = { particles: true, streamlines: false, slice: false, domain: true };
@@ -183,6 +185,11 @@ export class AirflowStudy {
 
   get ready() {
     return !!this.sim && !this.initializing;
+  }
+
+  /** True when there is a surface pressure to colour the part with (live, or loaded from a file). */
+  get hasSurface() {
+    return !!this.surface || !!this.frozenCp;
   }
 
   ensureCurrent(generation) {
@@ -581,6 +588,7 @@ export class AirflowStudy {
   /** Time-averaged pressure coefficient at every part vertex (NaN where unavailable). */
   surfaceCp() {
     const part = this.part;
+    if (this.frozenCp) return Float32Array.from(this.frozenCp);
     const out = new Float32Array(part.nVert).fill(NaN);
     if (!this.surface || !this.vertexRecords) return out;
     const inv = 1 / (3 * 0.5 * U_LAT * U_LAT);
@@ -592,9 +600,8 @@ export class AirflowStudy {
   }
 
   /** Aerodynamic pressure force on each part triangle (N, world) for the structural study. */
-  triangleForces() {
+  triangleForces(cp = this.surfaceCp()) {
     const part = this.part;
-    const cp = this.surfaceCp();
     const F = new Float32Array(3 * part.nTri);
     const a2 = this.opts.toMeters * this.opts.toMeters;
     for (let t = 0; t < part.nTri; t++) {
@@ -609,6 +616,148 @@ export class AirflowStudy {
       for (let d = 0; d < 3; d++) F[3 * t + d] = -pa * A * part.triNormal[3 * t + d];
     }
     return F;
+  }
+
+  // ---------- saving and loading results (.psim, RAIR section) ----------
+
+  /**
+   * The result in the form the file stores it: {meta, arrays}, or null when there is nothing to save yet.
+   * arrays: [{name, data, enc: 'q16', dims?}] for encodeArrays (src/core/psim.js). Only the time-averaged
+   * coarse flow is stored; the slice, the streamlines and (on load) the particles are drawn from it.
+   */
+  exportResults() {
+    const r = this.results, fl = this.fields;
+    if (!r || !fl || !fl.avg || !this.part) return null;
+    const o = this.opts, d = o.dir;
+    const num = (v) => (Number.isFinite(v) ? v : NaN);
+    const meta = {
+      schema: 1,
+      results: {
+        drag: r.drag, lift: r.lift, side: r.side, dragCI: r.dragCI, liftCI: r.liftCI, sideCI: r.sideCI,
+        frictionDrag: r.frictionDrag, cd: r.cd, cl: r.cl, cdCI: r.cdCI, clCI: r.clCI,
+        frontalArea: r.frontalArea, force: [r.force.x, r.force.y, r.force.z], averaged: !!r.averaged,
+      },
+      reynolds: this.reynolds, reynoldsLength: this.reynoldsLength, simReynolds: this.simReynolds,
+      nuAir: this.nuAir, nuLat: this.nuLat, uLat: U_LAT,
+      wallModel: !!this.wallModel, groundGap: this.groundGap, q: this.q, frontal: this.frontal,
+      steps: this.steps, samples: this.samples, converged: !!this.converged, developing: !!this.developing,
+      mlups: num(this.mlups) || 0, engine: this.engine,
+      dims: [...this.dims], h: this.h, factor: fl.factor, fieldDims: [...fl.dims], fieldSamples: fl.samples ?? 0,
+      toMeters: o.toMeters, nVert: this.part.nVert,
+      settings: {
+        dir: [d.x, d.y, d.z],
+        yaw: (Math.atan2(d.x, -d.z) * 180) / Math.PI, pitch: (Math.asin(Math.max(-1, Math.min(1, d.y))) * 180) / Math.PI,
+        speed: o.speed, airDensity: o.airDensity, ground: Number.isFinite(o.ground) && o.ground >= 0 ? o.ground : null,
+        boundaryLayer: o.boundaryLayer || 'auto', cells: o.cells ?? null, engine: o.engine ?? null,
+      },
+    };
+    const n = fl.dims[0] * fl.dims[1] * fl.dims[2];
+    const avg = fl.avg;
+    const soa = [0, 1, 2, 3].map(() => new Float32Array(n));
+    for (let c = 0; c < n; c++) {
+      if (avg[4 * c] === -2) { for (let k = 0; k < 4; k++) soa[k][c] = NaN; continue; }
+      for (let k = 0; k < 4; k++) soa[k][c] = avg[4 * c + k];
+    }
+    const dims = [...fl.dims];
+    const arrays = [{ name: 'airflow.cp', data: this.surfaceCp(), enc: 'q16' }];
+    ['rho', 'ux', 'uy', 'uz'].forEach((k, i) => arrays.push({ name: `airflow.avg.${k}`, data: soa[i], enc: 'q16', dims }));
+    return { meta, arrays };
+  }
+
+  /**
+   * Shows a stored result without a solver: a "frozen" study (frozen = true). `arrays` is the Map of
+   * decodeArrays (name -> {data}), an object of name -> typed array, or a list of {name, data}. The tunnel
+   * plan is planned again from the part with the stored cell size (deterministic), and the solid cells for the
+   * particles and streamlines come from buildFlowGrid's voxelisation (the same code as a live run, without
+   * the wall rays and without the solver). Particles move in the stored time-averaged field.
+   * Call showLoaded() on the panel afterwards. Run airflow sets the study up fresh and clears the flag.
+   */
+  async importResults(meta, arrays, part = this.part) {
+    const bad = (m) => { throw new Error(`The stored airflow result is not usable: ${m}.`); };
+    if (!part) bad('no part to show it on');
+    if (!meta || typeof meta !== 'object' || !meta.results || !meta.settings) bad('the header is incomplete');
+    const pos = (v) => Number.isFinite(v) && v > 0;
+    const st = meta.settings;
+    const dir = new THREE.Vector3(...(Array.isArray(st.dir) ? st.dir : []));
+    if (![dir.x, dir.y, dir.z].every(Number.isFinite) || dir.lengthSq() === 0) bad('the wind direction');
+    if (!pos(st.speed) || !pos(st.airDensity) || !pos(meta.toMeters) || !pos(meta.h)) bad('speed, density or scale');
+    const ok3 = (a, big) => Array.isArray(a) && a.length === 3 && a.every((v) => Number.isInteger(v) && v >= 1 && v <= big);
+    if (!ok3(meta.dims, 1e5) || !ok3(meta.fieldDims, 1e5)) bad('the grid sizes');
+    const N = meta.dims[0] * meta.dims[1] * meta.dims[2];
+    if (N > FLOW_CELLS.gpuMax) bad('the grid is too large');
+    if (!Number.isInteger(meta.factor) || meta.factor < 1) bad('the coarse factor');
+    if (!meta.dims.every((v, i) => meta.fieldDims[i] === Math.ceil(v / meta.factor))) bad('the coarse grid does not fit the tunnel');
+    if (meta.nVert !== part.nVert) bad('it was computed for a different part');
+    const f = meta.results;
+    if (!Array.isArray(f.force) || f.force.length !== 3) bad('the force vector');
+    const get = (name) => {
+      let a = arrays instanceof Map ? arrays.get(name) : Array.isArray(arrays) ? arrays.find((x) => x.name === name) : arrays?.[name];
+      if (a && !ArrayBuffer.isView(a)) a = a.data;
+      if (!a || !ArrayBuffer.isView(a)) bad(`the array ${name} is missing`);
+      return a;
+    };
+    const cp = get('airflow.cp');
+    if (cp.length !== part.nVert) bad('the pressure array does not match the part');
+    const nc = meta.fieldDims[0] * meta.fieldDims[1] * meta.fieldDims[2];
+    const comp = ['rho', 'ux', 'uy', 'uz'].map((k) => {
+      const a = get(`airflow.avg.${k}`);
+      if (a.length !== nc) bad(`the array airflow.avg.${k} has the wrong length`);
+      return a;
+    });
+
+    this.dispose(false);
+    const generation = this.generation;
+    const ground = Number.isFinite(st.ground) && st.ground >= 0 ? st.ground : null;
+    // the plan again, with the stored cell size: the same dims and origin as the run had
+    const plan = planTunnel(part, dir, 0, { margins: 'app', ground, h: meta.h });
+    if (!plan.dims.every((v, i) => v === meta.dims[i])) bad('the tunnel no longer matches the part');
+    const { basis, min, max, dims, h, origin } = plan;
+    this.onStatus('Preparing the loaded airflow result...');
+    await new Promise((r) => setTimeout(r, 0));
+    this.ensureCurrent(generation);
+    const full = buildFlowGrid(plan, part.tris, { voxelize });
+    this.ensureCurrent(generation);
+
+    this.part = part;
+    this.opts = { dir, speed: st.speed, airDensity: st.airDensity, cells: st.cells ?? undefined, engine: st.engine ?? undefined, toMeters: meta.toMeters, ground, boundaryLayer: st.boundaryLayer || 'auto' };
+    Object.assign(this, { plan, basis, h, dims, origin });
+    this.N = N;
+    this.grid = { dims, N, kind: full.kind }; // the cell kinds are all the redraws need
+    this.partRange = [
+      [(min[1] - origin[1]) / h, (max[1] - origin[1]) / h],
+      [(min[2] - origin[2]) / h, (max[2] - origin[2]) / h],
+    ];
+    this.hm = h * meta.toMeters;
+    Object.assign(this, {
+      nuAir: meta.nuAir, nuLat: meta.nuLat, reynolds: meta.reynolds, reynoldsLength: meta.reynoldsLength, simReynolds: meta.simReynolds,
+      wallModel: !!meta.wallModel, q: meta.q, frontal: meta.frontal, groundGap: meta.groundGap,
+      engine: meta.engine, steps: meta.steps, samples: meta.samples, converged: !!meta.converged, developing: !!meta.developing,
+      mlups: meta.mlups || 0, series: null,
+    });
+    this.results = {
+      drag: f.drag, lift: f.lift, side: f.side, dragCI: f.dragCI, liftCI: f.liftCI, sideCI: f.sideCI,
+      frictionDrag: f.frictionDrag, cd: f.cd, cl: f.cl, cdCI: f.cdCI, clCI: f.clCI, frontalArea: f.frontalArea,
+      force: new THREE.Vector3(...f.force), averaged: !!f.averaged,
+    };
+    const avg = new Float32Array(4 * nc);
+    for (let c = 0; c < nc; c++) {
+      if (Number.isNaN(comp[0][c])) { avg[4 * c] = -2; continue; }
+      for (let k = 0; k < 4; k++) avg[4 * c + k] = comp[k][c];
+    }
+    // the particles move in the averaged field too: no instantaneous field is stored
+    this.fields = { dims: [...meta.fieldDims], factor: meta.factor, inst: avg, avg, samples: meta.fieldSamples ?? 0 };
+    this.frozenCp = Float32Array.from(cp);
+    this.surface = null;
+    this.frozen = true;
+    const M = new THREE.Matrix4().makeBasis(basis[0], basis[1], basis[2])
+      .multiply(new THREE.Matrix4().makeTranslation(origin[0], origin[1], origin[2]))
+      .multiply(new THREE.Matrix4().makeScale(h, h, h));
+    this.group.matrix.copy(M);
+    this.group.matrixWorldNeedsUpdate = true;
+    this.buildDomainBox();
+    this.initParticles();
+    this.onStatus('Loaded airflow result shown (not computed here).');
+    this.onUpdate();
   }
 
   // ---------- visuals ----------
@@ -857,6 +1006,8 @@ export class AirflowStudy {
     this.samples = 0;
     this.steps = 0;
     this.mlups = 0;
+    this.frozen = false;
+    this.frozenCp = null;
     if (full) {
       this.unsubFrame();
       this.viewer.flowGroup.remove(this.group);
