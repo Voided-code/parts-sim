@@ -312,8 +312,54 @@ void AirflowSim::createSolver(const flow::Grid& grid) {
     }
 }
 
+void AirflowSim::loadFrozen(std::shared_ptr<const Part> p, const AirflowOptions& o, FrozenResult f) {
+    stopThread();
+    solver_.reset();
+    frozen = false;
+    if (!p || !(f.h > 0) || !(o.toMeters > 0) || !(dot(o.dir, o.dir) > 0)) throw std::runtime_error("The stored airflow result is not usable: speed, density or scale.");
+    if (f.cp.size() != size_t(p->nVert)) throw std::runtime_error("The stored airflow result is not usable: the pressure array does not match the part.");
+    TunnelOptions to;
+    to.h = f.h;
+    to.ground = o.ground;
+    const TunnelPlan plan = planTunnel(*p, o.dir, 0, to);
+    if (plan.dims != f.dims) throw std::runtime_error("The stored airflow result is not usable: the tunnel no longer matches the part.");
+    for (int a = 0; a < 3; a++)
+        if (f.fields.dims[a] != (f.dims[a] + f.fields.factor - 1) / f.fields.factor) throw std::runtime_error("The stored airflow result is not usable: the coarse grid does not fit the tunnel.");
+    flow::Grid grid = flow::buildGrid(plan.spec(), plan.q, p->tris);
+    part = std::move(p);
+    opts = o;
+    basis = plan.basis;
+    dims = plan.dims;
+    h = plan.h;
+    origin = plan.origin;
+    kind = std::move(grid.kind);
+    partRange = {{{(plan.mn[1] - origin[1]) / h, (plan.mx[1] - origin[1]) / h}, {(plan.mn[2] - origin[2]) / h, (plan.mx[2] - origin[2]) / h}}};
+    hm_ = h * o.toMeters;
+    nuAir = f.nuAir; nuLat = f.nuLat; reynolds = f.reynolds; reynoldsLength = f.reynoldsLength; simReynolds = f.simReynolds;
+    wallModel = f.wallModel; groundGap = f.groundGap; engine = f.engine;
+    q_ = f.q; frontal_ = f.frontal;
+    records = 0;
+    useGPU_ = false;
+    frozenCp_ = std::move(f.cp);
+    f.fields.inst = f.fields.avg;
+    auto snap = std::make_shared<AirSnapshot>();
+    snap->fields = std::make_shared<const flow::Fields>(std::move(f.fields));
+    snap->surface = std::make_shared<const std::vector<float>>();  // non-null marks "pressure available"
+    snap->steps = f.steps;
+    snap->samples = snap->fields->samples;
+    snap->mlups = f.mlups;
+    snap->developing = f.developing;
+    snap->converged = f.converged;
+    snap->results = f.results;
+    frozen = true;
+    {
+        std::lock_guard<std::mutex> lock(snapMutex_);
+        snap_ = snap;
+    }
+}
+
 void AirflowSim::start() {
-    if (!solver_ || running_) return;
+    if (!solver_ || running_ || frozen) return;
     stopThread();
     running_ = true;
     converged_ = false;
@@ -577,6 +623,7 @@ bool AirflowSim::isSolidAt(double x, double y, double z) const {
 }
 
 std::vector<float> AirflowSim::surfaceCp(const AirSnapshot& s) const {
+    if (frozen) return frozenCp_;
     const Part& p = *part;
     std::vector<float> out(p.nVert, std::numeric_limits<float>::quiet_NaN());
     if (!s.surface) return out;

@@ -97,8 +97,11 @@ psim::File MainWindow::gatherPsim(const PsimSaveOptions& o, QStringList* resultI
     std::vector<std::pair<QString, psim::Arrays>> results;
     if (auto r = structural->exportStatic()) results.push_back({"static", std::move(*r)});
     if (auto r = thermal->exportResult()) results.push_back({"thermal", std::move(*r)});
-    if (resultIds)
+    std::optional<psim::Arrays> air = airflow->exportResults();
+    if (resultIds) {
         for (auto& r : results) *resultIds << r.first;
+        if (air) *resultIds << "airflow";
+    }
     Value rlist = jarr();
     psim::Arrays rfea;
     rfea.meta = jobj();
@@ -108,6 +111,10 @@ psim::File MainWindow::gatherPsim(const PsimSaveOptions& o, QStringList* resultI
         rfea.meta.obj[id.toStdString()] = r.meta;
         for (auto& a : r.list) rfea.list.push_back(std::move(a));
     }
+    if (air && (o.allResults || o.results.contains("airflow"))) {
+        rlist.arr.push_back(jstr("airflow"));
+        f.rair = std::move(*air);
+    }
     rfea.meta.obj["results"] = rlist;
     if (o.setup)
         for (auto& a : structural->windArrays()) rfea.list.push_back(std::move(a));
@@ -116,7 +123,13 @@ psim::File MainWindow::gatherPsim(const PsimSaveOptions& o, QStringList* resultI
     contains.obj["setup"] = jbool(o.setup);
     contains.obj["results"] = rlist;
     contains.obj["cad"] = jbool(false);
-    if (!rlist.arr.empty() || !rfea.list.empty()) f.rfea = std::move(rfea);
+    // RFEA lists only the studies it holds
+    {
+        Value rl = jarr();
+        for (const auto& x : rlist.arr) if (x.str != "airflow") rl.arr.push_back(x);
+        rfea.meta.obj["results"] = rl;
+        if (!rl.arr.empty() || !rfea.list.empty()) f.rfea = std::move(rfea);
+    }
 
     if (o.cad && !sourceBytes.isEmpty()) {
         f.cad = psim::Bytes(sourceBytes.begin(), sourceBytes.end());
@@ -132,6 +145,7 @@ psim::File MainWindow::gatherPsim(const PsimSaveOptions& o, QStringList* resultI
         s.obj["material"] = materialToJson(material);
         s.obj["structural"] = structural->exportSetup();
         s.obj["thermal"] = thermal->exportState();
+        s.obj["airflow"] = airflow->exportState();
         f.setup = s;
     }
     if (o.setup || !rlist.arr.empty()) {
@@ -203,6 +217,7 @@ void MainWindow::showSaveDialog() {
             resSize[id] = double(deflated(psim::encodeArrays(one.meta, one.list)));
         }
     }
+    if (draft.rair) resSize["airflow"] = double(deflated(psim::encodeArrays(draft.rair->meta, draft.rair->list)));
     QDialog d(this);
     d.setWindowTitle(tr("Save as .psim"));
     auto* v = new QVBoxLayout(&d);
@@ -353,6 +368,13 @@ bool MainWindow::openPsim(const QString& path) {
             else problems << labelOf(id) + ": this version cannot show it yet";
         }
     }
+    if (f.rair) guard("airflow", [&] {
+        const Value& a = f.rair->meta["results"];
+        const Value* st = setup["airflow"].type == Value::Object ? &setup["airflow"] : nullptr;
+        airflow->loadResults(f.rair->meta, *f.rair, st);
+        lf.stored["airflow"] = {{"drag", numOr(a["drag"], NAN)}, {"lift", numOr(a["lift"], NAN)}, {"cd", numOr(a["cd"], NAN)}, {"cl", numOr(a["cl"], NAN)}};
+    });
+    else if (setup["airflow"].type == Value::Object) guard("airflow setup", [&] { airflow->importState(setup["airflow"]); });
     const Value view = f.view ? *f.view : Value{};
     guard("view", [&] {
         structural->importView(view["structural"]);
@@ -371,7 +393,7 @@ bool MainWindow::openPsim(const QString& path) {
     });
     const bool hasResults = !lf.stored.empty();
     const QString tabWanted = QString::fromStdString(strOr(view["tab"]));
-    setTab(QStringList{"part", "structural", "thermal", "airflow"}.contains(tabWanted) ? tabWanted : lf.stored.count("thermal") && !lf.stored.count("static") ? "thermal" : hasResults ? "structural" : "part");
+    setTab(QStringList{"part", "structural", "thermal", "airflow"}.contains(tabWanted) ? tabWanted : lf.stored.count("airflow") ? "airflow" : lf.stored.count("thermal") && !lf.stored.count("static") ? "thermal" : hasResults ? "structural" : "part");
     lf.hasResults = hasResults;
     lf.hasSetup = f.setup.has_value();
     loadedFile = lf;
@@ -422,7 +444,7 @@ void MainWindow::rerunLoaded() {
     loadedFile->rerun = true;
     banner_->hide();
     if (currentTab_ == "thermal") thermal->run();
-    else if (currentTab_ == "airflow") airflow->run();
+    else if (currentTab_ == "airflow") airflow->rerun();
     else structural->runStudy();
 }
 
