@@ -1,0 +1,85 @@
+# Builds the website (scripts/build-site.mjs) and deploys it to GitHub Pages.
+# Deploys only from main: pushes to main that touch the site, the docs or the web app, a manual run
+# on main, and a published release (which starts a run on main, because Pages rejects deployments
+# from a tag). Linux runners only; the pull-request run builds and checks but never deploys.
+name: Site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'docs/**'
+      - 'src/**'
+      - 'index.html'
+      - 'vite.config.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/build-site.mjs'
+      - 'scripts/lib/markdown.mjs'
+      - 'install.sh'
+      - '.github/workflows/site.yml'
+  pull_request:
+    paths:
+      - 'site/**'
+      - 'docs/**'
+      - 'scripts/build-site.mjs'
+      - 'scripts/lib/markdown.mjs'
+      - '.github/workflows/site.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # a release event runs on the tag, which Pages will not deploy: start the same workflow on main
+  from-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Run the site workflow on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run site.yml --ref main --repo "$GITHUB_REPOSITORY"
+
+  build:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build the site from the latest release's real files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/build-site.mjs
+      - name: Check the links
+        run: node scripts/site-check.mjs links
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    # never from a pull request or any branch but main
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

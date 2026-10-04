@@ -1,0 +1,58 @@
+<section class="hero" aria-labelledby="top">
+  <div>
+    <h1 id="top">Parts Sim</h1>
+    <p class="lead">Open-source structural, thermal and airflow simulation for your CAD parts.</p>
+    <p>Open a SolidWorks, STEP, IGES, STL or OBJ part, click the faces you want to hold and push, and see where it
+    bends most and where it breaks first. The same setup runs linear and nonlinear static, frequency, buckling,
+    fatigue, drop test, linear dynamic and optimization studies, plus steady and transient heat transfer. You can also put
+    the part in a virtual wind tunnel and turn the aerodynamic pressure into a structural load. Everything runs on your
+    machine; nothing is uploaded.</p>
+    <div class="actions">
+      <a class="btn primary" href="{{root}}app/">Try it in your browser</a>
+      <a class="btn" href="{{root}}download/">Download</a>
+    </div>
+    <p class="notice" id="gpu-note" role="status" hidden></p>
+    <p>The browser version needs a modern browser (Chrome or Edge 113 or newer, Safari 26 or newer) for the GPU path.
+    Without WebGPU it still opens and uses the CPU, with a smaller airflow grid.</p>
+  </div>
+  <img src="{{root}}images/bend-test.jpg" width="1400" height="860" alt="Von Mises stress plotted in rainbow colours on a bolted aluminium bracket, with the fixed support and the load arrow shown.">
+</section>
+
+<h2>What it does</h2>
+<div class="shots">
+  <figure><img src="{{root}}images/break-test.jpg" width="1400" height="860" loading="lazy" alt="A 3D-printed bracket with a crack grown from its weakest point."><figcaption>Break test: where a crack starts and how it runs through a PLA bracket.</figcaption></figure>
+  <figure><img src="{{root}}images/airflow.jpg" width="1400" height="860" loading="lazy" alt="Surface pressure and a wake of streamlines behind a car body in a virtual wind tunnel."><figcaption>Airflow: surface pressure and the wake of a car body.</figcaption></figure>
+</div>
+<ul class="features">
+  <li><strong>Opens SolidWorks parts and assemblies</strong> without SolidWorks, plus STEP, IGES, BREP, STL, OBJ, 3MF, PLY and GLB.</li>
+  <li><strong>Structural studies:</strong> linear and nonlinear static, frequency, buckling, fatigue, drop test, linear dynamic, topology and material optimization, with SolidWorks-style colour plots.</li>
+  <li><strong>Break test:</strong> progressive damage that shows where a crack starts and the load it takes to grow.</li>
+  <li><strong>Thermal:</strong> fixed temperatures, heat inputs and convection; steady state or over time.</li>
+  <li><strong>Airflow:</strong> a 3D lattice-Boltzmann wind tunnel with drag, lift, Cd and frontal area, and a one-click wind load for the bend test.</li>
+  <li><strong>Runs on the GPU</strong> through WebGPU where there is one, and falls back to the CPU.</li>
+  <li><strong>Seven sample parts</strong> with ready-made setups, from a beam to the Ahmed car body.</li>
+  <li><strong>Private:</strong> no account, no upload, no analytics. This site has no trackers and loads nothing from other sites.</li>
+</ul>
+
+<h2>How accurate is the airflow?</h2>
+<div class="panel">
+{{accuracy}}
+<p><a href="{{root}}docs/airflow-accuracy.html">Read the full accuracy page</a>, with every number and its reference.</p>
+</div>
+
+<h2>Honest limits</h2>
+<ul>
+  <li>Parts Sim is a design-comparison and learning tool, not a certified analysis.</li>
+  <li>Stresses at fixture edges and point loads are singular, as in any FEA.</li>
+  <li>The airflow grid is uniform and holds a few tens of millions of cells at most, so thin boundary layers are modelled, not resolved.</li>
+  <li>SolidWorks files are read from their cached display mesh, not the exact Parasolid geometry. Files from SolidWorks 2014 or older do not open.</li>
+  <li>The downloads are not code-signed yet, so the first launch needs one extra click (<a href="{{root}}download/">details</a>).</li>
+</ul>
+<p>The full list is in the <a href="https://github.com/Voided-code/parts-sim#limitations">README</a>.</p>
+
+<h2>Get it</h2>
+<div class="actions">
+  <a class="btn primary" href="{{root}}download/">Download for macOS, Windows or Linux</a>
+  <a class="btn" href="{{root}}app/">Open the web app</a>
+  <a class="btn" href="https://github.com/Voided-code/parts-sim">Source code (MIT licence)</a>
+</div>

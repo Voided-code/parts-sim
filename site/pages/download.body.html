@@ -1,0 +1,23 @@
+<h1>Download Parts Sim</h1>
+<p class="lead">Version {{version}}. Pick the file for your system. <a href="https://github.com/Voided-code/parts-sim/releases">Earlier versions</a> stay on GitHub.</p>
+
+<div class="panel">
+  <h3>Which one?</h3>
+  <p><strong>Native app</strong> (C++ and Qt): the fastest option. Its CPU solvers run about ten times faster than the Electron app&rsquo;s, and its airflow uses the GPU through Metal, Direct3D 12 or Vulkan.</p>
+  <p><strong>Desktop app (Electron)</strong>: the same app as the web page in a desktop shell. It has native menus, Open With from Finder or Explorer, and opens files from the command line. Its GPU path is whatever Chromium picks.</p>
+  <p>Both run the same studies. If unsure, take the native app where one is listed for your system.</p>
+  <h3>First launch</h3>
+  <p>The downloads are not code-signed yet. On <strong>macOS</strong>, right-click the app, choose <strong>Open</strong>, then confirm. On <strong>Windows</strong>, choose <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+</div>
+
+<div id="dl-holder">{{downloads}}</div>
+<p class="note" id="dl-source">Read from the release list built into this page.</p>
+<noscript><p>Your system is not detected without JavaScript, so all systems are listed.</p></noscript>
+
+<h2>Build from source</h2>
+<div class="cards">{{source}}</div>
+
+<h2>Checking a download</h2>
+<p>Every card shows the file&rsquo;s SHA-256 and the command that prints it on your system. The two must match. GitHub also shows a digest next to each file on the release page.</p>
+<p>The page asks <code>api.github.com</code> for the latest release when it opens, so the buttons follow what exists. Nothing else leaves your browser.</p>
+<script type="module" src="{{root}}download.js"></script>

@@ -1,0 +1,92 @@
+{
+  "version": "0.6.0",
+  "tag": "v0.6.0",
+  "releaseUrl": "https://github.com/Voided-code/parts-sim/releases/tag/v0.6.0",
+  "publishedAt": "2026-09-28T11:03:46Z",
+  "assets": [
+    {
+      "name": "Parts-Sim-0.6.0-native-Darwin-arm64.dmg",
+      "size": 42648964,
+      "digest": "sha256:2d3707b951e8cb7111368c27cfc58b03ca4b7a75b7aef8463ac8b4af614eeed1",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts-Sim-0.6.0-native-Darwin-arm64.dmg"
+    },
+    {
+      "name": "Parts-Sim-0.6.0-native-Linux-x86_64.AppImage",
+      "size": 54684152,
+      "digest": "sha256:12b281e6362a6eb679c58bcd5b2bdd545377c8297bee3c0f18ef1189ef243c79",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts-Sim-0.6.0-native-Linux-x86_64.AppImage"
+    },
+    {
+      "name": "Parts-Sim-0.6.0-native-Windows-AMD64.exe",
+      "size": 62843980,
+      "digest": "sha256:d576cad883c3e481f44587d4cb2ff5a08c6f5bc03963c4fb1c60bfcf8dbc166a",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts-Sim-0.6.0-native-Windows-AMD64.exe"
+    },
+    {
+      "name": "Parts-Sim-0.6.0-native-Windows-AMD64.zip",
+      "size": 76859449,
+      "digest": "sha256:a74d09b26e7bf8bb66bb168702c786a98a828e6ff7bc9a47e8e3da8384a9608c",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts-Sim-0.6.0-native-Windows-AMD64.zip"
+    },
+    {
+      "name": "Parts-Sim-0.6.0-SHA256SUMS.txt",
+      "size": 1253,
+      "digest": "sha256:d29c4f3dbb8dcac7ba03ace37bf632f08243641c0851fcdb7cf5defcf0e2c60d",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts-Sim-0.6.0-SHA256SUMS.txt"
+    },
+    {
+      "name": "parts-sim-0.6.0.tar.gz",
+      "size": 122400236,
+      "digest": "sha256:7bef8026faeb53db0d454706bc82230cedbbd475743dd87204a3277077e2ceb0",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/parts-sim-0.6.0.tar.gz"
+    },
+    {
+      "name": "Parts.Sim-0.6.0-arm64-mac.zip",
+      "size": 130382645,
+      "digest": "sha256:a575f4e55a147e973eed5d81fdbcea1a9ecddcca7b78bb741056d9995d908aa0",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0-arm64-mac.zip"
+    },
+    {
+      "name": "Parts.Sim-0.6.0-arm64-win.zip",
+      "size": 154660063,
+      "digest": "sha256:fe1fb1ed1739aeb3055a7cfb79dab8d0236c6e3ba4e903284733bddb7d1fc773",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0-arm64-win.zip"
+    },
+    {
+      "name": "Parts.Sim-0.6.0-arm64.dmg",
+      "size": 130611796,
+      "digest": "sha256:5948b1cd6d73d3dbc0a3b8c800b9983473944e0af8abdb6a2152c213c353f512",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0-arm64.dmg"
+    },
+    {
+      "name": "Parts.Sim-0.6.0-mac.zip",
+      "size": 137194986,
+      "digest": "sha256:4b7fab5a2363ce880d7634e8f6c1c0eeef50fb6e2c195ab09f1ed6ab9b3c31c1",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0-mac.zip"
+    },
+    {
+      "name": "Parts.Sim-0.6.0-win.zip",
+      "size": 156522823,
+      "digest": "sha256:ab0cfdf74599c596d5e079e9e53982c31830ba2d6f22561cde5b1ff2752d2e1a",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0-win.zip"
+    },
+    {
+      "name": "Parts.Sim-0.6.0.AppImage",
+      "size": 128680097,
+      "digest": "sha256:f9d61d361ef27b6d73452217d818083db88decc152d86e69ed92d370b3052233",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0.AppImage"
+    },
+    {
+      "name": "Parts.Sim-0.6.0.dmg",
+      "size": 137404469,
+      "digest": "sha256:e318937619ee0d297eeb7c387289d1c3a9778153c05a2576699ba6f4f830773b",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim-0.6.0.dmg"
+    },
+    {
+      "name": "Parts.Sim.Setup.0.6.0.exe",
+      "size": 221757741,
+      "digest": "sha256:2f89774a17eb43cd199134bfae06cb8febe31a9f6c39e3269b07c55ad24e3ca3",
+      "url": "https://github.com/Voided-code/parts-sim/releases/download/v0.6.0/Parts.Sim.Setup.0.6.0.exe"
+    }
+  ]
+}

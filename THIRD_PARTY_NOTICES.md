@@ -36,3 +36,7 @@ occt-import-js and Open CASCADE are shipped unmodified as a separate WebAssembly
 The full licence texts ship with the package in `node_modules/occt-import-js/dist/license.occt-import-js.txt` and `license.occt.txt`. Their sources are available from the links above.
 
 In the native app, Qt and Open CASCADE are unmodified shared libraries that the app links dynamically. The packaged app keeps them as separate files: `Contents/Frameworks` on macOS, next to the executable on Windows and Linux. You may replace them with your own builds of the same versions. The full licence texts come with each library's distribution, and their sources are available from the links above.
+
+## Website
+
+The website's web app (`site/vendor/coi-serviceworker.js`) includes [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) v0.1.7, MIT, © 2021 Guido Zuidhof and contributors. It lets a static host without custom headers serve the app with the cross-origin isolation its helper threads need. The licence text is in `site/vendor/coi-serviceworker.LICENSE`.

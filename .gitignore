@@ -6,3 +6,5 @@ dist/
 test-artifacts/
 release/
 native/build*/
+_site/
+_site-*/
