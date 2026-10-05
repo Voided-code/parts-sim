@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -84,6 +85,9 @@ struct Array {
     std::vector<int32_t> i;
     std::vector<uint8_t> u;
     uint32_t stride = 1;         // 2, 3 or 4 for q16/q8 arrays of vectors (no dims): predict from the same component of the previous vector
+    std::string base;            // q16/q8: name of an earlier array (same enc, n, min, max) the codes are predicted from; a series
+    bool hasRange = false;       // writing: a range shared with other arrays (so their codes can be compared), instead of the data's own
+    double rangeMin = 0, rangeMax = 0;
     std::vector<uint32_t> dims;  // empty, or {nx, ny, nz} with nx*ny*nz = size(), x fastest
     double err = 0;              // worst-case error of a quantised array (set by the reader and the writer)
     size_t size() const { return enc == Enc::I32 ? i.size() : enc == Enc::U8 ? u.size() : f.size(); }
@@ -99,6 +103,9 @@ struct Bound {
     std::string field;
     double absolute = 0;
 };
+
+/** The arrays of a time series (steps of a break test, frames of a drop test): one shared range, each predicted from the one before it. */
+std::vector<Array> seriesArrays(const std::vector<const std::vector<float>*>& datas, const std::function<std::string(size_t)>& name, uint32_t stride = 1);
 
 /** Body of a result section. `bounds` receives the error bound of each quantised array. */
 Bytes encodeArrays(const json::Value& meta, const std::vector<Array>& arrays, std::vector<Bound>* bounds = nullptr);

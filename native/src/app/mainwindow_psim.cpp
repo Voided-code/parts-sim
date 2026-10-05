@@ -141,6 +141,12 @@ psim::File MainWindow::gatherPsim(const PsimSaveOptions& o, QStringList* resultI
         contains.obj["cadName"] = jstr(QFileInfo(sourceName).fileName().toStdString());
     }
     info.obj["contains"] = contains;
+    // the linear dynamic study's modal basis is too large to store: its settings are saved, its result is not
+    if (Study* dyn = structural->studyById("dynamic"); dyn && dyn->hasResult()) {
+        Value ns = jarr();
+        ns.arr.push_back(jstr("dynamic"));
+        info.obj["notStored"] = ns;
+    }
     f.info = info;
 
     if (o.setup) {
@@ -206,11 +212,19 @@ void MainWindow::showSaveDialog() {
     if (!part) return status(tr("Open a part or a sample first."), "error");
     QStringList ids;
     PsimSaveOptions all;
-    all.thumb = false;
     psim::File draft = gatherPsim(all, &ids);
+    const double thumbSize = draft.thumb ? double(draft.thumb->size()) : 0;
     // compressed sizes of each piece
     const double geomQ = double(deflated(psim::encodeGeometry(*draft.geometry, true))), geomX = double(deflated(psim::encodeGeometry(*draft.geometry, false)));
-    double setupSize = draft.setup ? double(deflated(psim::Bytes(psim::stringifyJson(*draft.setup).begin(), psim::stringifyJson(*draft.setup).end()))) : 0;
+    double setupSize = 0;
+    if (draft.setup) {
+        const std::string text = psim::stringifyJson(*draft.setup);
+        setupSize = double(deflated(psim::Bytes(text.begin(), text.end())));
+        // the wind loads' per-triangle forces belong to the setup
+        std::vector<psim::Array> wind;
+        for (const auto& a : draft.rfea ? draft.rfea->list : std::vector<psim::Array>{}) if (a.name.rfind("load.", 0) == 0) wind.push_back(a);
+        if (!wind.empty()) setupSize += double(deflated(psim::encodeArrays(jobj(), wind)));
+    }
     std::map<QString, double> resSize;
     if (draft.rfea) {
         for (const QString& id : ids) {
@@ -248,7 +262,7 @@ void MainWindow::showSaveDialog() {
     std::map<QString, QCheckBox*> resChk;
     for (const QString& id : ids) {
         auto* c = new QCheckBox(tr("%1  %2").arg(labelOf(id), kb(resSize[id])), ibox);
-        c->setChecked(true);
+        c->setChecked(resSize[id] <= 4e6);  // a big result starts unchecked, as in the web app
         resChk[id] = c;
         il->addWidget(c);
     }
@@ -256,8 +270,9 @@ void MainWindow::showSaveDialog() {
     auto* cadChk = new QCheckBox(sourceBytes.isEmpty() ? tr("Original CAD file  (not available)") : tr("Original CAD file  %1").arg(kb(double(sourceBytes.size()))), ibox);
     cadChk->setEnabled(!sourceBytes.isEmpty());
     il->addWidget(cadChk);
-    auto* thumbChk = new QCheckBox(tr("Preview picture"), ibox);
-    thumbChk->setChecked(true);
+    auto* thumbChk = new QCheckBox(draft.thumb ? tr("Preview picture  %1").arg(kb(thumbSize)) : tr("Preview picture"), ibox);
+    thumbChk->setChecked(draft.thumb.has_value());
+    thumbChk->setEnabled(draft.thumb.has_value());
     il->addWidget(thumbChk);
     v->addWidget(ibox);
     auto* priv = new QLabel(tr("Lossy fields are listed with their largest error in the file’s info panel. The file never holds your user name, folders or computer "
@@ -267,7 +282,7 @@ void MainWindow::showSaveDialog() {
     v->addWidget(priv);
     auto* total = new QLabel(&d);
     auto refresh = [&] {
-        double n = 2000 + (thumbChk->isChecked() ? 8000 : 0) + (exact->isChecked() ? geomX : geomQ);
+        double n = 2000 + (thumbChk->isChecked() ? thumbSize : 0) + (exact->isChecked() ? geomX : geomQ);
         if (setupChk->isChecked()) n += setupSize;
         for (auto& [id, c] : resChk) if (c->isChecked()) n += resSize[id];
         if (cadChk->isChecked()) n += double(sourceBytes.size());
@@ -381,6 +396,7 @@ bool MainWindow::openPsim(const QString& path) {
         lf.stored["airflow"] = {{"drag", numOr(a["drag"], NAN)}, {"lift", numOr(a["lift"], NAN)}, {"cd", numOr(a["cd"], NAN)}, {"cl", numOr(a["cl"], NAN)}};
     });
     else if (setup["airflow"].type == Value::Object) guard("airflow setup", [&] { airflow->importState(setup["airflow"]); });
+    guard("study options", [&] { structural->reapplyStudyOptions(setup["structural"]); });
     const Value view = f.view ? *f.view : Value{};
     guard("view", [&] {
         structural->importView(view["structural"]);
@@ -405,8 +421,12 @@ bool MainWindow::openPsim(const QString& path) {
     loadedFile = lf;
     showBanner();
     psimOpenMs = double(t.elapsed());
-    status(tr("Opened %1: %2.%3").arg(fileName, hasResults ? tr("results shown from the file, not computed here") : tr("part and setup"),
-                                      problems.isEmpty() ? QString() : tr(" Could not restore: %1.").arg(problems.join("; "))),
+    QString note;
+    if (strOr(view["study"]) == "dynamic")
+        for (const auto& id : info["notStored"].arr)
+            if (strOr(id) == "dynamic") note = tr(" The linear dynamic results are not stored in files: press Re-run to compute them again.");
+    status(tr("Opened %1: %2.%3%4").arg(fileName, hasResults ? tr("results shown from the file, not computed here") : tr("part and setup"),
+                                      problems.isEmpty() ? QString() : tr(" Could not restore: %1.").arg(problems.join("; ")), note),
            problems.isEmpty() ? "" : "warn");
     (void)tRestore;
     return true;
@@ -497,6 +517,13 @@ void MainWindow::showFileInfo() {
     for (const auto& r : c["results"].arr) rs << labelOf(S(r));
     row(tr("Results"), rs.isEmpty() ? tr("none") : rs.join(", "));
     row(tr("CAD source"), boolOr(c["cad"], false) ? (S(c["cadName"]).isEmpty() ? tr("included") : S(c["cadName"])) : tr("not included"));
+    {
+        QStringList ns;
+        for (const auto& id : info["notStored"].arr)
+            ns << (strOr(id) == "dynamic" ? tr("The linear dynamic study’s results are not stored in .psim files (they are large); its settings are, so press Re-run to compute them again")
+                                           : S(id));
+        row(tr("Not stored"), ns.join("; "));
+    }
     row(tr("File size"), kb(double(f.size)));
     html += "</table><h4>" + tr("Sections") + "</h4><table cellpadding=3>";
     static const std::map<std::string, QString> names = {{"INFO", "Info"}, {"THMB", "Preview picture"}, {"GEOM", "Geometry"}, {"CADS", "CAD source"}, {"SETP", "Setup"}, {"RFEA", "Structural and thermal results"}, {"RAIR", "Airflow results"}, {"VIEW", "View"}};

@@ -224,7 +224,7 @@ json::Value arr() { json::Value v; v.type = json::Value::Array; return v; }
 const KeyOrder& infoOrder() {
     static const KeyOrder o = {
         // as the JavaScript writer lays it out: format, the caller's keys, then created and bounds
-        {"", {"format", "app", "name", "notes", "units", "contains", "part", "created", "bounds"}},
+        {"", {"format", "app", "name", "notes", "units", "contains", "part", "notStored", "created", "bounds"}},
         {"app", {"name", "version", "kind"}},
         {"contains", {"geometry", "setup", "results", "cad", "cadName"}},
         {"part", {"vertices", "triangles", "bbox"}},
@@ -264,7 +264,7 @@ const KeyOrder& viewOrder() {
 const KeyOrder& arraysHeaderOrder() {
     static const KeyOrder o = {
         {"", {"meta", "arrays"}},
-        {"arrays", {"name", "enc", "n", "dims", "stride", "min", "max", "err", "bytes"}},
+        {"arrays", {"name", "enc", "n", "dims", "stride", "base", "min", "max", "err", "bytes"}},
     };
     return o;
 }
@@ -477,9 +477,33 @@ const Array* Arrays::find(const std::string& name) const {
     return nullptr;
 }
 
+std::vector<Array> seriesArrays(const std::vector<const std::vector<float>*>& datas, const std::function<std::string(size_t)>& name, uint32_t stride) {
+    double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+    for (const auto* d : datas)
+        for (float v : *d)
+            if (std::isfinite(v)) { lo = std::min(lo, double(v)); hi = std::max(hi, double(v)); }
+    if (lo > hi) { lo = 0; hi = 0; }
+    std::vector<Array> out;
+    for (size_t i = 0; i < datas.size(); i++) {
+        Array a;
+        a.name = name(i);
+        a.enc = Enc::Q16;
+        a.f = *datas[i];
+        a.hasRange = true;
+        a.rangeMin = lo;
+        a.rangeMax = hi;
+        a.stride = stride;
+        if (i) a.base = name(i - 1);
+        out.push_back(std::move(a));
+    }
+    return out;
+}
+
 Bytes encodeArrays(const json::Value& meta, const std::vector<Array>& arrays, std::vector<Bound>* bounds) {
     json::Value entries = arr();
     std::vector<Bytes> blobs;
+    struct Coded { std::string name; Enc enc; size_t n; double mn, mx; std::vector<uint16_t> codes; };
+    std::vector<Coded> coded;
     for (const Array& a : arrays) {
         const size_t n = a.size();
         json::Value entry = obj();
@@ -496,6 +520,7 @@ Bytes encodeArrays(const json::Value& meta, const std::vector<Array>& arrays, st
             if (!(a.enc == Enc::Q16 || a.enc == Enc::Q8) || !a.dims.empty() || a.stride < 2 || a.stride > 4 || n % a.stride) fail("An array has a stride its encoding cannot use.", "invalid");
             entry.obj["stride"] = num(a.stride);
         }
+        if (!a.base.empty() && !(a.enc == Enc::Q16 || a.enc == Enc::Q8)) fail("Only quantised arrays can be predicted from another array.", "invalid");
         Bytes blob(size_t(widthOf(a.enc)) * n);
         if (a.enc == Enc::F32) {
             std::vector<uint32_t> bits(n);
@@ -510,18 +535,33 @@ Bytes encodeArrays(const json::Value& meta, const std::vector<Array>& arrays, st
         } else {
             const int L = levels(a.enc);
             double mn = std::numeric_limits<double>::infinity(), mx = -mn;
-            for (size_t i = 0; i < n; i++) {
-                const double v = a.f[i];
-                if (std::isfinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; }
+            if (a.hasRange) {
+                mn = a.rangeMin;
+                mx = a.rangeMax;
+                if (!std::isfinite(mn) || !std::isfinite(mx) || mx < mn) fail("An array has an invalid range.", "invalid");
+            } else {
+                for (size_t i = 0; i < n; i++) {
+                    const double v = a.f[i];
+                    if (std::isfinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; }
+                }
+                if (mn > mx) { mn = 0; mx = 0; }
             }
-            if (mn > mx) { mn = 0; mx = 0; }
             const double span = mx - mn;
             std::vector<uint16_t> codes(n);
             for (size_t i = 0; i < n; i++) {
                 const double v = a.f[i];
-                codes[i] = std::isfinite(v) ? uint16_t(span > 0 ? 1 + std::round(((v - mn) / span) * (L - 2)) : 1) : uint16_t(0);
+                codes[i] = std::isfinite(v) ? uint16_t(span > 0 ? 1 + std::min(double(L - 2), std::max(0.0, std::round(((v - mn) / span) * (L - 2)))) : 1) : uint16_t(0);
             }
-            const std::vector<uint32_t> res = predictEncode(codes, L, a.dims, a.stride);
+            std::vector<uint16_t> toPredict = codes;
+            if (!a.base.empty()) {
+                const Coded* b = nullptr;
+                for (const auto& cd : coded) if (cd.name == a.base) b = &cd;
+                if (!b || b->enc != a.enc || b->n != n || b->mn != mn || b->mx != mx) fail("An array can only be predicted from an earlier array of the same size, coding and range.", "invalid");
+                entry.obj["base"] = str(a.base);
+                for (size_t i = 0; i < n; i++) toPredict[i] = uint16_t((int(codes[i]) - int(b->codes[i])) & (L - 1));
+            }
+            coded.push_back({a.name, a.enc, n, mn, mx, codes});
+            const std::vector<uint32_t> res = predictEncode(toPredict, L, a.dims, a.stride);
             putPlanes(blob.data(), res.data(), n, widthOf(a.enc));
             const double err = span / (2.0 * (L - 2));
             entry.obj["min"] = num(mn);
@@ -556,6 +596,8 @@ Arrays decodeArrays(const uint8_t* bytes, size_t length) {
     const auto& list = head["arrays"].arr;
     if (list.size() > Limits::arrays) fail("A result section lists too many arrays.", "limit");
     Arrays out;
+    struct Seen { Enc enc; double n, mn, mx; std::vector<uint16_t> codes; };
+    std::map<std::string, Seen> seen;
     size_t o = 4 + size_t(hl);
     double elements = 0;
     for (const json::Value& e : list) {
@@ -604,7 +646,14 @@ Arrays decodeArrays(const uint8_t* bytes, size_t length) {
             }
             const double mn = e["min"].num, mx = e["max"].num;
             const auto res = getPlanes(src, n, widthOf(enc));
-            const auto codes = predictDecode(res, L, a.dims, a.stride);
+            auto codes = predictDecode(res, L, a.dims, a.stride);
+            if (e.has("base")) {
+                auto it = e["base"].type == json::Value::String ? seen.find(e["base"].str) : seen.end();
+                if (it == seen.end() || it->second.enc != enc || it->second.n != nd || it->second.mn != mn || it->second.mx != mx)
+                    fail("An array is predicted from an array it does not match.", "damaged");
+                for (size_t i = 0; i < n; i++) codes[i] = uint16_t((int(codes[i]) + int(it->second.codes[i])) & (L - 1));
+            }
+            seen[a.name] = {enc, nd, mn, mx, codes};
             a.f.resize(n);
             const double k = (mx - mn) / (L - 2);
             for (size_t i = 0; i < n; i++) a.f[i] = codes[i] == 0 ? std::numeric_limits<float>::quiet_NaN() : float(mn + (codes[i] - 1) * k);

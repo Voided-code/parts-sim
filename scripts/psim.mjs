@@ -30,14 +30,20 @@ function fmtG(v) {
   if (v === Infinity) return 'inf';
   if (v === -Infinity) return '-inf';
   if (v === 0) return Object.is(v, -0) ? '-0' : '0';
-  const [mant, exp] = v.toExponential(8).split('e');
-  const x = Number(exp);
-  if (x < -4 || x >= 9) {
-    const m = mant.includes('.') ? mant.replace(/0+$/, '').replace(/\.$/, '') : mant;
-    return `${m}e${x < 0 ? '-' : '+'}${String(Math.abs(x)).padStart(2, '0')}`;
+  // 9 significant digits from the exact decimal expansion, ties to even (what C's printf does)
+  const [m, e] = Math.abs(v).toExponential(100).split('e');
+  const d = m.replace('.', '');
+  let head = d.slice(0, 9), x = Number(e);
+  const rest = d.slice(9), tie = rest[0] === '5' && /^0*$/.test(rest.slice(1));
+  if (rest[0] > '5' || (rest[0] === '5' && !tie) || (tie && (head.charCodeAt(8) - 48) % 2 === 1)) {
+    head = (BigInt(head) + 1n).toString();
+    if (head.length > 9) { head = head.slice(0, 9); x++; }
   }
-  const f = v.toFixed(8 - x);
-  return f.includes('.') ? f.replace(/0+$/, '').replace(/\.$/, '') : f;
+  const sign = v < 0 ? '-' : '';
+  const trim = (s) => (s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s);
+  if (x < -4 || x >= 9) return `${sign}${trim(`${head[0]}.${head.slice(1)}`)}e${x < 0 ? '-' : '+'}${String(Math.abs(x)).padStart(2, '0')}`;
+  if (x >= 0) return sign + trim(`${head.slice(0, x + 1)}.${head.slice(x + 1)}`);
+  return sign + trim(`0.${'0'.repeat(-x - 1)}${head}`);
 }
 
 const hex8 = (n) => (n >>> 0).toString(16).padStart(8, '0');

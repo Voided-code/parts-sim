@@ -318,6 +318,32 @@ QString Study::engineNote(const std::string& engine, const std::string& gpuNote)
     return s;
 }
 
+
+// ---- .psim study options: helpers (the JS `adopt` rules: same type, finite, inside the range)
+namespace {
+using json::Value;
+void takeNum(const Value& o, const char* k, double& t, double lo = -1e300, double hi = 1e300) {
+    if (pj::isNum(o[k]) && o[k].num >= lo && o[k].num <= hi) t = o[k].num;
+}
+void takeInt(const Value& o, const char* k, int& t, double lo = -1e9, double hi = 1e9) {
+    if (pj::isNum(o[k]) && o[k].num >= lo && o[k].num <= hi) t = int(std::lround(o[k].num));
+}
+void takeBool(const Value& o, const char* k, bool& t) {
+    if (o[k].type == Value::Bool) t = o[k].b;
+}
+void takeStr(const Value& o, const char* k, QString& t, std::initializer_list<const char*> allowed) {
+    if (o[k].type != Value::String) return;
+    for (const char* a : allowed)
+        if (o[k].str == a) { t = QString::fromStdString(o[k].str); return; }
+}
+Value optionsOf(Value opts, Value view) {
+    Value o = pj::jobj();
+    o.obj["opts"] = std::move(opts);
+    o.obj["view"] = std::move(view);
+    return o;
+}
+}  // namespace
+
 namespace {
 
 // ---------------------------------------------------------------------------------------------
@@ -327,6 +353,23 @@ class NonlinearStudy : public Study {
 public:
     using Study::Study;
     QString id() const override { return "nonlinear"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["large"] = jbool(o_.large); o.obj["plastic"] = jbool(o_.plastic); o.obj["mode"] = jstr(o_.failure ? "failure" : "applied"); o.obj["steps"] = jnum(o_.steps);
+        v.obj["plot"] = jstr(view_.plot.toStdString()); v.obj["step"] = jnum(view_.step); v.obj["exaggerate"] = jnum(view_.exaggerate); v.obj["unloaded"] = jbool(view_.unloaded);
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        const Value &o = s["opts"], &v = s["view"];
+        takeBool(o, "large", o_.large); takeBool(o, "plastic", o_.plastic); takeInt(o, "steps", o_.steps, 2, 60);
+        if (o["mode"].type == Value::String && (o["mode"].str == "failure" || o["mode"].str == "applied")) o_.failure = o["mode"].str == "failure";
+        takeStr(v, "plot", view_.plot, {"vm", "disp", "pe"});
+        takeInt(v, "step", view_.step); takeNum(v, "exaggerate", view_.exaggerate, 1, 50); takeBool(v, "unloaded", view_.unloaded);
+        if (r_ && !r_->steps.empty()) view_.step = std::clamp(view_.step, 0, int(r_->steps.size()) - 1);
+        if (r_ && !r_->unloaded) view_.unloaded = false;
+        invalidate();
+    }
     bool hasResult() const override { return r_ && !r_->steps.empty(); }
     void clear() override { r_.reset(); view_.playing = false; }
 
@@ -368,7 +411,12 @@ public:
         Value steps = jarr();
         for (size_t i = 0; i < r_->steps.size(); i++) {
             steps.arr.push_back(stepMeta(r_->steps[i]));
-            put("nonlinear.step." + std::to_string(i), r_->steps[i]);
+        }
+        // each field of the steps is one series (shared range, predicted from the step before); the spring-back state stands alone
+        for (auto [field, stride] : {std::pair<const char*, uint32_t>{"u", 3}, {"vm", 1}, {"pe", 1}}) {
+            std::vector<const std::vector<float>*> list;
+            for (const auto& st : r_->steps) list.push_back(std::string(field) == "u" ? &st.u : std::string(field) == "vm" ? &st.vm : &st.pe);
+            for (auto& a : psim::seriesArrays(list, [field](size_t i) { return "nonlinear.step." + std::to_string(i) + "." + field; }, stride)) out.list.push_back(std::move(a));
         }
         m.obj["steps"] = steps;
         if (r_->unloaded) { m.obj["unloaded"] = stepMeta(*r_->unloaded); put("nonlinear.unloaded", *r_->unloaded); }
@@ -721,6 +769,20 @@ class ModalStudy : public ModeStudy {
 public:
     using ModeStudy::ModeStudy;
     QString id() const override { return "modal"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["nev"] = jnum(nev_);
+        v.obj["mode"] = jnum(view_.mode); v.obj["amp"] = jnum(view_.amp); v.obj["animate"] = jbool(view_.animate);
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        takeInt(s["opts"], "nev", nev_, 1, 20);
+        const Value& v = s["view"];
+        takeInt(v, "mode", view_.mode, 0); takeNum(v, "amp", view_.amp, 0.01, 0.3); takeBool(v, "animate", view_.animate);
+        if (r_) view_.mode = std::clamp(view_.mode, 0, std::max(0, int(r_->modes.size()) - 1));
+        invalidate();
+    }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
 
@@ -868,6 +930,20 @@ public:
         speed_ = 1;
     }
     QString id() const override { return "buckling"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["nev"] = jnum(nev_);
+        v.obj["mode"] = jnum(view_.mode); v.obj["amp"] = jnum(view_.amp); v.obj["animate"] = jbool(view_.animate);
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        takeInt(s["opts"], "nev", nev_, 1, 8);
+        const Value& v = s["view"];
+        takeInt(v, "mode", view_.mode, 0); takeNum(v, "amp", view_.amp, 0.01, 0.3); takeBool(v, "animate", view_.animate);
+        if (r_) view_.mode = std::clamp(view_.mode, 0, std::max(0, int(r_->modes.size()) - 1));
+        invalidate();
+    }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
 
@@ -1028,6 +1104,29 @@ class FatigueStudy : public Study {
 public:
     using Study::Study;
     QString id() const override { return "fatigue"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["loading"] = jstr(o_.loading == 0 ? "zero" : o_.loading == 1 ? "reversed" : "custom");
+        o.obj["R"] = jnum(o_.R); o.obj["cycles"] = jnum(o_.cycles); o.obj["finish"] = jstr(o_.finish.toStdString()); o.obj["scale"] = jnum(o_.scale);
+        v.obj["plot"] = jstr(view_.toStdString());
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        const Value& o = s["opts"];
+        if (o["loading"].type == Value::String) {
+            const std::string& l = o["loading"].str;
+            if (l == "zero") o_.loading = 0; else if (l == "reversed") o_.loading = 1; else if (l == "custom") o_.loading = 2;
+        }
+        takeNum(o, "R", o_.R, -5, 0.99); takeNum(o, "cycles", o_.cycles, 1); takeNum(o, "scale", o_.scale, 0);
+        if (o["finish"].type == Value::String)
+            for (const auto& [id, label] : fatigueFinishes()) if (id == o["finish"].str) o_.finish = QString::fromStdString(id);
+        takeStr(s["view"], "plot", view_, {"life", "damage", "fos"});
+        if (r_) {
+            r_->fat = fatigueField(r_->m.vm, r_->m.p1, r_->m.p3, r_->material, o_.finish.toStdString(), o_.R, o_.cycles, o_.scale);
+        }
+        invalidate();
+    }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); }
 
@@ -1256,6 +1355,20 @@ class DropStudy : public Study {
 public:
     using Study::Study;
     QString id() const override { return "drop"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["height"] = jnum(height_);
+        v.obj["plot"] = jstr(view_.plot.toStdString()); v.obj["frame"] = jnum(view_.frame); v.obj["exaggerate"] = jnum(view_.exaggerate);
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        takeNum(s["opts"], "height", height_, 0.001);
+        const Value& v = s["view"];
+        takeStr(v, "plot", view_.plot, {"peak", "frame"}); takeInt(v, "frame", view_.frame, 0); takeNum(v, "exaggerate", view_.exaggerate, 0);
+        if (r_ && !r_->frames.empty()) view_.frame = std::clamp(view_.frame, 0, int(r_->frames.size()) - 1);
+        invalidate();
+    }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); view_.playing = false; }
 
@@ -1294,10 +1407,10 @@ public:
         add("drop.vmMax", r.run.vmMax, psim::Enc::Q16, 1);
         add("drop.times", r.run.times, psim::Enc::F32, 1);
         add("drop.forces", r.run.forces, psim::Enc::F32, 1);
-        for (size_t i = 0; i < r.frames.size(); i++) {
-            add("drop.frame." + std::to_string(i) + ".u", r.frames[i].u, psim::Enc::Q16, 3);
-            add("drop.frame." + std::to_string(i) + ".vm", r.frames[i].vm, psim::Enc::Q16, 1);
-        }
+        std::vector<const std::vector<float>*> us, vms;
+        for (const auto& f : r.frames) { us.push_back(&f.u); vms.push_back(&f.vm); }
+        for (auto& a : psim::seriesArrays(us, [](size_t i) { return "drop.frame." + std::to_string(i) + ".u"; }, 3)) out.list.push_back(std::move(a));
+        for (auto& a : psim::seriesArrays(vms, [](size_t i) { return "drop.frame." + std::to_string(i) + ".vm"; })) out.list.push_back(std::move(a));
         return out;
     }
     bool canImport() const override { return true; }
@@ -1555,6 +1668,26 @@ class DynamicStudy : public Study {
 public:
     using Study::Study;
     QString id() const override { return "dynamic"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["source"] = jstr(o_.base ? "base" : "loads"); o.obj["dir"] = jnum(o_.dir); o.obj["type"] = jstr(o_.type.toStdString());
+        o.obj["amp"] = jnum(o_.amp); o.obj["zeta"] = jnum(o_.zeta); o.obj["nev"] = jnum(o_.nev); o.obj["fOp"] = jnum(0);
+        o.obj["pulse"] = jnum(o_.pulse); o.obj["sineF"] = jnum(o_.sineF); o.obj["duration"] = jnum(o_.duration); o.obj["quake"] = jnum(o_.quake);
+        v.obj["plot"] = jstr(view_.plot.toStdString()); v.obj["animate"] = jbool(view_.animate);
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        const Value& o = s["opts"];
+        if (o["source"].type == Value::String && (o["source"].str == "base" || o["source"].str == "loads")) o_.base = o["source"].str == "base";
+        if (pj::isNum(o["dir"]) && (o["dir"].num == 0 || o["dir"].num == 1 || o["dir"].num == 2)) o_.dir = int(o["dir"].num);
+        takeStr(o, "type", o_.type, {"harmonic", "shock", "sine", "quake"});
+        takeInt(o, "nev", o_.nev, 1, 20);
+        takeNum(o, "amp", o_.amp); takeNum(o, "zeta", o_.zeta); takeNum(o, "pulse", o_.pulse); takeNum(o, "sineF", o_.sineF);
+        takeNum(o, "duration", o_.duration); takeNum(o, "quake", o_.quake);
+        takeStr(s["view"], "plot", view_.plot, {"vm", "disp", "envelope", "now"}); takeBool(s["view"], "animate", view_.animate);
+        invalidate();
+    }
     bool hasResult() const override { return r_.has_value(); }
     void clear() override { r_.reset(); view_.playing = false; }
 
@@ -1961,6 +2094,26 @@ class OptimizeStudy : public Study {
 public:
     using Study::Study;
     QString id() const override { return "optimize"; }
+    json::Value exportOptions() const override {
+        using namespace pj;
+        Value o = jobj(), v = jobj();
+        o.obj["goal"] = jstr(o_.sizing ? "sizing" : "topology"); o.obj["keep"] = jnum(o_.keep); o.obj["iters"] = jnum(o_.iters);
+        o.obj["fos"] = jnum(o_.fos); o.obj["maxDisp"] = jnum(o_.maxDisp); o.obj["objective"] = jstr(o_.cost ? "cost" : "mass");
+        o.obj["family"] = jstr(o_.family == 1 ? "metals" : o_.family == 2 ? "plastics" : "all");
+        v.obj["level"] = jnum(level_);
+        return optionsOf(o, v);
+    }
+    void importOptions(const json::Value& s) override {
+        const Value& o = s["opts"];
+        if (o["goal"].type == Value::String && (o["goal"].str == "sizing" || o["goal"].str == "topology")) o_.sizing = o["goal"].str == "sizing";
+        takeNum(o, "keep", o_.keep, 5, 95); takeInt(o, "iters", o_.iters, 5, 100); takeNum(o, "fos", o_.fos, 0.1); takeNum(o, "maxDisp", o_.maxDisp, 0);
+        if (o["objective"].type == Value::String && (o["objective"].str == "mass" || o["objective"].str == "cost")) o_.cost = o["objective"].str == "cost";
+        if (o["family"].type == Value::String) { const auto& f = o["family"].str; if (f == "all") o_.family = 0; else if (f == "metals") o_.family = 1; else if (f == "plastics") o_.family = 2; }
+        const double before = level_;
+        takeNum(s["view"], "level", level_, 0.2, 0.8);
+        if (topo_ && topo_->done && level_ != before) buildShape();
+        invalidate();
+    }
     bool hasResult() const override { return topo_.has_value() || sizing_.has_value(); }
     void clear() override {
         topo_.reset();
