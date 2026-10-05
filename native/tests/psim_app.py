@@ -89,6 +89,13 @@ def main():
         got = __import__("json").loads(m.group(1)) if m else {}
         ok = all(got.get(part, {}).get(k) == v or (isinstance(v, float) and abs(got.get(part, {}).get(k, 1e99) - v) < 1e-9) for part in want for k, v in want[part].items())
         check(f"3d {study} options come back after reopening", rc == 0 and m and ok, out + " got " + str(got))
+    # 3f: the linear dynamic result is not stored: INFO.notStored says so, and opening says it in the status line
+    dyn = t / "dyn.psim"
+    rc, out = app(a.exe, f"sample:beam;idle;engine:cpu;mesh:3000;study:dynamic;run;idle;savepsim:{dyn};quit")
+    check("3f dynamic run and save", rc == 0 and dyn.exists(), out)
+    check("3f INFO.notStored is ['dynamic']", 'info.notStored[0] = "dynamic"' in js("dump", dyn).stdout, js("dump", dyn).stdout[:400])
+    rc, out = app(a.exe, f"open:{dyn};idle;wait:500;status;quit")
+    check("3f the status line names the missing dynamic result", rc == 0 and "dynamic results are not stored" in out, out)
     # 3e: a file whose options were written by another app (the JS tools) opens with them applied
     js_file = t / "opt-js.psim"
     script = (

@@ -224,7 +224,7 @@ json::Value arr() { json::Value v; v.type = json::Value::Array; return v; }
 const KeyOrder& infoOrder() {
     static const KeyOrder o = {
         // as the JavaScript writer lays it out: format, the caller's keys, then created and bounds
-        {"", {"format", "app", "name", "notes", "units", "contains", "part", "created", "bounds"}},
+        {"", {"format", "app", "name", "notes", "units", "contains", "part", "notStored", "created", "bounds"}},
         {"app", {"name", "version", "kind"}},
         {"contains", {"geometry", "setup", "results", "cad", "cadName"}},
         {"part", {"vertices", "triangles", "bbox"}},
