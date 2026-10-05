@@ -223,7 +223,7 @@ displacement or shape has three (`3 nV`, x y z per vertex).
 | study | meta | arrays |
 |---|---|---|
 | `static` | maxima, load factors, flags, material, units, resolution, total force | `vm`, `p1`, `p3`, `fos` (q16, per vertex), `u` (q16, 3 nV) |
-| `break` | per step: load factor, maximum displacement, cracked and detached voxel counts | per step `vm` and `u`, `cracked` and `detached` voxel ids |
+| `break` | per step: load factor `lambda`, maximum displacement, plus the voxel grid (`grid`) and `fieldScale` | per step `break.vm.<i>`, `break.u.<i>` (stride 3), `break.cracked.<i>`, `break.detached.<i>` (voxel ids). With `fieldScale` = `perLambda` (what the apps write) the stored `vm` and `u` are per unit load: multiply by the step's `lambda` (when it is above 0) to get the values at that step. The steps are one series each (`base`, a shared range). |
 | `nonlinear` | per step: load factor, displacement, maxima | per step `vm`, `pe`, `u`; the unloaded step |
 | `modal` | frequencies, effective mass | per mode `shape` |
 | `buckling` | factors | per mode `shape`, and `vm` |

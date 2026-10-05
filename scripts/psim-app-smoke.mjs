@@ -88,7 +88,7 @@ try {
     console.log(`${id} file: ${bytesX.length} bytes (${steps} ${id === 'break' ? 'steps' : 'frames'})`);
     await x.close();
     const y = await open(base);
-    await y.evaluate(async (arr) => { await window.partsSim.psim.open(Uint8Array.from(arr), `${id}.psim`); }, [...bytesX]);
+    await y.evaluate(async ([arr, name]) => { await window.partsSim.psim.open(Uint8Array.from(arr), name); }, [[...bytesX], `${id}.psim`]);
     await y.waitForFunction(() => !document.querySelector('#file-banner').hidden, null, { timeout: 60000 });
     await y.waitForTimeout(900);
     assert.equal(await text(y, kpis), text0, `${id} card`);

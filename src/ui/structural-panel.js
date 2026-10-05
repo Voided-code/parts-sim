@@ -1375,10 +1375,14 @@ export class StructuralPanel {
       return { step: s.step, lambda: s.lambda, maxDisp: s.maxDisp };
     });
     // the steps are two series (stress, displacement): one shared range each, every step predicted from the one before
-    arrays.push(...seriesSpecs(b.steps.map((s) => s.mapped.vm), (i) => `break.vm.${i}`), ...seriesSpecs(b.steps.map((s) => s.mapped.u), (i) => `break.u.${i}`, { stride: 3 }));
+    // Each step's stress and displacement are those of the unit load times the step's load factor (lambda), plus the effect of
+    // the cracks so far. Dividing by lambda leaves what the cracks changed, which is what the step before predicts well:
+    // the series is then less than half the size (meta.fieldScale = 'perLambda').
+    const perLambda = (arr, s) => (s.lambda > 0 ? Float32Array.from(arr, (v) => v / s.lambda) : arr);
+    arrays.push(...seriesSpecs(b.steps.map((s) => perLambda(s.mapped.vm, s)), (i) => `break.vm.${i}`), ...seriesSpecs(b.steps.map((s) => perLambda(s.mapped.u, s)), (i) => `break.u.${i}`, { stride: 3 }));
     b.steps.forEach((s, i) => arrays.push({ name: `break.cracked.${i}`, data: Int32Array.from(s.cracked), enc: 'i32' }, { name: `break.detached.${i}`, data: Int32Array.from(s.detached), enc: 'i32' }));
     return {
-      meta: { steps, totalF: b.totalF, material: b.material, toMeters: b.toMeters, reason: b.reason ?? null, done: !!b.done, scale: b.scale ?? null, grid: { dims: Array.from(m.dims), origin: Array.from(m.origin), h: m.h, resolution: m.resolution } },
+      meta: { fieldScale: 'perLambda', steps, totalF: b.totalF, material: b.material, toMeters: b.toMeters, reason: b.reason ?? null, done: !!b.done, scale: b.scale ?? null, grid: { dims: Array.from(m.dims), origin: Array.from(m.origin), h: m.h, resolution: m.resolution } },
       arrays,
     };
   }
@@ -1397,6 +1401,12 @@ export class StructuralPanel {
       cracked: need(`break.cracked.${i}`), detached: need(`break.detached.${i}`),
       mapped: { vm: need(`break.vm.${i}`, nV), u: need(`break.u.${i}`, 3 * nV) },
     }));
+    if (meta.fieldScale === 'perLambda') {
+      for (const s of steps) {
+        if (!(s.lambda > 0)) continue;
+        for (const k of ['vm', 'u']) { const a = s.mapped[k]; for (let q = 0; q < a.length; q++) a[q] *= s.lambda; }
+      }
+    }
     const model = { dims: grid.dims, origin: grid.origin, h: grid.h, resolution: grid.resolution };
     this.brk = { steps, totalF: meta.totalF, material: meta.material, current: 0, done: true, reason: meta.reason, model, toMeters: meta.toMeters, scale: meta.scale || undefined, loaded: true };
     if (!this.result) this.display = 'break';
