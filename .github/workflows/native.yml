@@ -218,6 +218,42 @@ jobs:
           if (-not $app) { throw 'The package contains no desktop executable.' }
           python native/tests/smoke_app.py $app.FullName --isolated --screenshot package-smoke.png
 
+      # the installer registers .psim (open with Parts Sim) and the uninstaller removes it again; the installed app opens a .psim file
+      - name: Test the installer and the .psim file association (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist/Parts-Sim-*.exe | Select-Object -First 1
+          $dir = 'C:\psim-assoc'
+          Start-Process $installer.FullName -ArgumentList '/S', "/D=$dir" -Wait
+          $roots = 'HKLM:\Software\Classes', 'HKCU:\Software\Classes'
+          $found = $roots | Where-Object { Test-Path "$_\.psim" } | Select-Object -First 1
+          if (-not $found) { throw 'The installer did not register the .psim file type.' }
+          "found in $found"
+          if ((Get-ItemProperty "$found\.psim").'(default)' -ne 'PartsSim.psim') { throw '.psim does not point to the Parts Sim file class.' }
+          $command = (Get-ItemProperty "$found\PartsSim.psim\shell\open\command").'(default)'
+          "open command: $command"
+          if ($command -notmatch 'Parts Sim\.exe') { throw 'The open command does not start Parts Sim.' }
+          $exe = Get-ChildItem $dir -Recurse -Filter 'Parts Sim.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'The installer put no Parts Sim.exe in the folder.' }
+          # the installed app opens a file written by the JavaScript code (assert:psim exits with an error when no results show)
+          $env:PARTS_SIM_NO_GPU = '1'
+          $env:PARTS_SIM_SCRIPT = "open:$((Resolve-Path test/fixtures/psim/v1-tube-stride.psim).Path);idle;assert:psim;quit"
+          $p = Start-Process $exe.FullName -Wait -PassThru
+          Remove-Item Env:PARTS_SIM_SCRIPT
+          if ($p.ExitCode -ne 0) { throw "The installed app could not open the .psim file (exit code $($p.ExitCode))." }
+          & "$dir\Uninstall.exe" /S "_?=$dir"
+          if ($roots | Where-Object { Test-Path "$_\.psim" }) { throw 'The uninstaller left the .psim file type registered.' }
+          'the .psim association is registered, works and is removed again'
+
+      - name: Check the .psim file type files (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          test -f AppDir/usr/share/mime/packages/parts-sim-psim.xml
+          grep -q 'application/x-parts-sim' AppDir/usr/share/mime/packages/parts-sim-psim.xml
+          grep -q 'application/x-parts-sim' AppDir/usr/share/applications/parts-sim.desktop
+          echo 'the shared-mime-info file and the desktop entry name the .psim type'
+
       - name: Test packaged app (Linux)
         if: runner.os == 'Linux'
         run: xvfb-run -a python3 native/tests/smoke_app.py dist/Parts-Sim-*.AppImage --isolated --screenshot package-smoke.png
