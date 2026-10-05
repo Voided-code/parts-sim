@@ -243,7 +243,8 @@ jobs:
           $p = Start-Process $exe.FullName -Wait -PassThru
           Remove-Item Env:PARTS_SIM_SCRIPT
           if ($p.ExitCode -ne 0) { throw "The installed app could not open the .psim file (exit code $($p.ExitCode))." }
-          & "$dir\Uninstall.exe" /S "_?=$dir"
+          # (calling the uninstaller with & would not wait for it, a GUI program)
+          Start-Process "$dir\Uninstall.exe" -ArgumentList '/S', "_?=$dir" -Wait
           if ($roots | Where-Object { Test-Path "$_\.psim" }) { throw 'The uninstaller left the .psim file type registered.' }
           'the .psim association is registered, works and is removed again'
 
