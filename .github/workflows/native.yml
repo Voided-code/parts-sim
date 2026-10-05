@@ -239,7 +239,7 @@ jobs:
           if (-not $exe) { throw 'The installer put no Parts Sim.exe in the folder.' }
           # the installed app opens a file written by the JavaScript code (assert:psim exits with an error when no results show)
           $env:PARTS_SIM_NO_GPU = '1'
-          $env:PARTS_SIM_SCRIPT = "open:$((Resolve-Path test/fixtures/psim/v1-tube-stride.psim).Path);idle;assert:psim;quit"
+          $env:PARTS_SIM_SCRIPT = "open:$((Resolve-Path test/fixtures/psim/js-hook.psim).Path);idle;assert:psim;quit"
           $p = Start-Process $exe.FullName -Wait -PassThru
           Remove-Item Env:PARTS_SIM_SCRIPT
           if ($p.ExitCode -ne 0) { throw "The installed app could not open the .psim file (exit code $($p.ExitCode))." }
