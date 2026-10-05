@@ -112,6 +112,22 @@ The stride-3 prediction halved the displacement arrays (316 to 154 KiB) and cut 
 Airflow, the Ahmed body, CPU engine: 50k cells 213 KB in the file (647 KB of arrays); 963k cells 2.52 MB (7.95 MB of
 arrays: the Cp per vertex 247 KB, and four 1.9 MB velocity and density arrays, 16-bit).
 
+Series (a break test's steps, a drop test's frames). Consecutive steps change little, so a series shares one quantisation range and
+each array is predicted from the one before it (`base`). On a break test there is a second effect: a step's stress and
+displacement are the unit-load field times the step's load factor (lambda), plus what the cracks changed. Storing the fields per
+unit load (`fieldScale` = `perLambda`) leaves only the crack effect for the step before to predict. A real 35-step break test on the
+140k-vertex L-bracket, deflated, MB:
+
+| | stress | displacement | both |
+|---|---|---|---|
+| each step coded alone | 5.98 | 10.51 | 16.5 |
+| as a series (shared range, predicted from the step before) | 4.68 | 7.03 | 11.7 |
+| as a series of value / lambda | 2.18 | 3.26 | **5.4** |
+
+In the app the 35-step file went from 12.59 MB (series only) to 6.28 MB (whole file, with geometry). The native app's 60-step
+L-bracket (20k voxels): 19.7 MB without series, 10.6 MB with series, **8.57 MB** with the per-lambda fields. A 12-frame drop test is 3.2 MB.
+The nonlinear steps use the series coding too (their fields are not linear in the load, so there is no per-lambda step).
+
 Largest errors (written into every file's INFO and shown in the File info panel): positions at most
 `(box size) / 131,070` per axis (0.0015 mm on the 200 mm beam); 16-bit fields at most `(max - min) / 131,068` of their
 own range; the 8-bit density of the topology study at most 0.2%.
@@ -127,19 +143,25 @@ own range; the 8-bit density of the topology study at most 0.2%.
     without it the app opens and says "Running on one thread";
   - `scripts/browser-smoke.mjs` against the built `/app/`: passes;
   - `scripts/psim-smoke.mjs` against the built `/app/`: a `.psim` file saved and opened on the website passes.
-- **Format and safety (`npm test`, 22 tests in `test/psim.test.js`, 3 s):** every section round trips, exact and
+- **Format and safety (`npm test`, 23 tests in `test/psim.test.js`, 3 s):** every section round trips, exact and
   quantised; 300 truncation points, 400 flipped bits, header lies about counts and lengths with the checksums repaired,
   a 64 MiB decompression bomb stopped in 1.2 s, section-internal count lies, a 600-case fuzz run in 1.5 s: none crashes,
   hangs or throws anything but a `PsimError`. Fixtures for each format version are kept (`test/fixtures/psim/`).
-  The native reader has the same tests (`test_psim`, 30 tests, 5 s) and passed a 40,000-case fuzz run under
+  The native reader has the same tests (`test_psim`, 31 tests, 5 s) and passed a 40,000-case fuzz run under
   AddressSanitizer and UBSan.
-- **Apps:** `npm test` 88 of 88 (it includes the 22 psim tests); `npm run build` passes.
+- **Apps:** `npm test` 89 of 89 (it includes the 23 psim tests); `npm run build` passes.
   Browser smokes: `psim-smoke.mjs` (bend test and thermal saved, a fresh page opens them: same card and legend text,
   picture difference 0.58 of 255; the Save dialog and a download; the file input; a cut file is refused with "damaged"
   and leaves the open part alone; Re-run reports -0.0% on max von Mises), `psim-app-smoke.mjs` (frequency study 0.76 of
   255, airflow 1.03 of 255, cards and legends identical), `psim-studies-smoke.mjs` (nonlinear, frequency, buckling,
   fatigue, drop, topology, sizing at the study level, picture difference 0.000-0.037), `psim-airflow-smoke.mjs`
   (airflow at 50k and 1M cells: card text identical, Cp error 7.5e-5 within its bound, streamline vertices identical).
+- **Windows and Linux (GitHub Actions, `native.yml` run by hand on this branch; free runners):** both builds green; `ctest` 7 of 7 on both, with
+  `test_psim` passing (Windows 3.6 s, Linux 0.5 s). New steps check the packaging: the Windows installer is run silently, the `.psim` registry keys are
+  checked, the installed app opens a JS-written `.psim` file (exit code 0), and the uninstaller removes the keys; the Linux step checks the
+  shared-mime-info file and the desktop entry. This found a real bug: the installer registered the open command as
+  `;C:\psim-assoc\bin\Parts;Sim.exe" "%1;` (fixed with NSIS quote escapes in `native/CMakeLists.txt`; it now reads
+  `"C:\psim-assoc\bin\Parts Sim.exe" "%1"`).
 - **Native:** `native/tests/psim_cross.py`: both directions, all 7 sample parts and the fixtures, `dump` identical;
   `native/tests/psim_app.py` (the real app with `PARTS_SIM_SCRIPT`): 10 of 10.
 
@@ -162,34 +184,34 @@ own range; the 8-bit density of the topology study at most 0.2%.
 
 - **Deploying the site.** Held until the airflow fixes are integrated and `.psim` is complete, so that the live accuracy page
   shows good numbers (the owner's decision). The branch is pushed; `site.yml` deploys only from `main`.
-- **Native app: study options and a few fields.** The native app saves and restores the setup and the results of the bend
+- **Native app: a few fields.** The native app saves and restores the setup and the results of the bend
   test, break test, nonlinear, frequency, buckling, fatigue, drop test, topology and size optimization, thermal and airflow
   (the airflow result opens without the solver or the GPU). Every one of those files, written by the native app, opens
   in the web app (11 files checked: the card, legend and numbers show, for example airflow Cd 1.38 and drag 152 N, the same
-  in both apps), and the JS-written files open natively with their stored numbers. What the native app does not save: the
-  study options (fatigue loading and finish, nonlinear steps, ...: SETP `options` is written empty, so those reset to
-  defaults when the file is opened), a few result fields its own structs do not keep (the nonlinear engine, the
-  optimization engine, a base peak stress), and the break test is large (19.7 MB for 60 steps of the L-bracket at 20k
-  voxels, because every step's stress and displacement are stored; see below).
-- **Large results.** A long break test (60 steps) is 20 MB and 17 drop frames are 10 MB raw, because every step or frame keeps its
-  full per-vertex fields. The web Save dialog starts any result over 4 MB unchecked and shows its size; the native dialog
-  does not do that yet. Subsampling steps is the obvious next saving.
-- **Linear dynamic results** are not stored in either app (version 1): the modal basis is large, and Re-run recomputes it.
+  in both apps), and the JS-written files open natively with their stored numbers. The study options (fatigue loading and finish,
+  nonlinear steps, frequency and buckling mode counts, drop height, optimization goal and limits) are written and read in both apps, with
+  a round-trip test for each study. What the native app does not keep: a few result fields its own structs do not hold (the
+  nonlinear and optimization engine, a base peak stress; they are written empty or zero), and the `fOp` option of the dynamic study.
+- **Large results.** A long break test is still the biggest piece (8.6 MB for 60 steps on the 140k-vertex L-bracket, 6.3 MB for 35 steps).
+  Both Save dialogs start any result over 4 MB unchecked and show its size. Dropping every second step would halve it again.
+- **Linear dynamic results** are not stored in either app (version 1): the modal basis is large, and Re-run recomputes it. The file's info
+  panel says so (`INFO.notStored`), and opening a file saved with the dynamic study selected tells the user to press Run.
 - **Break test, loaded from a file:** the voxels that show cracks are placed using the nearest surface vertex's displacement,
   because the voxel grid's node displacements are not stored (they would be tens of megabytes). The deformed part and the
-  stress colours are exact.
+  stress colours are exact; the app smoke measures a 7.9 of 255 picture difference for a 35-step break test (legend identical).
 - **Native study options** (SETP `options`) are written empty; the native studies have no options model to save. A native
   file opened in the web app shows the web app's defaults for those.
 - **Cross-app limits:** the native result meta carry the keys the native results have; the web importer fills the rest (the
   thermal history comes from the frame times). A native GPU engine choice is saved as "auto". The native camera in VIEW
   was not compared visually.
-- **Windows and Linux native builds** of the `.psim` code were not tried (no machine; the NSIS file association is
-  written but untested). The AppImage cannot register a MIME type by itself. The ZIP packages associate nothing.
+- **Windows and Linux native packages:** built and tested on GitHub's runners (above). The AppImage cannot register a MIME type by itself
+  (it needs a desktop integration tool or `update-mime-database`), and the ZIP packages associate nothing.
 - **Lighthouse and axe** were not run: not installed, and I did not install anything. The pages use semantic HTML,
   skip link, labelled landmarks, keyboard-reachable disabled buttons, alt text and system colour schemes; contrast was
   checked by eye only.
 - **Landing page screenshots** are the existing `docs/images` (not regenerated from the current UI).
-- **`ctest` hangs on this shared machine** (0% CPU, even for `ctest -N`); the native test binaries run directly and pass.
+- **`ctest` hangs on this shared Mac** (0% CPU, even for `ctest -N`); the native test binaries run directly and pass there, and `ctest` itself
+  passes 7 of 7 on the Windows and Linux runners.
 - **Re-run difference for airflow** is not shown (the run does not end by itself); the other studies show it.
 - **A 1M-cell airflow save and open in the app** was measured at the study level (2.5 MB, 759 ms to rebuild the solid cells),
   not through the Save dialog.
