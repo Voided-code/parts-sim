@@ -1411,6 +1411,7 @@ export class StructuralPanel {
     this.brk = { steps, totalF: meta.totalF, material: meta.material, current: 0, done: true, reason: meta.reason, model, toMeters: meta.toMeters, scale: meta.scale || undefined, loaded: true };
     if (!this.result) this.display = 'break';
     $('#break-card').hidden = false;
+    this.renderBreakKPIs();
   }
 
   /** Nearest-vertex displacement of a voxel centre, for break steps loaded from a file. */
