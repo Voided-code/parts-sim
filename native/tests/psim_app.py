@@ -91,7 +91,7 @@ def main():
         check(f"3d {study} options come back after reopening", rc == 0 and m and ok, out + " got " + str(got))
     # 3f: the linear dynamic result is not stored: INFO.notStored says so, and opening says it in the status line
     dyn = t / "dyn.psim"
-    rc, out = app(a.exe, f"sample:beam;idle;engine:cpu;mesh:3000;study:dynamic;run;idle;savepsim:{dyn};quit")
+    rc, out = app(a.exe, f"sample:beam;idle;engine:cpu;mesh:3000;study:dynamic;run;idle;wait:3000;savepsim:{dyn};quit")
     check("3f dynamic run and save", rc == 0 and dyn.exists(), out)
     check("3f INFO.notStored is ['dynamic']", 'info.notStored[0] = "dynamic"' in js("dump", dyn).stdout, js("dump", dyn).stdout[:400])
     rc, out = app(a.exe, f"open:{dyn};idle;wait:500;status;quit")
