@@ -187,7 +187,8 @@ export async function saveDialog(app) {
   let cadZ = null;
   if (draft.cad) cadZ = draft.cad.size;
 
-  const state = { geometry: 'quantised', setup: true, results: new Set(draft.results.keys()), cad: false, thumb: true };
+  // a result over 4 MB (a long break test, many drop frames) starts unchecked; the size next to it says why
+  const state = { geometry: 'quantised', setup: true, results: new Set([...draft.results.keys()].filter((id) => (sizes.results[id] ?? 0) < 4e6)), cad: false, thumb: true };
   const total = h('strong');
   const refresh = () => {
     let n = 2000 + (state.thumb && thumb ? thumb.length : 0);
@@ -202,7 +203,7 @@ export async function saveDialog(app) {
   const geomRadio = (mode, label) => h('label.check', {}, h('input', { type: 'radio', name: 'psim-geom', value: mode, checked: mode === 'quantised', onchange: () => { state.geometry = mode; refresh(); } }), ` ${label} `, h('span.muted', {}, kb(sizes.geometry[mode])));
   const name = h('input', { type: 'text', value: draft.name, 'aria-label': 'Name' });
   const notes = h('textarea', { rows: 2, placeholder: 'Notes for whoever opens the file (optional)', 'aria-label': 'Notes' });
-  const resultRows = [...draft.results.keys()].map((id) => check(RESULT_LABELS[id] ?? id, kb(sizes.results[id]), id, { set: (on) => (on ? state.results.add(id) : state.results.delete(id)) }));
+  const resultRows = [...draft.results.keys()].map((id) => check(RESULT_LABELS[id] ?? id, kb(sizes.results[id]), id, { checked: state.results.has(id), set: (on) => (on ? state.results.add(id) : state.results.delete(id)) }));
   const save = h('button.btn.primary', {
     type: 'button',
     onclick: async () => {

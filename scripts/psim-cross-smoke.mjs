@@ -35,10 +35,15 @@ try {
       tab: window.partsSim.tab,
       kpis: document.querySelector('#kpis')?.innerText,
       thermal: document.querySelector('#th-kpis')?.innerText,
+      flow: document.querySelector('#flow-card')?.hidden ? '' : document.querySelector('#flow-kpis')?.innerText,
+      frozen: window.partsSim.airflow?.study?.frozen,
+      study: window.partsSim.structural.study,
+      card: document.querySelector('#study-card')?.hidden ? '' : document.querySelector('#study-card')?.innerText.slice(0, 160),
+      breakKpis: document.querySelector('#break-card')?.hidden ? '' : document.querySelector('#break-kpis')?.innerText,
       part: window.partsSim.part?.name,
     }));
     const ok = !errors.length && !/error/.test(r.cls) && /Loaded from file/.test(r.banner);
-    console.log(`${ok ? 'ok  ' : 'FAIL'} ${basename(file)} -> ${r.part}, tab ${r.tab}\n  ${r.status}\n  ${(r.kpis || '').replace(/\n+/g, ' | ')}\n  ${(r.thermal || '').replace(/\n+/g, ' | ')}${errors.length ? `\n  errors: ${errors.join('; ')}` : ''}`);
+    console.log(`${ok ? 'ok  ' : 'FAIL'} ${basename(file)} -> ${r.part}, tab ${r.tab}\n  ${r.status}\n  ${(r.kpis || '').replace(/\n+/g, ' | ')}\n  ${(r.thermal || '').replace(/\n+/g, ' | ')}${r.card ? `\n  ${r.study}: ${r.card.replace(/\n+/g, ' | ')}` : ''}${r.breakKpis ? `\n  break: ${r.breakKpis.replace(/\n+/g, ' | ')}` : ''}${r.flow ? `\n  airflow (frozen ${r.frozen}): ${r.flow.replace(/\n+/g, ' | ')}` : ''}${errors.length ? `\n  errors: ${errors.join('; ')}` : ''}`);
     if (!ok) failed++;
     await page.screenshot({ path: `test-artifacts/web/cross-${basename(file, '.psim')}.png` });
     await page.close();

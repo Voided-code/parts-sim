@@ -62,8 +62,10 @@ the native app, without solving again. The specification is [psim-format.md](psi
 ### The native app
 
 The Qt/C++ app has the same reader and writer (`native/src/core/psim.cpp`, no Qt), a `psim_tool` command-line tool,
-and in the app: Save as .psim, open (menu, toolbar, drop, argument, Finder), the banner, File info, Re-run, and
-the setup, the static result and the thermal result. See *What is not done*.
+and in the app: Save as .psim (the same dialog contents), open (menu, toolbar, drop, argument, Finder), the banner,
+File info, Re-run, and the setup and the results listed above. A .psim document type is registered in the macOS
+`Info.plist` (UTI `org.partssim.psim`), the Linux `.desktop` file and shared-mime-info XML, and the Windows NSIS installer
+(untested).
 
 ## Measured against the brief's targets
 
@@ -160,15 +162,27 @@ own range; the 8-bit density of the topology study at most 0.2%.
 
 - **Deploying the site.** Held until the airflow fixes are integrated and `.psim` is complete, so that the live accuracy page
   shows good numbers (the owner's decision). The branch is pushed; `site.yml` deploys only from `main`.
-- **Native app, results other than static and thermal.** NATIVE_STATUS
+- **Native app: study options and a few fields.** The native app saves and restores the setup and the results of the bend
+  test, break test, nonlinear, frequency, buckling, fatigue, drop test, topology and size optimization, thermal and airflow
+  (the airflow result opens without the solver or the GPU). Every one of those files, written by the native app, opens
+  in the web app (11 files checked: the card, legend and numbers show, for example airflow Cd 1.38 and drag 152 N, the same
+  in both apps), and the JS-written files open natively with their stored numbers. What the native app does not save: the
+  study options (fatigue loading and finish, nonlinear steps, ...: SETP `options` is written empty, so those reset to
+  defaults when the file is opened), a few result fields its own structs do not keep (the nonlinear engine, the
+  optimization engine, a base peak stress), and the break test is large (19.7 MB for 60 steps of the L-bracket at 20k
+  voxels, because every step's stress and displacement are stored; see below).
+- **Large results.** A long break test (60 steps) is 20 MB and 17 drop frames are 10 MB raw, because every step or frame keeps its
+  full per-vertex fields. The web Save dialog starts any result over 4 MB unchecked and shows its size; the native dialog
+  does not do that yet. Subsampling steps is the obvious next saving.
 - **Linear dynamic results** are not stored in either app (version 1): the modal basis is large, and Re-run recomputes it.
 - **Break test, loaded from a file:** the voxels that show cracks are placed using the nearest surface vertex's displacement,
   because the voxel grid's node displacements are not stored (they would be tens of megabytes). The deformed part and the
   stress colours are exact.
 - **Native study options** (SETP `options`) are written empty; the native studies have no options model to save. A native
   file opened in the web app shows the web app's defaults for those.
-- **Cross-app limits:** the native thermal and static meta carry the keys the native result has; the web importer
-  fills the rest (the thermal history comes from the frame times). A native GPU engine choice is saved as "auto".
+- **Cross-app limits:** the native result meta carry the keys the native results have; the web importer fills the rest (the
+  thermal history comes from the frame times). A native GPU engine choice is saved as "auto". The native camera in VIEW
+  was not compared visually.
 - **Windows and Linux native builds** of the `.psim` code were not tried (no machine; the NSIS file association is
   written but untested). The AppImage cannot register a MIME type by itself. The ZIP packages associate nothing.
 - **Lighthouse and axe** were not run: not installed, and I did not install anything. The pages use semantic HTML,
