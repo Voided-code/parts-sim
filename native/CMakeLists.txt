@@ -312,7 +312,7 @@ if(PARTS_SIM_APP)
         WriteRegStr SHCTX 'Software\\Classes\\.psim' 'Content Type' 'application/x-parts-sim'
         WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim' '' 'Parts Sim file'
         WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim\\DefaultIcon' '' '$INSTDIR\\bin\\Parts Sim.exe,0'
-        WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim\\shell\\open\\command' '' '\"$INSTDIR\\bin\\Parts Sim.exe\" \"%1\"'
+        WriteRegStr SHCTX 'Software\\Classes\\PartsSim.psim\\shell\\open\\command' '' '$\\\"$INSTDIR\\bin\\Parts Sim.exe$\\\" $\\\"%1$\\\"'
         System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
       ")
       set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "

@@ -233,6 +233,7 @@ jobs:
           if ((Get-ItemProperty "$found\.psim").'(default)' -ne 'PartsSim.psim') { throw '.psim does not point to the Parts Sim file class.' }
           $command = (Get-ItemProperty "$found\PartsSim.psim\shell\open\command").'(default)'
           "open command: $command"
+          reg query "HKLM\Software\Classes\PartsSim.psim\shell\open\command"
           if ($command -notmatch 'Parts Sim\.exe') { throw 'The open command does not start Parts Sim.' }
           $exe = Get-ChildItem $dir -Recurse -Filter 'Parts Sim.exe' | Select-Object -First 1
           if (-not $exe) { throw 'The installer put no Parts Sim.exe in the folder.' }
