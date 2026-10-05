@@ -310,6 +310,30 @@ test('arrays: a stride-3 field round trips within its bound and codes smaller th
   assert.throws(() => encodeArrays({}, [{ name: 'x', data: new Float32Array(12), enc: 'f32', stride: 3 }]), PsimError);
 });
 
+test('arrays: a series predicted from the previous step round trips and codes smaller', async () => {
+  const n = 3000, steps = 6;
+  const frames = Array.from({ length: steps }, (_, k) => Float32Array.from({ length: n }, (_, i) => Math.sin(i / 30) * (1 + k * 0.05) + (i % 97 === 0 ? k * 0.01 : 0)));
+  let lo = Infinity, hi = -Infinity;
+  for (const f of frames) for (const v of f) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const plain = encodeArrays({}, frames.map((d, k) => ({ name: `f.${k}`, data: d, enc: 'q16' })));
+  const series = encodeArrays({}, frames.map((d, k) => ({ name: `f.${k}`, data: d, enc: 'q16', range: [lo, hi], ...(k ? { base: `f.${k - 1}` } : {}) })));
+  const back = decodeArrays(series.bytes).arrays;
+  const bound = (hi - lo) / (2 * 65534);
+  frames.forEach((d, k) => { const b = back.get(`f.${k}`).data; for (let i = 0; i < n; i++) assert.ok(Math.abs(b[i] - d[i]) <= bound * 1.0001 + 1e-6, `frame ${k} value ${i}`); });
+  const [zp, zs] = [(await deflateRaw(plain.bytes)).length, (await deflateRaw(series.bytes)).length];
+  assert.ok(zs < 0.8 * zp, `the series codes smaller (${zs} vs ${zp})`);
+  assert.throws(() => encodeArrays({}, [{ name: 'a', data: new Float32Array(4), enc: 'q16' }, { name: 'b', data: new Float32Array(4), enc: 'q16', base: 'a', range: [0, 1] }]), PsimError, 'range differs from the base');
+  assert.throws(() => encodeArrays({}, [{ name: 'b', data: new Float32Array(4), enc: 'q16', base: 'missing' }]), PsimError);
+  assert.throws(() => encodeArrays({}, [{ name: 'a', data: new Float32Array(4), enc: 'f32' }, { name: 'b', data: new Float32Array(4), enc: 'f32', base: 'a' }]), PsimError);
+  // a header that names a base that does not exist, or that differs in range, is refused
+  const bad = Buffer.from(series.bytes);
+  const text = Buffer.from('"base":"f.0"');
+  const at = bad.indexOf(text);
+  assert.ok(at > 0);
+  bad.write('"base":"f.9"', at);
+  assert.throws(() => decodeArrays(new Uint8Array(bad)), PsimError);
+});
+
 for (const name of ['v1-tube.psim', 'v1-tube-stride.psim']) {
 test(`a file written by format version 1 still reads (fixture ${name})`, async () => {
   const { readFile } = await import('node:fs/promises');

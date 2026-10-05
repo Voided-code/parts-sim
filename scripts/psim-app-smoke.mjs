@@ -69,6 +69,35 @@ try {
   assert.ok(d1 < 6);
   await b.close();
 
+  // ---- the series studies (steps and frames are predicted from the one before): break test and drop test
+  for (const [id, sample, study, run, card, kpis] of [['break', 'lbracket', 'static', '#btn-break', '#break-card', '#break-kpis'], ['drop', 'beam', 'drop', '#btn-run', '#study-card', '#study-card']]) {
+    const x = await open(`${base}?sample=${sample}`);
+    await x.waitForFunction(() => !!window.partsSim?.part, null, { timeout: 60000 });
+    await idle(x);
+    await x.evaluate(([n, st]) => { const r = document.querySelector('#res-range'); r.value = n; r.dispatchEvent(new Event('input')); r.dispatchEvent(new Event('change')); window.partsSim.structural.setStudy(st); }, [id === 'break' ? 28 : 20, study]);
+    await x.click(run);
+    await x.waitForTimeout(300);
+    await idle(x);
+    await x.waitForTimeout(700);
+    const text0 = await text(x, kpis);
+    const leg0 = await text(x, '#legend');
+    const shot0 = await x.locator('#viewport').screenshot();
+    const bytesX = Buffer.from(await x.evaluate(async (all) => Array.from(await window.partsSim.psim.save(all ? {} : {})), true));
+    await writeFile(`${out}/app-${id}.psim`, bytesX);
+    const steps = await x.evaluate((i) => (i === 'break' ? window.partsSim.structural.brk.steps.length : window.partsSim.structural.studies.drop.result.frames.length), id);
+    console.log(`${id} file: ${bytesX.length} bytes (${steps} ${id === 'break' ? 'steps' : 'frames'})`);
+    await x.close();
+    const y = await open(base);
+    await y.evaluate(async (arr) => { await window.partsSim.psim.open(Uint8Array.from(arr), `${id}.psim`); }, [...bytesX]);
+    await y.waitForFunction(() => !document.querySelector('#file-banner').hidden, null, { timeout: 60000 });
+    await y.waitForTimeout(900);
+    assert.equal(await text(y, kpis), text0, `${id} card`);
+    const d = await pixelDiff(y, shot0, await y.locator('#viewport').screenshot());
+    console.log(`${id} picture difference ${d.toFixed(3)}/255 (legend ${leg0 === (await text(y, '#legend')) ? 'identical' : 'differs'})`);
+    assert.ok(d < 8, `${id} picture`);
+    await y.close();
+  }
+
   // ---- airflow on the Ahmed body, CPU engine, 50k cells
   a = await open(`${base}?sample=ahmed`);
   await a.waitForFunction(() => !!window.partsSim?.part, null, { timeout: 60000 });

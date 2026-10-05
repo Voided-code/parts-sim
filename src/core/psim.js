@@ -251,6 +251,7 @@ export function encodeArrays(meta, arrays) {
   const entries = [];
   const blobs = [];
   const bounds = [];
+  const codesByName = new Map();
   for (const a of arrays) {
     const { name, data, enc } = a;
     if (!(enc in WIDTH)) fail(`Unknown array encoding ${enc}.`);
@@ -262,6 +263,7 @@ export function encodeArrays(meta, arrays) {
       if (!(enc === 'q16' || enc === 'q8') || a.dims || ![2, 3, 4].includes(stride) || n % stride) fail('An array has a stride its encoding cannot use.');
       entry.stride = stride;
     }
+    if (a.base !== undefined && !(enc === 'q16' || enc === 'q8')) fail('Only quantised arrays can be predicted from another array.');
     let blob;
     if (enc === 'f32') {
       const bits = new Uint32Array(new Float32Array(data).buffer);
@@ -277,18 +279,32 @@ export function encodeArrays(meta, arrays) {
     } else {
       const L = LEVELS[enc];
       let min = Infinity, max = -Infinity;
-      for (let i = 0; i < n; i++) {
-        const v = data[i];
-        if (Number.isFinite(v)) { if (v < min) min = v; if (v > max) max = v; }
+      if (a.range) {
+        [min, max] = a.range; // a range shared with other arrays, so their codes can be compared
+        if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) fail('An array has an invalid range.');
+      } else {
+        for (let i = 0; i < n; i++) {
+          const v = data[i];
+          if (Number.isFinite(v)) { if (v < min) min = v; if (v > max) max = v; }
+        }
+        if (min > max) { min = 0; max = 0; }
       }
-      if (min > max) { min = 0; max = 0; }
       const codes = enc === 'q16' ? new Uint16Array(n) : new Uint8Array(n);
       const span = max - min;
       for (let i = 0; i < n; i++) {
         const v = data[i];
-        codes[i] = Number.isFinite(v) ? (span > 0 ? 1 + Math.round(((v - min) / span) * (L - 2)) : 1) : 0;
+        codes[i] = Number.isFinite(v) ? (span > 0 ? 1 + Math.min(L - 2, Math.max(0, Math.round(((v - min) / span) * (L - 2)))) : 1) : 0;
       }
-      const res = predictEncode(codes, L, a.dims, stride);
+      codesByName.set(name, codes);
+      let toPredict = codes;
+      if (a.base !== undefined) {
+        const b = entries.find((e) => e.name === a.base);
+        const baseCodes = codesByName.get(a.base);
+        if (!b || !baseCodes || b.enc !== enc || b.n !== n || b.min !== min || b.max !== max) fail('An array can only be predicted from an earlier array of the same size, coding and range.');
+        entry.base = a.base;
+        toPredict = codes.map((c, i) => (c - baseCodes[i]) & (L - 1));
+      }
+      const res = predictEncode(toPredict, L, a.dims, stride);
       blob = new Uint8Array(WIDTH[enc] * n);
       putPlanes(blob, 0, res, WIDTH[enc]);
       entry.min = min;
@@ -320,6 +336,8 @@ export function decodeArrays(bytes) {
   if (!head || typeof head !== 'object' || !Array.isArray(head.arrays)) fail('A result section has no array list.', 'damaged');
   if (head.arrays.length > LIMITS.arrays) fail('A result section lists too many arrays.', 'limit');
   const arrays = new Map();
+  const codesByName = new Map();
+  const headers = new Map();
   let o = 4 + hl;
   let elements = 0;
   for (const e of head.arrays) {
@@ -344,12 +362,19 @@ export function decodeArrays(bytes) {
       const L = LEVELS[e.enc];
       if (!Number.isFinite(e.min) || !Number.isFinite(e.max)) fail('A quantised array has no valid range.', 'damaged');
       const res = getPlanes(bytes, o, e.n, WIDTH[e.enc]);
-      const codes = predictDecode(res, L, e.dims, e.enc === 'q16' ? Uint16Array : Uint8Array, stride);
+      let codes = predictDecode(res, L, e.dims, e.enc === 'q16' ? Uint16Array : Uint8Array, stride);
+      if (e.base !== undefined) {
+        const b = headers.get(e.base), baseCodes = codesByName.get(e.base);
+        if (typeof e.base !== 'string' || !b || !baseCodes || b.enc !== e.enc || b.n !== e.n || b.min !== e.min || b.max !== e.max) fail('An array is predicted from an array it does not match.', 'damaged');
+        codes = codes.map((c, i) => (c + baseCodes[i]) & (L - 1));
+      }
+      codesByName.set(e.name, codes);
       data = new Float32Array(e.n);
       const k = (e.max - e.min) / (L - 2);
       for (let i = 0; i < e.n; i++) data[i] = codes[i] === 0 ? NaN : e.min + (codes[i] - 1) * k;
     }
     if (arrays.has(e.name)) fail(`The array ${e.name} appears twice.`, 'damaged');
+    headers.set(e.name, e);
     arrays.set(e.name, { data, enc: e.enc, dims: e.dims ?? null, err: e.err ?? 0 });
     o += e.bytes;
   }

@@ -10,6 +10,7 @@ import { renderLegend } from './legend.js';
 import { LineChart } from './chart.js';
 import { createStudies, STUDY_INFO } from './studies.js';
 import { patchToJson, patchFromJson } from '../core/psim-patches.js';
+import { seriesSpecs } from '../core/psim-series.js';
 
 const FIX_COLOR = 0x1a9f55;
 const LOAD_COLOR = 0x9b46d4;
@@ -1364,17 +1365,18 @@ export class StructuralPanel {
     if (!b || !b.steps.length) return null;
     const m = b.model;
     const arrays = [];
-    const steps = b.steps.map((s, i) => {
+    const steps = b.steps.map((s) => {
       if (!s.mapped) {
         const W = m.vertexWeights(s.activeNode);
         const u = m.interpolate(W, s.u, 3);
         for (let q = 0; q < u.length; q++) u[q] /= b.toMeters;
         s.mapped = { vm: m.interpolate(W, s.nodeVM), u };
       }
-      arrays.push({ name: `break.vm.${i}`, data: s.mapped.vm, enc: 'q16' }, { name: `break.u.${i}`, data: s.mapped.u, enc: 'q16', stride: 3 },
-        { name: `break.cracked.${i}`, data: Int32Array.from(s.cracked), enc: 'i32' }, { name: `break.detached.${i}`, data: Int32Array.from(s.detached), enc: 'i32' });
       return { step: s.step, lambda: s.lambda, maxDisp: s.maxDisp };
     });
+    // the steps are two series (stress, displacement): one shared range each, every step predicted from the one before
+    arrays.push(...seriesSpecs(b.steps.map((s) => s.mapped.vm), (i) => `break.vm.${i}`), ...seriesSpecs(b.steps.map((s) => s.mapped.u), (i) => `break.u.${i}`, { stride: 3 }));
+    b.steps.forEach((s, i) => arrays.push({ name: `break.cracked.${i}`, data: Int32Array.from(s.cracked), enc: 'i32' }, { name: `break.detached.${i}`, data: Int32Array.from(s.detached), enc: 'i32' }));
     return {
       meta: { steps, totalF: b.totalF, material: b.material, toMeters: b.toMeters, reason: b.reason ?? null, done: !!b.done, scale: b.scale ?? null, grid: { dims: Array.from(m.dims), origin: Array.from(m.origin), h: m.h, resolution: m.resolution } },
       arrays,

@@ -2,6 +2,7 @@
 // frequency, buckling, fatigue, drop test, linear dynamic and optimization. Each study renders its
 // options, runs its worker job and draws its results; StructuralPanel owns the shared setup
 // (material, fixtures, loads, mesh) and the linear static study.
+import { seriesSpecs } from '../core/psim-series.js';
 import * as THREE from 'three';
 import { FEAJob } from '../fea/structural.js';
 import { MATERIALS, completeMaterial } from '../core/materials.js';
@@ -358,12 +359,14 @@ class NonlinearStudy extends Study {
     const r = this.result;
     if (!r?.done || !r.reason || !r.steps.length) return null;
     const nV = this.part.nVert, arrays = [];
-    const one = (s, id) => {
-      arrays.push({ name: `nonlinear.${id}.u`, data: s.u, enc: 'q16', stride: 3 }, { name: `nonlinear.${id}.vm`, data: s.vm, enc: 'q16' }, { name: `nonlinear.${id}.pe`, data: s.pe, enc: 'q16' });
-      return { lam: s.lam, D: s.D, maxVM: s.maxVM, maxPE: s.maxPE, maxDisp: s.maxDisp, iterations: s.iterations };
-    };
-    const steps = r.steps.map((s, i) => one(s, `step.${i}`));
-    const unloaded = r.unloaded ? one(r.unloaded, 'unloaded') : null;
+    const one = (s) => ({ lam: s.lam, D: s.D, maxVM: s.maxVM, maxPE: s.maxPE, maxDisp: s.maxDisp, iterations: s.iterations });
+    const steps = r.steps.map(one);
+    const unloaded = r.unloaded ? one(r.unloaded) : null;
+    // each field of the steps is one series (shared range, predicted from the step before); the spring-back state stands alone
+    for (const [field, stride] of [['u', 3], ['vm', 1], ['pe', 1]]) {
+      arrays.push(...seriesSpecs(r.steps.map((s) => s[field]), (i) => `nonlinear.step.${i}.${field}`, { stride }));
+    }
+    if (r.unloaded) for (const [field, stride] of [['u', 3], ['vm', 1], ['pe', 1]]) arrays.push({ name: `nonlinear.unloaded.${field}`, data: r.unloaded[field], enc: 'q16', ...(stride > 1 ? { stride } : {}) });
     const meta = {
       nVert: nV, units: r.units, material: plain(r.material), totalF: r.totalF, reason: r.reason, engine: r.engine ?? null, gpuNote: r.gpuNote ?? null,
       plastic: !!r.plastic, opts: plain(r.opts), steps, unloaded,
@@ -959,7 +962,7 @@ class DropStudy extends Study {
       { name: 'drop.times', data: r.times, enc: 'f32' },
       { name: 'drop.forces', data: r.forces, enc: 'f32' },
     ];
-    r.frames.forEach((fr, i) => arrays.push({ name: `drop.frame.${i}.u`, data: fr.u, enc: 'q16', stride: 3 }, { name: `drop.frame.${i}.vm`, data: fr.vm, enc: 'q16' }));
+    arrays.push(...seriesSpecs(r.frames.map((fr) => fr.u), (i) => `drop.frame.${i}.u`, { stride: 3 }), ...seriesSpecs(r.frames.map((fr) => fr.vm), (i) => `drop.frame.${i}.vm`));
     const peakFrame = r.frames.findIndex((fr) => fr.t >= r.tPeak[r.peakAt]);
     const meta = {
       nVert: this.part.nVert, units: r.units, material: plain(r.material), height: this.opts.height, speed: r.speed, mass: r.mass,

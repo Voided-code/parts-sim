@@ -63,6 +63,8 @@ export function gather(app) {
     },
     cad: app.sourceFile ?? null,
     partInfo: app.partInfo,
+    // results the file cannot hold: the linear dynamic study's modal basis is too large (Re-run recomputes it)
+    notStored: st.studies.dynamic?.result ? ['dynamic'] : [],
   };
 }
 
@@ -128,6 +130,7 @@ export async function buildFile(app, draft, options, thumb = null, created = nul
     content.rair = { meta: r.meta, arrays: r.arrays };
   }
   info.contains.results = wantResults;
+  if (draft.notStored?.length) info.notStored = draft.notStored;
   if (options.cad && draft.cad) {
     content.cad = new Uint8Array(await draft.cad.arrayBuffer());
     info.contains.cad = true;
@@ -393,6 +396,7 @@ export function showInfo(app, f) {
       ['Setup', c.setup ? 'included' : 'not included'],
       ['Results', (c.results ?? []).map((id) => RESULT_LABELS[id] ?? id).join(', ') || 'none'],
       ['CAD source', c.cad ? c.cadName || 'included' : 'not included'],
+      ['Not stored', (info.notStored ?? []).map((id) => `${NOT_STORED[id] ?? id}`).join('; ')],
       ['File size', kb(f.size)],
     ]),
     h('h3', {}, 'Sections'),
@@ -408,6 +412,7 @@ export function showInfo(app, f) {
   dlg.showModal();
 }
 
+const NOT_STORED = { dynamic: 'The linear dynamic study\u2019s results are not stored in .psim files (they are large); its settings are, so press Re-run to compute them again' };
 const SECTION_NAMES = { INFO: 'Info', THMB: 'Preview picture', GEOM: 'Geometry', CADS: 'CAD source', SETP: 'Setup', RFEA: 'Structural and thermal results', RAIR: 'Airflow results', VIEW: 'View' };
 const sectionName = (id) => SECTION_NAMES[id] ?? `${id} (unknown)`;
 

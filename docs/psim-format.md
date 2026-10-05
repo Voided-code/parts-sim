@@ -107,6 +107,7 @@ A JSON object with these keys (the order of keys is not significant, and extra k
 }
 ```
 
+- `notStored` (optional): the ids of results the app had but a file cannot hold. Version 1 knows `dynamic` (the linear dynamic study: its modal basis is large, so its settings are stored and Re-run recomputes it). The info panel says so.
 - `kind` is `web`, `electron` or `native`. There is no user name, folder name or machine name.
 - `bounds` lists the worst-case error of every lossy field: the largest difference between a stored and an original
   value. Fields that are not listed are exact.
@@ -205,6 +206,7 @@ cannot hold infinity or not-a-number, so these are written as `{"$num":"inf"}`, 
     `(max - min) / (2 * (L - 2))`. The codes are then predicted and written as zig-zag residuals in byte planes.
 - `err`: written for `q16` and `q8`: the largest error of the array, `(max - min) / (2 * (L - 2))`. Readers may ignore it.
 - `stride`: optional, 2, 3 or 4, for `q16` and `q8` arrays without `dims` whose values come in groups (a displacement or a mode shape has three values per vertex: x y z). The prediction is then the value `stride` places back (the same component of the previous vertex) instead of the previous value, and `n` must be a multiple of `stride`. Without it (stride 1), the prediction is the previous value. On a displacement field this makes the array about half the size.
+- `base`, with `min` and `max` equal to the base array's: for a series of arrays that change little from one to the next (the steps of a break test, the frames of a drop test). `base` names an earlier array of the same `enc`, `n`, `min` and `max`. The codes are first differenced against the base's codes (`(code - base code) mod L`), then predicted as usual (`stride`, `dims`), and the reader adds the base's codes back. The writer gives the whole series one shared `min` and `max`. On a break test this makes the steps 40-50% smaller.
 - `dims`: present for 3-D grids (`nx * ny * nz = n`, x fastest). The prediction is the 3-D Lorenzo predictor
   `p = a[x-1] + a[y-1] + a[z-1] - a[x-1,y-1] - a[x-1,z-1] - a[y-1,z-1] + a[x-1,y-1,z-1]` (missing neighbours count as
   0). Without `dims` the prediction is the previous value. The residual `code - p` is taken modulo `L`, as a signed
