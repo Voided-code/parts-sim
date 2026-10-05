@@ -755,4 +755,49 @@ TEST("restorePart rebuilds a built part exactly, without refining") {
     }
 }
 
+TEST("series: arrays predicted from the previous step round trip and code smaller; bad bases are refused") {
+    const size_t n = 3000, steps = 6;
+    std::vector<std::vector<float>> frames(steps, std::vector<float>(n));
+    for (size_t k = 0; k < steps; k++)
+        for (size_t i = 0; i < n; i++) frames[k][i] = float(std::sin(double(i) / 30) * (1 + double(k) * 0.05) + (i % 97 == 0 ? double(k) * 0.01 : 0));
+    std::vector<const std::vector<float>*> ptrs;
+    std::vector<Array> plain;
+    double lo = 1e300, hi = -1e300;
+    for (auto& f : frames) { ptrs.push_back(&f); for (float v : f) { lo = std::min(lo, double(v)); hi = std::max(hi, double(v)); } }
+    for (size_t k = 0; k < steps; k++) plain.push_back(qarray("f." + std::to_string(k), Enc::Q16, frames[k]));
+    const auto series = seriesArrays(ptrs, [](size_t i) { return "f." + std::to_string(i); });
+    const Bytes bp = encodeArrays(jobj(), plain), bs = encodeArrays(jobj(), series);
+    const Arrays back = decodeArrays(bs.data(), bs.size());
+    const double bound = (hi - lo) / (2 * 65534);
+    for (size_t k = 0; k < steps; k++) {
+        const Array* a = back.find("f." + std::to_string(k));
+        CHECK(a && a->f.size() == n);
+        for (size_t i = 0; a && i < n; i++) CHECK(std::abs(a->f[i] - frames[k][i]) <= bound * 1.0001 + 1e-6);
+    }
+    CHECK(deflateRaw(bs.data(), bs.size()).size() < 0.8 * double(deflateRaw(bp.data(), bp.size()).size()));
+    // refused when writing: range differs from the base, missing base, non-quantised
+    Array a = qarray("a", Enc::Q16, std::vector<float>(4, 0.f)), b = qarray("b", Enc::Q16, std::vector<float>(4, 0.f));
+    b.base = "a"; b.hasRange = true; b.rangeMin = 0; b.rangeMax = 1;
+    CHECK_THROWS(encodeArrays(jobj(), {a, b}), "invalid");
+    b.hasRange = false; b.base = "missing";
+    CHECK_THROWS(encodeArrays(jobj(), {b}), "invalid");
+    Array f1 = qarray("a", Enc::F32, {1, 2, 3, 4}), f2 = qarray("b", Enc::F32, {1, 2, 3, 4});
+    f2.base = "a";
+    CHECK_THROWS(encodeArrays(jobj(), {f1, f2}), "invalid");
+    // a header that names a base that does not exist is refused
+    std::string text(bs.begin(), bs.end());
+    const size_t at = text.find("\"base\":\"f.0\"");
+    CHECK(at != std::string::npos);
+    Bytes bad = bs;
+    bad[at + 10] = '9';
+    CHECK_THROWS(decodeArrays(bad.data(), bad.size()), "damaged");
+    bad = bs;
+    const size_t at1 = text.find("\"base\":\"f.1\"");
+    bad[at1 + 10] = '0';  // f.2 predicted from f.0 now: same range, so it decodes, to different values; but base "f.5" (later) must fail
+    const size_t at2 = text.find("\"base\":\"f.2\"");
+    bad = bs;
+    bad[at2 + 10] = '5';
+    CHECK_THROWS(decodeArrays(bad.data(), bad.size()), "damaged");
+}
+
 TEST_MAIN
