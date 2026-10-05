@@ -2116,6 +2116,7 @@ std::optional<psim::Arrays> StructuralPanel::exportBreak() {
     Break& b = *brk_;
     psim::Arrays out;
     Value steps = jarr();
+    std::vector<const std::vector<float>*> vms, us;
     for (size_t i = 0; i < b.steps.size(); i++) {
         const BreakStep& s = b.steps[i];
         if (!b.mapped[i]) {
@@ -2125,17 +2126,23 @@ std::optional<psim::Arrays> StructuralPanel::exportBreak() {
             mp.vm = interpolate(W, s.nodeVM.data());
             b.mapped[i] = std::move(mp);
         }
-        psim::Array vm, u, cr, de;
-        vm.name = "break.vm." + std::to_string(i); vm.enc = psim::Enc::Q16; vm.f = b.mapped[i]->vm;
-        u.name = "break.u." + std::to_string(i); u.enc = psim::Enc::Q16; u.f = b.mapped[i]->u; u.stride = 3;
-        cr.name = "break.cracked." + std::to_string(i); cr.enc = psim::Enc::I32; cr.i.assign(s.cracked.begin(), s.cracked.end());
-        de.name = "break.detached." + std::to_string(i); de.enc = psim::Enc::I32; de.i.assign(s.detached.begin(), s.detached.end());
-        for (auto* a : {&vm, &u, &cr, &de}) out.list.push_back(std::move(*a));
+        vms.push_back(&b.mapped[i]->vm);
+        us.push_back(&b.mapped[i]->u);
         Value e = jobj();
         e.obj["step"] = jnum(s.step);
         e.obj["lambda"] = jnum(s.lambda);
         e.obj["maxDisp"] = jnum(s.maxDisp);
         steps.arr.push_back(e);
+    }
+    // the steps are two series (stress, displacement): one shared range each, every step predicted from the one before
+    for (auto& a : psim::seriesArrays(vms, [](size_t i) { return "break.vm." + std::to_string(i); })) out.list.push_back(std::move(a));
+    for (auto& a : psim::seriesArrays(us, [](size_t i) { return "break.u." + std::to_string(i); }, 3)) out.list.push_back(std::move(a));
+    for (size_t i = 0; i < b.steps.size(); i++) {
+        psim::Array cr, de;
+        cr.name = "break.cracked." + std::to_string(i); cr.enc = psim::Enc::I32; cr.i.assign(b.steps[i].cracked.begin(), b.steps[i].cracked.end());
+        de.name = "break.detached." + std::to_string(i); de.enc = psim::Enc::I32; de.i.assign(b.steps[i].detached.begin(), b.steps[i].detached.end());
+        out.list.push_back(std::move(cr));
+        out.list.push_back(std::move(de));
     }
     Value m = jobj();
     m.obj["steps"] = steps;

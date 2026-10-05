@@ -368,7 +368,12 @@ public:
         Value steps = jarr();
         for (size_t i = 0; i < r_->steps.size(); i++) {
             steps.arr.push_back(stepMeta(r_->steps[i]));
-            put("nonlinear.step." + std::to_string(i), r_->steps[i]);
+        }
+        // each field of the steps is one series (shared range, predicted from the step before); the spring-back state stands alone
+        for (auto [field, stride] : {std::pair<const char*, uint32_t>{"u", 3}, {"vm", 1}, {"pe", 1}}) {
+            std::vector<const std::vector<float>*> list;
+            for (const auto& st : r_->steps) list.push_back(std::string(field) == "u" ? &st.u : std::string(field) == "vm" ? &st.vm : &st.pe);
+            for (auto& a : psim::seriesArrays(list, [field](size_t i) { return "nonlinear.step." + std::to_string(i) + "." + field; }, stride)) out.list.push_back(std::move(a));
         }
         m.obj["steps"] = steps;
         if (r_->unloaded) { m.obj["unloaded"] = stepMeta(*r_->unloaded); put("nonlinear.unloaded", *r_->unloaded); }
@@ -1294,10 +1299,10 @@ public:
         add("drop.vmMax", r.run.vmMax, psim::Enc::Q16, 1);
         add("drop.times", r.run.times, psim::Enc::F32, 1);
         add("drop.forces", r.run.forces, psim::Enc::F32, 1);
-        for (size_t i = 0; i < r.frames.size(); i++) {
-            add("drop.frame." + std::to_string(i) + ".u", r.frames[i].u, psim::Enc::Q16, 3);
-            add("drop.frame." + std::to_string(i) + ".vm", r.frames[i].vm, psim::Enc::Q16, 1);
-        }
+        std::vector<const std::vector<float>*> us, vms;
+        for (const auto& f : r.frames) { us.push_back(&f.u); vms.push_back(&f.vm); }
+        for (auto& a : psim::seriesArrays(us, [](size_t i) { return "drop.frame." + std::to_string(i) + ".u"; }, 3)) out.list.push_back(std::move(a));
+        for (auto& a : psim::seriesArrays(vms, [](size_t i) { return "drop.frame." + std::to_string(i) + ".vm"; })) out.list.push_back(std::move(a));
         return out;
     }
     bool canImport() const override { return true; }
