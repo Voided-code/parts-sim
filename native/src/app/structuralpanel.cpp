@@ -2136,6 +2136,7 @@ std::optional<psim::Arrays> StructuralPanel::exportBreak() {
     psim::Arrays out;
     Value steps = jarr();
     std::vector<const std::vector<float>*> vms, us;
+    std::vector<std::unique_ptr<std::vector<float>>> scaledStore;
     for (size_t i = 0; i < b.steps.size(); i++) {
         const BreakStep& s = b.steps[i];
         if (!b.mapped[i]) {
@@ -2145,8 +2146,14 @@ std::optional<psim::Arrays> StructuralPanel::exportBreak() {
             mp.vm = interpolate(W, s.nodeVM.data());
             b.mapped[i] = std::move(mp);
         }
-        vms.push_back(&b.mapped[i]->vm);
-        us.push_back(&b.mapped[i]->u);
+        // per unit load: a step's fields are about the unit-load field times lambda, so the series codes much smaller
+        auto scaled = [&](const std::vector<float>& v) {
+            scaledStore.push_back(std::make_unique<std::vector<float>>(v));
+            if (s.lambda > 0) for (float& x : *scaledStore.back()) x = float(x / s.lambda);
+            return scaledStore.back().get();
+        };
+        vms.push_back(scaled(b.mapped[i]->vm));
+        us.push_back(scaled(b.mapped[i]->u));
         Value e = jobj();
         e.obj["step"] = jnum(s.step);
         e.obj["lambda"] = jnum(s.lambda);
@@ -2165,6 +2172,7 @@ std::optional<psim::Arrays> StructuralPanel::exportBreak() {
     }
     Value m = jobj();
     m.obj["steps"] = steps;
+    m.obj["fieldScale"] = jstr("perLambda");
     m.obj["totalF"] = jnum(b.totalF);
     m.obj["material"] = materialToJson(b.material);
     m.obj["toMeters"] = jnum(b.toMeters);
@@ -2198,6 +2206,7 @@ void StructuralPanel::importBreak(const json::Value& m, const psim::Arrays& arra
         if (!a || (!any && a->size() != n)) throw std::runtime_error("The break test in the file does not fit this part.");
         return *a;
     };
+    const bool perLambda = strOr(m["fieldScale"]) == "perLambda";
     const auto& st = m["steps"].arr;
     for (size_t i = 0; i < st.size(); i++) {
         BreakStep s;
@@ -2213,6 +2222,11 @@ void StructuralPanel::importBreak(const json::Value& m, const psim::Arrays& arra
         Break::Mapped mp;
         mp.vm = need("break.vm." + std::to_string(i), nV, false).f;
         mp.u = need("break.u." + std::to_string(i), 3 * nV, false).f;
+        if (perLambda && b.steps.back().lambda > 0) {
+            const double lam = b.steps.back().lambda;
+            for (float& x : mp.vm) x = float(x * lam);
+            for (float& x : mp.u) x = float(x * lam);
+        }
         b.mapped.push_back(std::move(mp));
     }
     if (b.steps.empty()) throw std::runtime_error("The break test in the file has no steps.");
