@@ -69,6 +69,43 @@ def main():
         check(f"3b JS verifies {study}", js("verify", f).returncode == 0, js("verify", f).stderr)
         rc, out = app(a.exe, f"open:{f};idle;wait:800;assert:psim;status;quit")
         check(f"3b {study} reopens from the file", rc == 0 and "results shown from the file" in out, out)
+    # 3d: study options round trip, one case per study (set non-default, save, reopen, read back)
+    options = {
+        "nonlinear": {"opts": {"large": False, "plastic": False, "mode": "failure", "steps": 17}, "view": {"plot": "disp", "exaggerate": 7}},
+        "modal": {"opts": {"nev": 7}, "view": {"amp": 0.2, "animate": False}},
+        "buckling": {"opts": {"nev": 5}, "view": {"amp": 0.11, "animate": True}},
+        "fatigue": {"opts": {"loading": "custom", "R": -0.5, "cycles": 2e7, "finish": "polished", "scale": 1.5}, "view": {"plot": "fos"}},
+        "drop": {"opts": {"height": 2.5}, "view": {"plot": "frame", "exaggerate": 3}},
+        "dynamic": {"opts": {"source": "base", "dir": 2, "type": "sine", "nev": 6, "amp": 2, "zeta": 3, "pulse": 8, "sineF": 80, "duration": 0.5, "quake": 12}, "view": {"plot": "disp", "animate": False}},
+        "optimize": {"opts": {"goal": "sizing", "keep": 55, "iters": 45, "fos": 3, "maxDisp": 2, "objective": "cost", "family": "metals"}, "view": {"level": 0.6}},
+    }
+    for study, want in options.items():
+        f = t / ("opt-" + study + ".psim")
+        j = __import__("json").dumps(want, separators=(",", ":"))
+        rc, out = app(a.exe, f"sample:beam;idle;study:{study};setopt:{study}:{j};savepsim:{f};quit")
+        check(f"3d {study} options save", rc == 0 and f.exists(), out)
+        rc, out = app(a.exe, f"open:{f};idle;wait:500;getopt:{study};quit")
+        m = re.search(r"options \S+: (\{.*\})", out)
+        got = __import__("json").loads(m.group(1)) if m else {}
+        ok = all(got.get(part, {}).get(k) == v or (isinstance(v, float) and abs(got.get(part, {}).get(k, 1e99) - v) < 1e-9) for part in want for k, v in want[part].items())
+        check(f"3d {study} options come back after reopening", rc == 0 and m and ok, out + " got " + str(got))
+    # 3e: a file whose options were written by another app (the JS tools) opens with them applied
+    js_file = t / "opt-js.psim"
+    script = (
+        "import {readPsim, writePsim} from './src/core/psim.js'; import {readFileSync, writeFileSync} from 'node:fs';"
+        f"const f = await readPsim(new Uint8Array(readFileSync({str(t / 'opt-modal.psim')!r})));"
+        "f.setup.structural.options.modal = {opts: {nev: 9, bogus: 1}, view: {amp: 0.25, mode: 3}};"
+        "f.setup.structural.options.drop = {opts: {height: 'tall'}, view: {}};"
+        "f.setup.structural.options.fatigue = {opts: {R: 7}, view: {plot: 'nope'}};"
+        "f.setup.structural.study = 'modal';"
+        "const geometry = f.geometry; const rfea = f.rfea ? {meta: f.rfea.meta, arrays: []} : undefined;"
+        f"writeFileSync({str(js_file)!r}, await writePsim({{info: f.info, geometry: {{...geometry, faceOf: null}}, setup: f.setup, view: f.view}}, {{created: f.info.created}}));"
+    )
+    r = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT, capture_output=True, text=True)
+    check("3e JS rewrites the setup with other options", r.returncode == 0 and js_file.exists(), r.stderr)
+    rc, out = app(a.exe, f"open:{js_file};idle;wait:500;getopt:modal;getopt:drop;getopt:fatigue;quit")
+    check("3e modal options from the file are applied (nev 9, amp 0.25)", '"nev":9' in out and '"amp":0.25' in out, out)
+    check("3e wrong types and out-of-range values are ignored", '"height":1' in out and '"R":0' in out, out)
     # 3c: airflow at ~50k cells on the CPU engine
     af = t / "air.psim"
     rc, out = app(a.exe, f"sample:ahmed;idle;tab:airflow;airengine:cpu;cells:50000;run;idle;airwait:300;idle;aero;savepsim:{af};quit")

@@ -381,6 +381,7 @@ bool MainWindow::openPsim(const QString& path) {
         lf.stored["airflow"] = {{"drag", numOr(a["drag"], NAN)}, {"lift", numOr(a["lift"], NAN)}, {"cd", numOr(a["cd"], NAN)}, {"cl", numOr(a["cl"], NAN)}};
     });
     else if (setup["airflow"].type == Value::Object) guard("airflow setup", [&] { airflow->importState(setup["airflow"]); });
+    guard("study options", [&] { structural->reapplyStudyOptions(setup["structural"]); });
     const Value view = f.view ? *f.view : Value{};
     guard("view", [&] {
         structural->importView(view["structural"]);

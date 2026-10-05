@@ -400,7 +400,8 @@ void StructuralPanel::setStudy(int index) {
     study_ = index;
     studyBox_->setCurrentIndex(index);
     if (app_->part) {
-        resolution_ = suggestResolution(*app_->part, studyInfos()[index].budget);
+        const auto it = resFor_.find(studyInfos()[index].id);
+        resolution_ = it != resFor_.end() ? it->second : suggestResolution(*app_->part, studyInfos()[index].budget);
         targetVoxels_ = voxelFactor_ * estimateVoxels(*app_->part, resolution_);
         syncVoxelControls();
         updateMeshInfo();
@@ -455,6 +456,7 @@ void StructuralPanel::reset(const SampleSetup* setup) {
     fixtures.clear();
     loads.clear();
     selectedLoad = -1;
+    resFor_.clear();
     models_.clear();
     result_.reset();
     brk_.reset();
@@ -887,6 +889,7 @@ void StructuralPanel::setTargetVoxels(double n, bool markChanged) {
     const int before = resolution_;
     if (app_->part) resolution_ = resolutionFor(*app_->part, targetVoxels_, voxelFactor_);
     syncVoxelControls();
+    if (markChanged) resFor_[studyInfos()[study_].id] = resolution_;
     if (markChanged && resolution_ != before) {
         markStale();
         showVoxelPreview();
@@ -1889,6 +1892,7 @@ json::Value StructuralPanel::exportSetup() const {
     o.obj["study"] = jstr(studyInfos()[study_].id.toStdString());
     o.obj["resolution"] = jnum(resolution_);
     Value rf = jobj();
+    for (const auto& [id, n] : resFor_) rf.obj[id.toStdString()] = jnum(n);
     rf.obj[studyInfos()[study_].id.toStdString()] = jnum(resolution_);
     o.obj["resFor"] = rf;
     o.obj["gravity"] = jbool(gravity_->isChecked());
@@ -1925,7 +1929,12 @@ json::Value StructuralPanel::exportSetup() const {
         ld.arr.push_back(e);
     }
     o.obj["loads"] = ld;
-    o.obj["options"] = jobj();
+    Value opts = jobj();
+    for (const auto& st : studies) {
+        Value e = st->exportOptions();
+        if (e.type == Value::Object) opts.obj[st->id().toStdString()] = e;
+    }
+    o.obj["options"] = opts;
     return o;
 }
 
@@ -1991,7 +2000,12 @@ void StructuralPanel::importSetup(const json::Value& s, const psim::Arrays* arra
     gravity_->setChecked(boolOr(s["gravity"], false));
     engine_->setCurrentIndex(strOr(s["engine"]) == "cpu" ? 2 : 0);
     const std::string id = strOr(s["study"], "static");
+    resFor_.clear();
+    for (const auto& [sid, n] : s["resFor"].obj)
+        if (isNum(n)) resFor_[QString::fromStdString(sid)] = int(std::clamp(std::round(n.num), 16.0, 480.0));
+    for (const auto& st : studies) st->importOptions(s["options"][st->id().toStdString()]);
     selectStudy(QString::fromStdString(id));
+    renderStudyOptions();
     double res = numOr(s["resFor"][id], numOr(s["resolution"], resolution_));
     resolution_ = int(std::clamp(std::round(res), 16.0, 480.0));
     if (app_->part) targetVoxels_ = voxelFactor_ * estimateVoxels(*app_->part, resolution_);
@@ -2004,6 +2018,11 @@ Study* StructuralPanel::studyById(const QString& id) const {
     for (const auto& st : studies)
         if (st->id() == id) return st.get();
     return nullptr;
+}
+
+void StructuralPanel::reapplyStudyOptions(const json::Value& s) {
+    for (const auto& st : studies)
+        if (st->hasResult()) st->importOptions(s["options"][st->id().toStdString()]);
 }
 
 void StructuralPanel::restoreStudy(const QString& id) {

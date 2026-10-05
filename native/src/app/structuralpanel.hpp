@@ -74,6 +74,8 @@ public:
     void importView(const json::Value& v);
     void restoreStudy(const QString& id);
     void importMaterial(const json::Value& m);
+    /** Study options again after the results were put in (the view is clamped to them); called by the file opener. */
+    void reapplyStudyOptions(const json::Value& structuralSetup);
     bool hasStaticResult() const { return result_.has_value(); }
 
     void runStudy();
@@ -149,6 +151,7 @@ private:
     std::vector<float> shown_;  // values currently coloured (probe)
     std::function<QString(double)> shownFmt_;
     int study_ = 0;
+    std::map<QString, int> resFor_;  // voxels on the longest side chosen for each study (saved in .psim files)
     QString display_ = "setup";
     bool stale_ = false;
     double phase_ = 0;

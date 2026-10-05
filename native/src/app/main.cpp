@@ -122,6 +122,19 @@ void runScript(ps::MainWindow* w, QStringList steps) {
     } else if (cmd == "rerun") w->rerunLoaded();
     else if (cmd == "tab") w->setTab(arg);
     else if (cmd == "study") w->structural->selectStudy(arg);
+    else if (cmd == "setopt") {
+        // setopt:<study>:<json> - merge { opts: {...}, view: {...} } into a study's options as a loaded file would
+        const QString id = arg.section(':', 0, 0);
+        auto* s = w->structural->studyById(id);
+        if (!s) return scriptFailure("setopt: unknown study " + id);
+        try { s->importOptions(ps::psim::parseJson(arg.section(':', 1).toStdString())); } catch (const std::exception& e) { return scriptFailure(QString("setopt: ") + e.what()); }
+        w->structural->renderStudyOptions();
+    } else if (cmd == "getopt") {
+        auto* s = w->structural->studyById(arg);
+        if (!s) return scriptFailure("getopt: unknown study " + arg);
+        std::printf("options %s: %s\n", qPrintable(arg), ps::psim::stringifyJson(s->exportOptions()).c_str());
+        std::fflush(stdout);
+    }
     else if (cmd == "studyopt") { if (auto* s = w->structural->currentStudy()) s->scriptOption(arg); }
     else if (cmd == "run") {
         if (w->tab() == "thermal") w->thermal->run();
