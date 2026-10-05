@@ -12,6 +12,9 @@ const out = 'test-artifacts/web';
 await mkdir(out, { recursive: true });
 let browser;
 const errors = [];
+// PSIM_ONLY=modal|series|airflow runs one stage
+const only = process.env.PSIM_ONLY;
+const stage = (name) => !only || only === name;
 const idle = (p) => p.waitForFunction(() => document.querySelector('#busy').hidden, null, { timeout: 600000 });
 const text = (p, sel) => p.locator(sel).innerText();
 
@@ -40,8 +43,10 @@ try {
     args: process.platform === 'darwin' ? ['--enable-unsafe-webgpu', '--use-angle=metal'] : ['--enable-unsafe-webgpu'],
   });
 
+  let a, b;
   // ---- frequency study on the beam
-  let a = await open(`${base}?sample=beam`);
+  if (stage('modal')) {
+  a = await open(`${base}?sample=beam`);
   await a.waitForFunction(() => !!window.partsSim?.part, null, { timeout: 60000 });
   await idle(a);
   await a.evaluate(() => { const r = document.querySelector('#res-range'); r.value = 24; r.dispatchEvent(new Event('input')); r.dispatchEvent(new Event('change')); window.partsSim.structural.setStudy('modal'); });
@@ -57,7 +62,7 @@ try {
   await writeFile(`${out}/app-modal.psim`, modal);
   console.log(`frequency file: ${modal.length} bytes`);
   await a.close();
-  let b = await open(base);
+  b = await open(base);
   await b.evaluate(async (arr) => { await window.partsSim.psim.open(Uint8Array.from(arr), 'modal.psim'); }, [...modal]);
   await b.waitForFunction(() => !document.querySelector('#file-banner').hidden, null, { timeout: 30000 });
   await b.waitForTimeout(600);
@@ -68,9 +73,10 @@ try {
   console.log(`frequency picture difference ${d1.toFixed(3)}/255`);
   assert.ok(d1 < 6);
   await b.close();
+  }
 
   // ---- the series studies (steps and frames are predicted from the one before): break test and drop test
-  for (const [id, sample, study, run, card, kpis] of [['break', 'lbracket', 'static', '#btn-break', '#break-card', '#break-kpis'], ['drop', 'beam', 'drop', '#btn-run', '#study-card', '#study-card']]) {
+  if (stage('series')) for (const [id, sample, study, run, card, kpis] of [['break', 'lbracket', 'static', '#btn-break', '#break-card', '#break-kpis'], ['drop', 'beam', 'drop', '#btn-run', '#study-card', '#study-card']]) {
     const x = await open(`${base}?sample=${sample}`);
     await x.waitForFunction(() => !!window.partsSim?.part, null, { timeout: 60000 });
     await idle(x);
@@ -99,6 +105,7 @@ try {
   }
 
   // ---- airflow on the Ahmed body, CPU engine, 50k cells
+  if (stage('airflow')) {
   a = await open(`${base}?sample=ahmed`);
   await a.waitForFunction(() => !!window.partsSim?.part, null, { timeout: 60000 });
   await idle(a);
@@ -134,6 +141,7 @@ try {
   assert.ok(d2 < 8);
   await b.screenshot({ path: `${out}/psim-airflow-loaded.png` });
   assert.deepEqual(errors, []);
+  }
   console.log('psim app smoke passed');
 } finally {
   await browser?.close();

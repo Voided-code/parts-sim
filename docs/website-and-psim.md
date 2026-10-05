@@ -212,6 +212,8 @@ own range; the 8-bit density of the topology study at most 0.2%.
 - **Landing page screenshots** are the existing `docs/images` (not regenerated from the current UI).
 - **`ctest` hangs on this shared Mac** (0% CPU, even for `ctest -N`); the native test binaries run directly and pass there, and `ctest` itself
   passes 7 of 7 on the Windows and Linux runners.
+- **Airflow through the app path** (`PSIM_ONLY=airflow node scripts/psim-app-smoke.mjs`, Ahmed body, 50k cells, CPU engine): the file is 0.96 MB, the card, notes and legend
+  are identical after opening it in a fresh page, and the picture differs by 0.60 of 255. (An earlier run of this stage timed out under machine load; the rerun through the GPU lock passed.)
 - **Re-run difference for airflow** is not shown (the run does not end by itself); the other studies show it.
 - **A 1M-cell airflow save and open in the app** was measured at the study level (2.5 MB, 759 ms to rebuild the solid cells),
   not through the Save dialog.
